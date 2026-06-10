@@ -1,4 +1,4 @@
-package asicam
+package astrocam
 
 // StubTransport is an in-memory ZWO-camera Transport for hardware-free, end-to-end
 // tests of the capture pipeline: Init → SetROI → SetGain → SetExposure →

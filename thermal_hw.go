@@ -1,4 +1,4 @@
-package asicam
+package astrocam
 
 // Hardware Thermal backend: the control-transfer implementation of the Thermal seam the
 // Cooler drives (cooling.go):

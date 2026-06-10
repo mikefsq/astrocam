@@ -1,6 +1,6 @@
 package sensors
 
-import . "asicam"
+import . "github.com/mikefsq/astrocam"
 
 // init wires each camera USB (VID,PID) to its sensor profile and per-variant Name/Color/
 // USB3/Cooling/ST4 flags — for BOTH vendors that build on this platform: ZWO (VID 0x03C3)

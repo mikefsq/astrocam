@@ -22,7 +22,7 @@
 //	the capture worker (DDR capture: arm, FPGABufReload, TriggerSignal+XHSStop window, windowed xfer)
 package sensors
 
-import . "asicam"
+import . "github.com/mikefsq/astrocam"
 
 import (
 	"fmt"

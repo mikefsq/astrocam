@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	. "asicam"
+	. "github.com/mikefsq/astrocam"
 )
 
 // fakeRegmap records register writes so a sensor profile's encoding can be

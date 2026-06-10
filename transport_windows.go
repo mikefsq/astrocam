@@ -12,7 +12,7 @@
 // UNVERIFIED: compile-checked for windows/amd64 but not run on hardware. Validate
 // on a Windows box with a WinUSB-bound camera before trusting it.
 
-package asicam
+package astrocam
 
 import (
 	"fmt"

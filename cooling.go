@@ -1,4 +1,4 @@
-package asicam
+package astrocam
 
 // Host-side TEC cooling control: the regulation step, PID initialization, the
 // setpoint ramp, SetPowerPerc, the power-to-DAC conversion, and the cooling worker

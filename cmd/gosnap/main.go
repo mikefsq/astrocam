@@ -27,8 +27,8 @@ import (
 	"syscall"
 	"time"
 
-	"asicam"
-	_ "asicam/sensors" // registers the PID -> sensor profile table
+	"github.com/mikefsq/astrocam"
+	_ "github.com/mikefsq/astrocam/sensors" // registers the PID -> sensor profile table
 )
 
 func main() {
@@ -58,7 +58,7 @@ func main() {
 	cool := flag.Bool("cool", false, "ACTUATE the TEC: open-loop power steps then a closed-loop regulation run (returns to 0 on exit/Ctrl-C)")
 	regulate := flag.Bool("regulate", false, "ACTUATE the TEC: closed-loop regulate to -regtarget (returns to 0 on exit/Ctrl-C). Tune with -kp/-ki/-kd/-slew/-seed.")
 	regtarget := flag.Float64("regtarget", 10, "target temperature °C for -regulate")
-	dc := asicam.DefaultCoolerConfig() // flag defaults track the library's velocity-form gains
+	dc := astrocam.DefaultCoolerConfig() // flag defaults track the library's velocity-form gains
 	kp := flag.Float64("kp", dc.Kp, "-regulate velocity-form Kp (damps the approach)")
 	ki := flag.Float64("ki", dc.Ki, "-regulate velocity-form Ki (drive ramp rate; raise to arrive faster)")
 	kd := flag.Float64("kd", dc.Kd, "-regulate velocity-form Kd (fine damping)")
@@ -81,12 +81,12 @@ func main() {
 		return
 	}
 	if *tecoff {
-		raw, err := asicam.OpenHost(asicam.ZWO.VID, uint16(*pid))
+		raw, err := astrocam.OpenHost(astrocam.ZWO.VID, uint16(*pid))
 		if err != nil {
 			log.Fatalf("tecoff: %v", err)
 		}
 		defer raw.Close()
-		cam, _ := asicam.Open(raw, asicam.ZWO.VID, uint16(*pid))
+		cam, _ := astrocam.Open(raw, astrocam.ZWO.VID, uint16(*pid))
 		th := cam.HardwareThermal()
 		_ = th.SetTECPower(0)
 		_ = th.SetFan(false)
@@ -95,12 +95,12 @@ func main() {
 		return
 	}
 	if *heater >= 0 {
-		raw, err := asicam.OpenHost(asicam.ZWO.VID, uint16(*pid))
+		raw, err := astrocam.OpenHost(astrocam.ZWO.VID, uint16(*pid))
 		if err != nil {
 			log.Fatalf("heater: %v", err)
 		}
 		defer raw.Close()
-		cam, _ := asicam.Open(raw, asicam.ZWO.VID, uint16(*pid))
+		cam, _ := astrocam.Open(raw, astrocam.ZWO.VID, uint16(*pid))
 		th := cam.HardwareThermal()
 		rm := cam.Rm()
 		if err := th.SetHeater(*heater); err != nil {
@@ -171,20 +171,20 @@ func (o captureOpts) binOr1() int {
 }
 
 func run(pid uint16, capture, verbose bool, o captureOpts) error {
-	raw, err := asicam.OpenHost(asicam.ZWO.VID, pid)
+	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
 	if err != nil {
-		return fmt.Errorf("connect %04x:%04x: %w\n(camera plugged in, not claimed by another driver, accessible?)", asicam.ZWO.VID, pid, err)
+		return fmt.Errorf("connect %04x:%04x: %w\n(camera plugged in, not claimed by another driver, accessible?)", astrocam.ZWO.VID, pid, err)
 	}
 	defer raw.Close() // always disconnect cleanly
 
 	t0 := time.Now()
 	el := func() string { return fmt.Sprintf("[%8.3fs]", time.Since(t0).Seconds()) }
 
-	var t asicam.Transport = raw
+	var t astrocam.Transport = raw
 	if verbose {
 		t = &logT{t: raw, w: os.Stderr, start: t0}
 	}
-	cam, err := asicam.Open(t, asicam.ZWO.VID, pid)
+	cam, err := astrocam.Open(t, astrocam.ZWO.VID, pid)
 	if err != nil {
 		return fmt.Errorf("bind PID 0x%04x: %w", pid, err)
 	}
@@ -197,7 +197,7 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 		fmt.Printf("  fps percent: %d (bandwidth-overload override)\n", o.fpsPerc)
 	}
 
-	fmt.Printf("connected %04x:%04x\n", asicam.ZWO.VID, pid)
+	fmt.Printf("connected %04x:%04x\n", astrocam.ZWO.VID, pid)
 	if d, ok := interface{}(raw).(interface{ Describe() string }); ok {
 		fmt.Printf("  link     : %s\n", d.Describe())
 	}
@@ -322,7 +322,7 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 					// when the backend offers it (no per-frame memcpy), to isolate read overhead.
 					// Zero-copy only when a whole frame fits in one transfer (sub-MiB ROI); larger
 					// frames span chunks and aren't contiguous in one scratch, so fall back to Next.
-					zc, hasZC := sess.(asicam.FrameStreamZC)
+					zc, hasZC := sess.(astrocam.FrameStreamZC)
 					hasZC = hasZC && fbytes <= (1<<20)
 					ivs := make([]float64, 0, nf) // per-frame intervals (ms) — drop vs bandwidth probe
 					t0 = time.Now()               // time ONLY the steady-state loop (exclude arm/prime/warm-up)
@@ -581,7 +581,7 @@ func rawPath(p string) string {
 // doList enumerates attached ZWO cameras and reads each one's factory serial (opening
 // then closing it) — the Alpaca "what's plugged in, by stable id" listing.
 func doList() error {
-	devs, err := asicam.Enumerate()
+	devs, err := astrocam.Enumerate()
 	if err != nil {
 		return err
 	}
@@ -591,12 +591,12 @@ func doList() error {
 	}
 	for _, d := range devs {
 		line := d.String()
-		t, err := asicam.OpenLocation(d.VID, d.Location)
+		t, err := astrocam.OpenLocation(d.VID, d.Location)
 		if err != nil {
 			fmt.Printf("%s  serial=?(open failed: %v)\n", line, err)
 			continue
 		}
-		if cam, err := asicam.Open(t, d.VID, d.PID); err == nil {
+		if cam, err := astrocam.Open(t, d.VID, d.PID); err == nil {
 			if sn, err := cam.SerialNumber(); err == nil {
 				line += "  serial=" + sn.String()
 			} else {
@@ -612,13 +612,13 @@ func doList() error {
 // doSerial opens the camera with the given factory serial (the stable Alpaca bind) and
 // prints its identity, proving the enumerate -> open-by-location -> match-serial search.
 func doSerial(serial string) error {
-	t, d, err := asicam.OpenSerial(serial)
+	t, d, err := astrocam.OpenSerial(serial)
 	if err != nil {
 		return err
 	}
 	defer t.Close()
 	fmt.Printf("opened %s\n", d)
-	cam, err := asicam.Open(t, d.VID, d.PID)
+	cam, err := astrocam.Open(t, d.VID, d.PID)
 	if err != nil {
 		return err
 	}
@@ -633,16 +633,16 @@ func doSerial(serial string) error {
 // Thermal backend, and dumps the raw 0xB3 temp bytes so the decode can be checked against
 // the SDK. Read-only — it does NOT drive the TEC, fan, or heater.
 func doThermal(pid uint16) error {
-	raw, err := asicam.OpenHost(asicam.ZWO.VID, pid)
+	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
 	if err != nil {
 		return err
 	}
 	defer raw.Close()
-	cam, err := asicam.Open(raw, asicam.ZWO.VID, pid)
+	cam, err := astrocam.Open(raw, astrocam.ZWO.VID, pid)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("connected %04x:%04x  %s  cooled=%v\n", asicam.ZWO.VID, pid, cam.Name(), cam.Cooled())
+	fmt.Printf("connected %04x:%04x  %s  cooled=%v\n", astrocam.ZWO.VID, pid, cam.Name(), cam.Cooled())
 
 	// Raw 0xB3 bytes, so we can see both candidate decodings vs the SDK ground truth.
 	var b [2]byte
@@ -676,12 +676,12 @@ func doThermal(pid uint16) error {
 // closed-loop regulation run through the Cooler goroutine. It always returns the TEC to 0
 // and the fan off on exit — including Ctrl-C — so the camera is never left driven.
 func doCool(pid uint16) error {
-	raw, err := asicam.OpenHost(asicam.ZWO.VID, pid)
+	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
 	if err != nil {
 		return err
 	}
 	defer raw.Close()
-	cam, err := asicam.Open(raw, asicam.ZWO.VID, pid)
+	cam, err := astrocam.Open(raw, astrocam.ZWO.VID, pid)
 	if err != nil {
 		return err
 	}
@@ -736,7 +736,7 @@ func doCool(pid uint16) error {
 
 	target := base - 10
 	fmt.Printf("Phase 2 — closed-loop regulation to %.1f °C (Cooler goroutine):\n", target)
-	cfg := asicam.DefaultCoolerConfig()
+	cfg := astrocam.DefaultCoolerConfig()
 	cfg.RampRate = 30 // °C/min setpoint ramp
 	if err := cam.EnableCooling(nil, target, cfg); err != nil {
 		return err
@@ -756,12 +756,12 @@ func doCool(pid uint16) error {
 // disabled and a 50% warm-start, then watches it converge and hold — the temperature-
 // regulation test. Returns the TEC to 0 / fan off on exit (Ctrl-C included).
 func doRegulate(pid uint16, target, kp, ki, kd, slew, seed, maxerr, target2 float64) error {
-	raw, err := asicam.OpenHost(asicam.ZWO.VID, pid)
+	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
 	if err != nil {
 		return err
 	}
 	defer raw.Close()
-	cam, err := asicam.Open(raw, asicam.ZWO.VID, pid)
+	cam, err := astrocam.Open(raw, astrocam.ZWO.VID, pid)
 	if err != nil {
 		return err
 	}
@@ -786,7 +786,7 @@ func doRegulate(pid uint16, target, kp, ki, kd, slew, seed, maxerr, target2 floa
 	fmt.Printf("%s %s  baseline %.2f °C  (Kp=%.3g Ki=%.3g Kd=%.3g slew=%.3g seed=%.3g maxerr=%.3g)\n",
 		el(), cam.Name(), base, kp, ki, kd, slew, seed, maxerr)
 
-	cfg := asicam.DefaultCoolerConfig()
+	cfg := astrocam.DefaultCoolerConfig()
 	cfg.Kp, cfg.Ki, cfg.Kd = kp, ki, kd
 	cfg.SlewPerStep = slew // 0 = per-tick rate limit disabled
 	cfg.RampRate = 0       // no setpoint ramp — MaxError is what paces the approach here
@@ -847,7 +847,7 @@ func doReplay(pid uint16, file string) error {
 	if err != nil {
 		return err
 	}
-	t, err := asicam.OpenHost(asicam.ZWO.VID, pid)
+	t, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -868,7 +868,7 @@ func doReplay(pid uint16, file string) error {
 		n++
 	}
 	fmt.Printf("replayed %d SDK writes; reading frame...\n", n)
-	if r, ok := interface{}(t).(asicam.EndpointResetter); ok {
+	if r, ok := interface{}(t).(astrocam.EndpointResetter); ok {
 		r.ResetEndpoint(0x81)
 	}
 	buf := make([]byte, 4708352) // EXACTLY one frame (no over-read)
@@ -905,7 +905,7 @@ func findMagic(b []byte) int {
 // logT wraps a Transport and logs every transfer (the -v debug path). It forwards
 // only the Transport methods, so a streaming backend falls back to logged BulkRead.
 type logT struct {
-	t     asicam.Transport
+	t     astrocam.Transport
 	w     io.Writer
 	start time.Time
 }
@@ -942,7 +942,7 @@ func (l *logT) BulkRead(buf []byte, to time.Duration) (int, error) {
 // ReadFrameStream forwards the optional windowed-stream read (FrameStreamer) so the
 // IMX455 worker's real data plane runs under -v instead of falling back to BulkRead.
 func (l *logT) ReadFrameStream(buf []byte, idle, total time.Duration) (int, error) {
-	fs, ok := l.t.(asicam.FrameStreamer)
+	fs, ok := l.t.(astrocam.FrameStreamer)
 	if !ok {
 		return 0, fmt.Errorf("transport has no FrameStreamer")
 	}
@@ -965,7 +965,7 @@ func (l *logT) SuperSpeed() bool {
 
 // ResetEndpoint forwards the optional pipe-flush so it still runs under -v.
 func (l *logT) ResetEndpoint(ep uint8) error {
-	r, ok := l.t.(asicam.EndpointResetter)
+	r, ok := l.t.(astrocam.EndpointResetter)
 	if !ok {
 		return nil
 	}

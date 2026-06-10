@@ -1,4 +1,4 @@
-package asicam
+package astrocam
 
 // SonyAnalogGain converts an ASI gain value (0.1 dB units, the API scale) to a Sony
 // STARVIS analog-gain register code plus the high-conversion-gain (HCG) select. The

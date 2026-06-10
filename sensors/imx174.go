@@ -10,7 +10,7 @@
 //	reglist             (31 reg/val16 entries)
 package sensors
 
-import . "asicam"
+import . "github.com/mikefsq/astrocam"
 
 import (
 	"fmt"

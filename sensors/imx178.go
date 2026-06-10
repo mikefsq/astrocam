@@ -20,7 +20,7 @@
 //	the capture worker (capture: arm, FPGABufReload, TriggerSignal+XHSStop window, async xfer)
 package sensors
 
-import . "asicam"
+import . "github.com/mikefsq/astrocam"
 
 import (
 	"fmt"

@@ -1,4 +1,4 @@
-package asicam
+package astrocam
 
 // Snap (single-frame) data plane, built around StartCapture / the post-exposure image read (the
 // status gate) and the capture worker.

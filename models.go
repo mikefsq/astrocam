@@ -1,4 +1,4 @@
-package asicam
+package astrocam
 
 // Model binds a camera (its USB VID:PID) to its Sensor profile plus the per-model
 // facts that are NOT sensor-intrinsic (color filter, cooler, USB speed). Adding a
@@ -14,7 +14,7 @@ type Model struct {
 
 // registry maps a USB VID:PID to its camera model. The sensor profiles live in the
 // asicam/sensors package and register themselves from its init() (the caller
-// does an `import _ "asicam/sensors"`), so the core never imports the sensor
+// does an `import _ "github.com/mikefsq/astrocam/sensors"`), so the core never imports the sensor
 // data — no cycle, and the LUT grows independently.
 var registry = map[DeviceID]Model{}
 

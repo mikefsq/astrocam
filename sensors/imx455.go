@@ -29,7 +29,7 @@
 // ASI never writes 0x67f on the 455; PlayerOne does.)
 package sensors
 
-import . "asicam"
+import . "github.com/mikefsq/astrocam"
 
 import (
 	"fmt"

@@ -1,11 +1,11 @@
-package asicam_test
+package astrocam_test
 
 import (
 	"testing"
 	"time"
 
-	"asicam"
-	_ "asicam/sensors" // registers the PID → sensor table
+	"github.com/mikefsq/astrocam"
+	_ "github.com/mikefsq/astrocam/sensors" // registers the PID → sensor table
 )
 
 // TestE2ECapture runs the full hardware-free capture pipeline against StubTransport
@@ -20,8 +20,8 @@ func TestE2ECapture(t *testing.T) {
 		{0x620A, "ASI6200MC Pro"}, // IMX455, USB3 windowed-stream path
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ft := asicam.NewStubTransport()
-			cam, err := asicam.Open(ft, asicam.ZWO.VID, tc.pid)
+			ft := astrocam.NewStubTransport()
+			cam, err := astrocam.Open(ft, astrocam.ZWO.VID, tc.pid)
 			if err != nil {
 				t.Fatalf("Open: %v", err)
 			}
@@ -71,8 +71,8 @@ func TestE2ETriggerMode(t *testing.T) {
 	if testing.Short() {
 		t.Skip("trigger mode host-times a 1 s integration; skipped in -short")
 	}
-	ft := asicam.NewStubTransport()
-	cam, err := asicam.Open(ft, asicam.ZWO.VID, 0x620A)
+	ft := astrocam.NewStubTransport()
+	cam, err := astrocam.Open(ft, astrocam.ZWO.VID, 0x620A)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

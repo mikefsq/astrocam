@@ -1,4 +1,4 @@
-package asicam
+package astrocam
 
 import (
 	"errors"

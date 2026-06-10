@@ -1,4 +1,4 @@
-package asicam
+package astrocam
 
 // This file is the shared readout/line-time engine. It is reused by every sensor profile.
 // Each sensor profile supplies data (pixel clock, HMAX floor, blanking) and the runtime

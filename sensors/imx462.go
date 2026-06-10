@@ -17,7 +17,7 @@
 //	the capture worker (sensor stream gate: standby 0x3000 = 1 stop / 0 start)
 package sensors
 
-import . "asicam"
+import . "github.com/mikefsq/astrocam"
 
 import (
 	"fmt"

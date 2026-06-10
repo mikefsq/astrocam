@@ -11,7 +11,7 @@
 // initAsyncXfer/startAsyncXfer (window of buffers in flight, reap by
 // completion, resubmit).
 
-package asicam
+package astrocam
 
 import (
 	"fmt"
@@ -87,7 +87,7 @@ type usbfsDevice struct {
 }
 
 // OpenUSBFS finds the first device matching vid/pid under /dev/bus/usb, claims
-// interface 0, and returns a Transport. The ZWO VID is asicam.ZWO.VID (0x03C3).
+// interface 0, and returns a Transport. The ZWO VID is astrocam.ZWO.VID (0x03C3).
 func OpenUSBFS(vid, pid uint16) (*usbfsDevice, error) {
 	nodes, _ := filepath.Glob("/dev/bus/usb/*/*")
 	for _, n := range nodes {

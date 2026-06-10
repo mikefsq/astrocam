@@ -30,7 +30,7 @@
 // registers also second-source confirms the ASI 455/571 decode. What's left for a live
 // PlayerOne camera is hardware-gated: PID->sensor rows (PlayerOne ships no static PID
 // table) and capture-path validation.
-package asicam
+package astrocam
 
 import "time"
 

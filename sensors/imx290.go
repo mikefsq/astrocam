@@ -11,7 +11,7 @@
 // yet strip (it searches for 0xBB00AA11) — that marker is likely this camera's frame header.
 package sensors
 
-import . "asicam"
+import . "github.com/mikefsq/astrocam"
 
 import (
 	"fmt"

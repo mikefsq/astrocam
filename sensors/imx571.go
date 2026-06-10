@@ -5,7 +5,7 @@
 // (ZWO 0x03C3 vs PlayerOne 0xA0A0); see imx571SetGainPOA.
 package sensors
 
-import . "asicam"
+import . "github.com/mikefsq/astrocam"
 
 import (
 	"fmt"

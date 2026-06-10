@@ -14,7 +14,7 @@
 // HARDWARE-VALIDATED: control plane + both bulk paths against real cameras — ASI174MM Mini
 // (USB2) and ASI6200 MM/MC (full 122 MB frames over USB3 and USB2).
 
-package asicam
+package astrocam
 
 /*
 #cgo LDFLAGS: -framework IOKit -framework CoreFoundation
