@@ -1,0 +1,12 @@
+# Go build output
+*.test
+*.out
+
+# Captured frames / scratch
+*.fits
+*.fit
+*.raw
+frame.*
+
+# Editor / OS
+.DS_Store
