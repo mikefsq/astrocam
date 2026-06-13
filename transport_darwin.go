@@ -288,9 +288,8 @@ typedef struct { volatile int done; uint32_t len; IOReturn kr; asi_rd* rd; } asl
 struct asi_rd {
     aslot* slots;
     int n;
-    volatile int completed;
     CFRunLoopRef rl;
-    dispatch_semaphore_t finished;
+    dispatch_semaphore_t comp; // V'd once per completion (success, error, or abort)
 };
 
 static void asi_async_cb(void* refcon, IOReturn result, void* arg0) {
@@ -298,11 +297,9 @@ static void asi_async_cb(void* refcon, IOReturn result, void* arg0) {
     s->len = (uint32_t)(uintptr_t)arg0;
     s->kr = result;
     s->done = 1;
-    asi_rd* rd = s->rd;
-    if (__sync_add_and_fetch(&rd->completed, 1) == rd->n) {
-        dispatch_semaphore_signal(rd->finished);
-        CFRunLoopStop(rd->rl);
-    }
+    // One signal per completion; the reader counts them down and only then stops the
+    // runloop, so every callback runs BEFORE the runloop thread exits and rd is freed.
+    dispatch_semaphore_signal(s->rd->comp);
 }
 
 typedef struct {
@@ -335,46 +332,58 @@ static int asi_read_frame_async(asicam_dev* d, void* buf, uint32_t bufSize,
     asi_rd rd;
     rd.slots = (aslot*)calloc(n, sizeof(aslot));
     rd.n = n;
-    rd.completed = 0;
     rd.rl = NULL;
-    rd.finished = dispatch_semaphore_create(0);
+    rd.comp = dispatch_semaphore_create(0);
     for (int i = 0; i < n; i++) rd.slots[i].rd = &rd;
 
     dispatch_semaphore_t ready = dispatch_semaphore_create(0);
     asi_rd_thr ta = { d, &rd, ready, NULL, kIOReturnSuccess };
     pthread_t th;
     if (pthread_create(&th, NULL, asi_rd_run, &ta) != 0) {
-        free(rd.slots); dispatch_release(rd.finished); dispatch_release(ready);
+        free(rd.slots); dispatch_release(rd.comp); dispatch_release(ready);
         return -4;
     }
     dispatch_semaphore_wait(ready, DISPATCH_TIME_FOREVER); // runloop + source ready
     if (ta.srcErr != kIOReturnSuccess) {
         pthread_join(th, NULL);
-        free(rd.slots); dispatch_release(rd.finished); dispatch_release(ready);
+        free(rd.slots); dispatch_release(rd.comp); dispatch_release(ready);
         return -3;
     }
 
-    // Submit all transfers; completions fire on the dedicated runloop thread.
+    // Submit all transfers; their completions fire on the dedicated runloop thread. Track how
+    // many are actually in flight: a SYNCHRONOUS submit failure does NOT schedule a callback,
+    // so it must not be counted (else the drain below waits forever for a completion that
+    // never comes).
+    int inflight = 0;
     for (int i = 0; i < n; i++) {
         uint32_t off = (uint32_t)i * chunk;
         uint32_t len = (off + chunk <= bufSize) ? chunk : (bufSize - off);
         IOReturn kr = (*d->intf)->ReadPipeAsyncTO(d->intf, d->inPipe, (char*)buf + off, len,
                           timeoutMs, timeoutMs, (IOAsyncCallback1)asi_async_cb, &rd.slots[i]);
-        if (kr != kIOReturnSuccess) {
+        if (kr == kIOReturnSuccess) {
+            inflight++;
+        } else {
             rd.slots[i].done = 1; rd.slots[i].kr = kr;
-            if (__sync_add_and_fetch(&rd.completed, 1) == n) {
-                dispatch_semaphore_signal(rd.finished); CFRunLoopStop(rd.rl);
-            }
         }
     }
 
-    // Wait for all transfers to complete, or time out.
-    dispatch_time_t dl = dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMs * 1000000LL + 500000000LL);
-    if (dispatch_semaphore_wait(rd.finished, dl) != 0) {
-        (*d->intf)->AbortPipe(d->intf, d->inPipe); // forces remaining callbacks -> finished
-        dispatch_semaphore_wait(rd.finished, dispatch_time(DISPATCH_TIME_NOW, 2000000000LL));
+    // Drain EVERY outstanding completion before tearing down. The previous version waited on a
+    // single "all done" semaphore with a bounded timeout and then freed rd / the runloop — but
+    // if a transfer was still pending when that timed out, its callback fired against freed
+    // state (the use-after-free crash). Here we count completions down one by one; on the
+    // overall timeout we AbortPipe (which completes the rest as aborted) and keep draining.
+    // Only once inflight hits 0 do we stop the runloop and join, so no callback can outlive rd.
+    // (Mirrors asi_read_frame_stream's teardown.)
+    int64_t waitNs = (int64_t)timeoutMs * 1000000LL + 500000000LL;
+    int aborted = 0;
+    while (inflight > 0) {
+        if (dispatch_semaphore_wait(rd.comp, dispatch_time(DISPATCH_TIME_NOW, waitNs)) != 0) {
+            if (!aborted) { (*d->intf)->AbortPipe(d->intf, d->inPipe); aborted = 1; waitNs = 2000000000LL; continue; }
+            break; // a transfer is genuinely wedged; stop the runloop (removes the source) and bail
+        }
+        inflight--;
     }
-    CFRunLoopStop(rd.rl); // ensure the thread's runloop exits even on a race
+    CFRunLoopStop(rd.rl);
     pthread_join(th, NULL);
 
     // Bytes transferred, in order, up to and INCLUDING the frame-terminating short
@@ -397,7 +406,7 @@ static int asi_read_frame_async(asicam_dev* d, void* buf, uint32_t bufSize,
 
     (*d->intf)->ClearPipeStallBothEnds(d->intf, d->inPipe); // quiescent pipe for next capture
     free(rd.slots);
-    dispatch_release(rd.finished);
+    dispatch_release(rd.comp);
     dispatch_release(ready);
     return 0;
 }
