@@ -1,21 +1,27 @@
 //go:build windows
 
-// Pure-Go Windows USB transport over WinUSB, no cgo (stdlib syscall + lazy DLLs).
-// WinUSB is the fastest cgo-free path on Windows: control via WinUsb_ControlTransfer
-// and a bulk stream of overlapped WinUsb_ReadPipe reads reaped through an I/O
-// completion port — the same submit-window/reap model as startAsyncXfer.
+// Pure-Go Windows USB transport over WinUSB, no cgo (stdlib syscall + lazy DLLs):
+// control via WinUsb_ControlTransfer and bulk-IN frame reads via overlapped
+// WinUsb_ReadPipe, bounded by the pipe's transfer-timeout policy.
 //
 // The camera must be bound to WinUSB/libusbK (the ZWO installer or Zadig). We match
 // the device by VID/PID in its device-interface path under the generic USB device
 // interface GUID.
 //
-// UNVERIFIED: compile-checked for windows/amd64 but not run on hardware. Validate
-// on a Windows box with a WinUSB-bound camera before trusting it.
+// Frame reads go through fixed 1 MiB chunked reads assembled to a contiguous watermark
+// (BulkRead / ReadFrameStream) — the same shape as the darwin async pump and the Linux
+// usbfs backend: a whole-frame read must time-bound (default WinUSB blocks forever) and
+// read THROUGH the FX3's mid-frame short packets / ZLPs rather than stop on the first.
+//
+// UNVERIFIED: compile-checked for windows/amd64 but not run on hardware. Validate on a
+// Windows box with a WinUSB-bound camera before trusting it. Mirrors the (hardware-
+// validated) Linux usbfs backend.
 
 package astrocam
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -36,10 +42,9 @@ var (
 	procWinUsbControl    = modWinUSB.NewProc("WinUsb_ControlTransfer")
 	procWinUsbReadPipe   = modWinUSB.NewProc("WinUsb_ReadPipe")
 	procWinUsbSetPipePol = modWinUSB.NewProc("WinUsb_SetPipePolicy")
+	procWinUsbResetPipe  = modWinUSB.NewProc("WinUsb_ResetPipe")
 	procCreateFile       = modKernel32.NewProc("CreateFileW")
 	procCloseHandle      = modKernel32.NewProc("CloseHandle")
-	procCreateIoCP       = modKernel32.NewProc("CreateIoCompletionPort")
-	procGetQueuedCS      = modKernel32.NewProc("GetQueuedCompletionStatus")
 	procGetOverlappedRes = modKernel32.NewProc("GetOverlappedResult")
 )
 
@@ -67,11 +72,21 @@ const (
 	fileShareRW          = 0x03
 	openExisting         = 3
 	fileFlagOverlapped   = 0x40000000
-	rawIOPolicy          = 0x07 // WINUSB pipe policy RAW_IO
+	pipeTransferTimeout  = 0x03 // WINUSB_PIPE_POLICY PIPE_TRANSFER_TIMEOUT (ULONG ms)
 	pipeIn               = bulkEndpoint
+
+	// maxBulkChunk caps a single ReadPipe so a whole-frame read time-bounds and reads
+	// THROUGH mid-frame short packets at a contiguous watermark; 1 MiB matches the
+	// SDK/darwin/usbfs xferLen.
+	maxBulkChunk = 1 << 20
+
+	// Windows error codes that mean "the bounded read elapsed", not a pipe failure.
+	errSemTimeout = 121  // ERROR_SEMAPHORE_TIMEOUT
+	errOpAborted  = 995  // ERROR_OPERATION_ABORTED
+	errTimeout    = 1460 // ERROR_TIMEOUT
 )
 
-// winusbDevice is a WinUSB-backed Transport + BulkStreamer for one open camera.
+// winusbDevice is a WinUSB-backed Transport for one open camera.
 type winusbDevice struct {
 	handle syscall.Handle // file handle
 	winusb uintptr        // WINUSB_INTERFACE_HANDLE
@@ -81,17 +96,23 @@ type winusbDevice struct {
 	ctrlMu sync.Mutex
 }
 
-// OpenWinUSB finds the first WinUSB-bound device matching vid/pid and opens it.
-func OpenWinUSB(vid, pid uint16) (*winusbDevice, error) {
-	want := fmt.Sprintf("vid_%04x&pid_%04x", vid, pid)
+// winNode is one WinUSB device-interface path with its parsed VID/PID.
+type winNode struct {
+	path     string
+	vid, pid uint16
+}
+
+// scanWinUSB lists every WinUSB device-interface path whose path carries the given vid
+// (and pid, when pid != 0), with the PID parsed from the path.
+func scanWinUSB(vid, pid uint16) []winNode {
 	h, _, _ := procGetClassDevs.Call(uintptr(unsafe.Pointer(&usbDeviceGUID)), 0, 0, digcfPresent|digcfDeviceInterface)
 	if h == 0 || h == ^uintptr(0) {
-		return nil, fmt.Errorf("asicam: SetupDiGetClassDevs failed")
+		return nil
 	}
 	defer procDestroyDevInfo.Call(h)
 
-	var idx uint32
-	for ; ; idx++ {
+	var out []winNode
+	for idx := uint32(0); ; idx++ {
 		var ifData spDeviceInterfaceData
 		ifData.cbSize = uint32(unsafe.Sizeof(ifData))
 		r, _, _ := procEnumInterfaces.Call(h, 0, uintptr(unsafe.Pointer(&usbDeviceGUID)), uintptr(idx), uintptr(unsafe.Pointer(&ifData)))
@@ -99,14 +120,68 @@ func OpenWinUSB(vid, pid uint16) (*winusbDevice, error) {
 			break // ERROR_NO_MORE_ITEMS
 		}
 		path := interfacePath(h, &ifData)
-		if path == "" || !containsFold(path, want) {
+		if path == "" {
 			continue
 		}
-		dev, err := openPath(path)
-		if err != nil {
-			return nil, err
+		gotVID, gotPID, ok := parseVIDPID(path)
+		if !ok || gotVID != vid || (pid != 0 && gotPID != pid) {
+			continue
 		}
-		return dev, nil
+		out = append(out, winNode{path: path, vid: gotVID, pid: gotPID})
+	}
+	return out
+}
+
+// parseVIDPID pulls vid_XXXX / pid_XXXX (hex) out of a WinUSB device-interface path.
+func parseVIDPID(path string) (vid, pid uint16, ok bool) {
+	lp := toLowerASCII(path)
+	v := hexAfter(lp, "vid_")
+	p := hexAfter(lp, "pid_")
+	if v < 0 || p < 0 {
+		return 0, 0, false
+	}
+	return uint16(v), uint16(p), true
+}
+
+// hexAfter parses the 4 hex digits following marker in s, or -1.
+func hexAfter(s, marker string) int {
+	i := strings.Index(s, marker)
+	if i < 0 || i+len(marker)+4 > len(s) {
+		return -1
+	}
+	val := 0
+	for _, c := range s[i+len(marker) : i+len(marker)+4] {
+		var d int
+		switch {
+		case c >= '0' && c <= '9':
+			d = int(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = int(c-'a') + 10
+		default:
+			return -1
+		}
+		val = val*16 + d
+	}
+	return val
+}
+
+// pathLocation hashes a device-interface path to a stable per-port location id (FNV-1a).
+// The path encodes the hub/port topology, so it survives a replug — the Windows analogue
+// of the darwin IORegistry locationID and the Linux busnum/devnum.
+func pathLocation(path string) uint32 {
+	const offset, prime = 2166136261, 16777619
+	h := uint32(offset)
+	for i := 0; i < len(path); i++ {
+		h ^= uint32(path[i])
+		h *= prime
+	}
+	return h
+}
+
+// OpenWinUSB finds the first WinUSB-bound device matching vid/pid and opens it.
+func OpenWinUSB(vid, pid uint16) (*winusbDevice, error) {
+	for _, n := range scanWinUSB(vid, pid) {
+		return openPath(n.path)
 	}
 	return nil, fmt.Errorf("asicam: no WinUSB device for %04x:%04x (bind it with WinUSB / libusbK via Zadig)", vid, pid)
 }
@@ -180,15 +255,112 @@ func (d *winusbDevice) ControlIn(bRequest uint8, wValue, wIndex uint16, data []b
 	return d.control(0xC0, bRequest, wValue, wIndex, data)
 }
 
-func (d *winusbDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
+// setPipeTimeout bounds a bulk-IN read: WinUSB cancels a ReadPipe that hasn't completed
+// within timeoutMs (0 = block forever, the default and the bug we avoid).
+func (d *winusbDevice) setPipeTimeout(timeoutMs uint32) {
+	procWinUsbSetPipePol.Call(d.winusb, pipeIn, pipeTransferTimeout, 4, uintptr(unsafe.Pointer(&timeoutMs)))
+}
+
+// readChunk issues one overlapped ReadPipe of up to len(buf) bytes, bounded by
+// timeoutMs, and returns the count transferred. A timeout/cancel returns (n, nil) — the
+// caller's loop treats no-data as a stall; only a genuine pipe error returns non-nil.
+// Default WinUSB (no RAW_IO) returns on a short packet, so n may be < len(buf).
+func (d *winusbDevice) readChunk(buf []byte, timeoutMs uint32) (int, error) {
+	d.setPipeTimeout(timeoutMs)
 	var ov overlapped
-	var bufPtr uintptr
-	if len(buf) > 0 {
-		bufPtr = uintptr(unsafe.Pointer(&buf[0]))
+	procWinUsbReadPipe.Call(d.winusb, pipeIn, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0, uintptr(unsafe.Pointer(&ov)))
+	var transferred uint32
+	r, _, callErr := procGetOverlappedRes.Call(uintptr(d.handle), uintptr(unsafe.Pointer(&ov)), uintptr(unsafe.Pointer(&transferred)), 1)
+	if r != 0 {
+		return int(transferred), nil
 	}
-	procWinUsbReadPipe.Call(d.winusb, pipeIn, bufPtr, uintptr(len(buf)), 0, uintptr(unsafe.Pointer(&ov)))
-	n, err := d.waitOverlapped(&ov, timeout)
-	return n, err
+	if errno, ok := callErr.(syscall.Errno); ok {
+		switch errno {
+		case 0, errSemTimeout, errOpAborted, errTimeout:
+			return int(transferred), nil // bounded read elapsed: no (more) data this round
+		}
+	}
+	return int(transferred), fmt.Errorf("asicam: ReadPipe failed: %v", callErr)
+}
+
+// BulkRead reads one frame from the bulk-IN endpoint into buf, in fixed maxBulkChunk
+// reads into a scratch buffer copied to a running watermark — so the read time-bounds
+// (default WinUSB blocks forever) and assembles the frame contiguously across the FX3's
+// mid-frame short packets, which a single whole-frame ReadPipe would stop on. Mirrors
+// the Linux usbfs BulkRead.
+func (d *winusbDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	deadline := time.Now().Add(timeout)
+	scratch := make([]byte, maxBulkChunk)
+	total := 0
+	for total < len(buf) {
+		ms := time.Until(deadline).Milliseconds()
+		if ms <= 0 {
+			break
+		}
+		n, err := d.readChunk(scratch, uint32(ms))
+		if n > 0 {
+			total += copy(buf[total:], scratch[:n])
+		}
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			break // no more data = frame end
+		}
+	}
+	return total, nil
+}
+
+// ReadFrameStream reads one whole frame, treating the FX3's mid-frame short packets and
+// ZLPs as NON-terminal (DDR cameras hold the frame's final partial buffer until
+// FPGABufReload, which the worker pulses for the duration of this call). It cycles
+// maxBulkChunk reads into scratch to a watermark until the frame is in, `idle` passes
+// with no data (a genuine stall), or the `total` deadline hits. winusbDevice satisfying
+// FrameStreamer is what makes StreamFrame use this instead of the generic loop.
+func (d *winusbDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	deadline := time.Now().Add(total)
+	scratch := make([]byte, maxBulkChunk)
+	got := 0
+	lastData := time.Now()
+	for got < len(buf) {
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			break
+		}
+		ms := rem
+		if ms > idle {
+			ms = idle
+		}
+		n, err := d.readChunk(scratch, uint32(ms.Milliseconds()))
+		if n > 0 {
+			got += copy(buf[got:], scratch[:n])
+			lastData = time.Now()
+			continue
+		}
+		if err != nil {
+			return got, err
+		}
+		if time.Since(lastData) >= idle {
+			break // genuine stall: no data for the whole idle window
+		}
+	}
+	return got, nil
+}
+
+// ResetEndpoint clears/aborts the bulk-IN pipe (WinUsb_ResetPipe) so a stale pipe state
+// from a prior aborted read can't fail the next transfer. It is the EndpointResetter the
+// capture worker calls before each frame (was unimplemented on Windows).
+func (d *winusbDevice) ResetEndpoint(ep uint8) error {
+	if r, _, _ := procWinUsbResetPipe.Call(d.winusb, uintptr(ep)); r == 0 {
+		return fmt.Errorf("asicam: WinUsb_ResetPipe(0x%02x) failed", ep)
+	}
+	return nil
 }
 
 func (d *winusbDevice) Close() error {
@@ -206,11 +378,28 @@ func OpenHost(vid, pid uint16) (Transport, error) {
 	return d, nil
 }
 
-// enumerateRaw / OpenLocation: not implemented on Windows yet. The WinUSB backend can
-// list ZWO devices via SetupDiGetClassDevs on the device interface GUID (parsing the
-// instance id for VID/PID and using it as the location) — a follow-up to match darwin.
-func enumerateRaw(uint16) ([]DeviceInfo, error)      { return nil, errEnumUnsupported }
-func OpenLocation(uint16, uint32) (Transport, error) { return nil, errEnumUnsupported }
+// enumerateRaw lists every VID-matched WinUSB device WITHOUT opening it (the shared
+// Enumerate filters these to known camera PIDs). Name is left empty (filterCameras fills
+// it from the model registry); Location is the path hash, the key OpenLocation reopens by.
+func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
+	var out []DeviceInfo
+	for _, n := range scanWinUSB(vid, 0) {
+		out = append(out, DeviceInfo{VID: n.vid, PID: n.pid, Location: pathLocation(n.path)})
+	}
+	return out, nil
+}
+
+// OpenLocation opens the WinUSB device whose path hashes to loc (from a DeviceInfo) — the
+// way to bind the exact unit chosen from Enumerate when several identical cameras are
+// attached.
+func OpenLocation(vid uint16, loc uint32) (Transport, error) {
+	for _, n := range scanWinUSB(vid, 0) {
+		if pathLocation(n.path) == loc {
+			return openPath(n.path)
+		}
+	}
+	return nil, fmt.Errorf("asicam: no WinUSB device at location 0x%08x for vid %04x (unplugged or moved)", loc, vid)
+}
 
 type overlapped struct {
 	Internal     uintptr
@@ -218,82 +407,6 @@ type overlapped struct {
 	Offset       uint32
 	OffsetHigh   uint32
 	HEvent       syscall.Handle
-}
-
-// waitOverlapped blocks for a single overlapped read to complete and returns the
-// transferred length. timeout is not honored here (the high-rate path is
-// BulkStream, which reaps via the IOCP with a real timeout); BulkRead is the
-// simple one-shot fallback.
-func (d *winusbDevice) waitOverlapped(ov *overlapped, timeout time.Duration) (int, error) {
-	_ = timeout
-	var transferred uint32
-	r, _, _ := procGetOverlappedRes.Call(uintptr(d.handle), uintptr(unsafe.Pointer(ov)), uintptr(unsafe.Pointer(&transferred)), 1)
-	if r == 0 {
-		return 0, fmt.Errorf("asicam: GetOverlappedResult failed")
-	}
-	return int(transferred), nil
-}
-
-// BulkStream submits nBuffers overlapped reads and reaps them through an IOCP,
-// resubmitting on completion (the startAsyncXfer window model).
-func (d *winusbDevice) BulkStream(bufSize, nBuffers int) (Stream, error) {
-	iocp, _, _ := procCreateIoCP.Call(uintptr(d.handle), 0, 0, 0)
-	if iocp == 0 {
-		return nil, fmt.Errorf("asicam: CreateIoCompletionPort failed")
-	}
-	// RAW_IO pipe policy for max throughput (no buffering/short-read coalescing).
-	var on uint8 = 1
-	procWinUsbSetPipePol.Call(d.winusb, pipeIn, rawIOPolicy, 1, uintptr(unsafe.Pointer(&on)))
-
-	s := &winusbStream{
-		d:    d,
-		iocp: syscall.Handle(iocp),
-		bufs: make([][]byte, nBuffers),
-		ovs:  make([]overlapped, nBuffers),
-	}
-	for i := range s.bufs {
-		s.bufs[i] = make([]byte, bufSize)
-		s.submit(i)
-	}
-	return s, nil
-}
-
-type winusbStream struct {
-	d    *winusbDevice
-	iocp syscall.Handle
-	bufs [][]byte
-	ovs  []overlapped
-}
-
-func (s *winusbStream) submit(i int) {
-	s.ovs[i] = overlapped{}
-	procWinUsbReadPipe.Call(s.d.winusb, pipeIn, uintptr(unsafe.Pointer(&s.bufs[i][0])), uintptr(len(s.bufs[i])), 0, uintptr(unsafe.Pointer(&s.ovs[i])))
-}
-
-func (s *winusbStream) Next(timeout time.Duration) ([]byte, error) {
-	var nbytes uint32
-	var key uintptr
-	var povl uintptr
-	r, _, _ := procGetQueuedCS.Call(uintptr(s.iocp), uintptr(unsafe.Pointer(&nbytes)), uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&povl)), uintptr(timeout.Milliseconds()))
-	if r == 0 {
-		return nil, fmt.Errorf("asicam: bulk stream wait failed/timeout")
-	}
-	// Match the completed OVERLAPPED by address, copy out, resubmit.
-	for i := range s.ovs {
-		if uintptr(unsafe.Pointer(&s.ovs[i])) != povl {
-			continue
-		}
-		out := make([]byte, nbytes)
-		copy(out, s.bufs[i][:nbytes])
-		s.submit(i)
-		return out, nil
-	}
-	return nil, fmt.Errorf("asicam: reaped unknown overlapped")
-}
-
-func (s *winusbStream) Close() error {
-	procCloseHandle.Call(uintptr(s.iocp))
-	return nil
 }
 
 // --- small helpers (avoid pulling extra deps) ---
@@ -308,16 +421,6 @@ func utf16BytesToString(b []byte) string {
 		u = append(u, c)
 	}
 	return syscall.UTF16ToString(u)
-}
-
-func containsFold(s, sub string) bool {
-	ls, lsub := toLowerASCII(s), toLowerASCII(sub)
-	for i := 0; i+len(lsub) <= len(ls); i++ {
-		if ls[i:i+len(lsub)] == lsub {
-			return true
-		}
-	}
-	return false
 }
 
 func toLowerASCII(s string) string {
