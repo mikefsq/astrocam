@@ -174,6 +174,42 @@ func (c *Camera) writeFPGAReg(reg, val uint16) error {
 
 func (c *Camera) vendorCmd(op uint8) error { return c.t.ControlOut(op, 0, 0, nil) }
 
+// FlashHPCMapAddr is the flash address of the factory hot/dead-pixel correction map blob.
+// Layout: a 2 KiB header beginning with magic "ASID" (defect map; "ASIG" = gain map) and a
+// big-endian uint32 payload length at offset 4, followed by a compressed 1-bit-per-pixel
+// defect bitmap.
+const FlashHPCMapAddr = 0x40000
+
+// ReadSPIFlash reads n bytes from the camera's SPI flash starting at addr, in 2 KiB vendor-IN
+// blocks (wIndex tracks addr>>8). The SPI flash and the sensor's 32-bit GPIF data bus share
+// FX3 pins, so the read is bracketed by EnableGPIF32DQ(false)/(true); the camera must be Init'd
+// first. Exposed so callers can pull the raw factory defect map (FlashHPCMapAddr) for inspection.
+func (c *Camera) ReadSPIFlash(addr uint32, n int) ([]byte, error) {
+	if err := c.t.ControlOut(cmdEnableGPIF32DQ, 0, 0, nil); err != nil {
+		return nil, err
+	}
+	defer c.t.ControlOut(cmdEnableGPIF32DQ, 1, 0, nil)
+	const block = 2048
+	out := make([]byte, 0, n)
+	for len(out) < n {
+		want := n - len(out)
+		if want > block {
+			want = block
+		}
+		buf := make([]byte, want)
+		got, err := c.t.ControlIn(reqReadSPIFlash, 0, uint16(addr>>8), buf)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, buf[:got]...)
+		if got < want {
+			break
+		}
+		addr += uint32(got)
+	}
+	return out, nil
+}
+
 // FirmwareVersion reads the camera firmware version.
 func (c *Camera) FirmwareVersion() (uint16, error) {
 	buf := make([]byte, 2)

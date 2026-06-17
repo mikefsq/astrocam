@@ -17,6 +17,11 @@
 //     geometry (SetFPGAWidth 0x04/05, SetFPGAHeight 0x08/09).
 //   - Data plane: the 6200 streams over the windowed FX3 pump with FPGABufReload tail-flush
 //     and a time-based stall (transport_darwin.go); see imx455Worker.
+//   - FX3 DDR frame markers: the readout brackets every frame with fixed header/footer DMA
+//     words (first 32-bit word 0x00005A7E, last 0x3CF00000), so RAW16 pixels 0,1 and N-2,N-1
+//     are not sensor data; the shared repairFX3DMAMarkers (capture.go, gated by the profile's
+//     FX3DMAMarkers flag) edge-replicates them — also covers the IMX462.
+//   - Optical-black crop (SetFPGAVBLK/SetFPGAHBLK) trims the OB margin band off the left/top.
 //
 // One IMX455 die backs the whole ASI6200 MM/MC family (the worker is variant-agnostic).
 // Still UNVERIFIED: the binned/12-bit readout modes (only full-frame 16-bit is on the
@@ -109,6 +114,11 @@ const (
 	imx455ExpMaxUs   = 0x77359400 // 2 000 000 000 µs, SetExp clamp hi
 	imx455SHSAdd     = 0x14       // long-exp SHS residual when VMAX = lines + 0x14
 	imx455YStartBias = 0x19       // Y row offset added before 0x06/0x07
+
+	// FPGA optical-black crop — leading blank columns/rows the readout windows past so the OB
+	// margin never reaches the host frame.
+	imx455FPGAVBLK = 49 // 0x31
+	imx455FPGAHBLK = 24 // 0x18
 
 	// Timing model (the per-mode V values and mode→table map are in
 	// imx455_modes.go). InitSensorMode stores a per-mode base constant V; V is used
@@ -241,6 +251,8 @@ var IMX455 = Sensor{
 	StreamStop:  func(rm Regmap) error { return rm.WriteReg(imx455RegMaster, 0) }, // 0x19e = 0
 	StreamStart: func(rm Regmap) error { return rm.WriteReg(imx455RegMaster, 5) }, // 0x19e = 5
 	Worker:      imx455Worker,                                                     // rich arm + windowed stream read
+
+	FX3DMAMarkers: true, // FX3 brackets each frame with 0x5A7E/0x3CF0 marker words (HW-confirmed)
 }
 
 // imx455Worker is the host-timed single-shot capture. Same skeleton as the IMX174/290,
@@ -906,6 +918,17 @@ func imx455SetROI(rm Regmap, x, y, w, h, bin int) error {
 		if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
 			return err
 		}
+	}
+	// FPGA optical-black crop: SetFPGAVBLK (0x06/0x07) and SetFPGAHBLK (0x02/0x03) tell the FX3
+	// how many leading blank / optical-black rows and columns the sensor emits ahead of the
+	// active image, so the readout windows PAST them. Without these, every frame carries the OB
+	// margin as a ~12 px-wide darker band on the left and ~27 px tall on top. VBLK = 49, HBLK =
+	// 24 (24 FPGA units = 12 packed px); validated pixel-for-pixel against the SDK.
+	if err := SetFPGAVBLK(rm, imx455FPGAVBLK); err != nil {
+		return err
+	}
+	if err := SetFPGAHBLK(rm, imx455FPGAHBLK); err != nil {
+		return err
 	}
 	// FPGA frame geometry: SetFPGAWidth → 0x04/0x05 = output
 	// width, SetFPGAHeight → 0x08/0x09 = output height. These size the FX3 transfer.

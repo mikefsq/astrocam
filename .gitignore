@@ -1,6 +1,7 @@
 # Go build output
 *.test
 *.out
+/cmd/gosnap/gosnap
 
 # Captured frames / scratch
 *.fits

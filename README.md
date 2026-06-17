@@ -1,6 +1,6 @@
-# astrocam — pure-Go ZWO / PlayerOne camera driver
+# astrocam —- Go astronomy camera driver
 
-A Go driver for **ZWO ASI** and **PlayerOne** astronomy cameras that talks the
+A Go driver for various astronomy cmos cameras that talks the
 cameras' USB protocol directly — **no vendor SDK** in the process. 
 
 cgo-free everywhere except the macOS USB backend: **Linux and Windows build with
@@ -12,8 +12,7 @@ A `(VID,PID)→Model` registry plus a `VID→Vendor` dialect map, so a single se
 keyed by the **Sony die** — serves every vendor that uses that die. ZWO and PlayerOne share
 the IMX455/IMX571 profiles; the only per-vendor difference is the register-map (`Regmap`)
 opcodes and the gain/offset unit scale, selected at call time from the regmap's VID. Vendors
-register themselves from `init()` (ZWO in `protocol.go`, PlayerOne in `protocol_poa.go`), so
-the core hardcodes no vendor. PlayerOne implementation of the same registers validates the ASI implementation.
+register themselves from `init()` (ZWO in `protocol.go`, PlayerOne in `protocol_poa.go`).
 
 ## Layout
 
@@ -45,9 +44,10 @@ cmd/gosnap/            bring-up + capture CLI (the pure-Go counterpart to the SD
 Control + data plane, cooling PID, guiding, and snap/stream capture, with modular sensor profiles (one per Sony die). Wired across the family: HCG gain, sub-frame ROI, binning, offset/black-level, RAW8/RAW16 readout, 10-bit high-speed mode, and host-timed long exposures.
 
 **Hardware-validated on the wire:**
-- **ASI6200MM/MC Pro (IMX455)** 
+- **ASI6200MM/MC Pro (IMX455)** — full-frame pixel-matched to the SDK: optical-black crop + FX3 DDR frame-marker repair (on by default), and hot-pixel map repair (off by default).
 - **ASI290MM Mini (IMX290)** 
-- **ASI462 (IMX462)**
+- **ASI462 (IMX462)** — 12-bit + 10-bit high-speed; shares the FX3 frame-marker repair (the repair is a per-sensor opt-in, so unverified/non-Sony cameras are never touched).
+- **ASI174MM Mini (IMX174)** — global shutter (no hardware binning)
 
 **WIP**: 
 - **IMX178**

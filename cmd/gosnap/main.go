@@ -14,6 +14,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -50,9 +51,12 @@ func main() {
 	replay := flag.String("replay", "", "replay an SDK 'req reg val' write sequence (file) then read a frame")
 	nframes := flag.Int("n", 1, "with -capture: after one arm, read N frames back-to-back (no re-arm) and time each — the cold-start/throwaway test")
 	discard := flag.Bool("discard", false, "with -capture -n N: capture frames via the resident stream but DON'T write them — the pure-capture throughput benchmark, matching the SDK video bench (no disk I/O)")
+	fixDefects := flag.Bool("fixdefects", false, "with -capture: apply the factory defect map (read once from flash) to the RAW16 frame — neighbour-average each hot/dead pixel. OFF by default: raw frames are better fixed by dithering + integration")
 	list := flag.Bool("list", false, "enumerate attached cameras (with serials) and exit")
 	serial := flag.String("serial", "", "open the camera with this factory serial (hex) instead of -pid")
 	thermal := flag.Bool("thermal", false, "read sensor temperature + humidity via the hardware Thermal backend and exit (read-only; no TEC actuation)")
+	dumpflash := flag.String("dumpflash", "", "read the factory defect map from SPI flash (0x40000) and write the raw blob to this path, then exit (read-only)")
+	keepMarkers := flag.Bool("keepmarkers", false, "do NOT repair the FX3 DDR frame header/footer marker pixels — deliver the genuine raw frame with the corner marker pixels intact (default off: markers are repaired on sensors that have them, e.g. IMX455/IMX462)")
 	tecoff := flag.Bool("tecoff", false, "force the TEC drive and fan OFF and exit (safety/recovery)")
 	heater := flag.Int("heater", -1, "set the anti-dew lens heater to this %% (0..100) and exit; reads back reg 0x2a/0x19. -1 = leave unchanged")
 	cool := flag.Bool("cool", false, "ACTUATE the TEC: open-loop power steps then a closed-loop regulation run (returns to 0 on exit/Ctrl-C)")
@@ -67,6 +71,9 @@ func main() {
 	maxerr := flag.Float64("maxerr", 0, "-regulate clamp on |temp-setpoint| °C the PID acts on (0 = off; ~3 = SDK-like gentle glide, both directions)")
 	regtarget2 := flag.Float64("regtarget2", math.NaN(), "-regulate second target °C: after reaching -regtarget, ramp to this (tests warmup); unset = single phase")
 	flag.Parse()
+	if *keepMarkers {
+		astrocam.RepairDMAMarkers = false
+	}
 
 	if *list {
 		if err := doList(); err != nil {
@@ -77,6 +84,12 @@ func main() {
 	if *thermal {
 		if err := doThermal(uint16(*pid)); err != nil {
 			log.Fatalf("thermal error: %v", err)
+		}
+		return
+	}
+	if *dumpflash != "" {
+		if err := doDumpFlash(uint16(*pid), *dumpflash); err != nil {
+			log.Fatalf("dumpflash: %v", err)
 		}
 		return
 	}
@@ -139,7 +152,7 @@ func main() {
 	o := captureOpts{
 		exposure: *exposure, gain: *gain, offset: *offset, bin: *bin, roi: *roi,
 		raw8: *raw8 || *highspeed, out: *out, timeout: *timeout, nframes: *nframes, usb2: *usb2,
-		discard: *discard, highspeed: *highspeed, fpsPerc: *fpsPerc,
+		discard: *discard, highspeed: *highspeed, fpsPerc: *fpsPerc, fixDefects: *fixDefects,
 	}
 	if err := run(uint16(*pid), *capture, *verbose, o); err != nil {
 		log.Fatalf("error: %v", err)
@@ -148,19 +161,20 @@ func main() {
 
 // captureOpts bundles the -capture controls (exposure/gain/offset/bin/roi/depth + output).
 type captureOpts struct {
-	exposure  time.Duration
-	gain      int
-	offset    int // -1 = leave the sensor default
-	bin       int
-	roi       string // "x,y,w,h" in binned pixels, or "" = full binned frame
-	raw8      bool
-	out       string
-	timeout   time.Duration
-	nframes   int
-	usb2      bool // force the USB2 readout path regardless of model/link
-	discard   bool // capture frames via the stream but don't write (pure-capture benchmark)
-	highspeed bool // 10-bit high-speed readout (implies raw8)
-	fpsPerc   int  // bandwidth-overload / FPS percent (40..100); 0 = bus default
+	exposure   time.Duration
+	gain       int
+	offset     int // -1 = leave the sensor default
+	bin        int
+	roi        string // "x,y,w,h" in binned pixels, or "" = full binned frame
+	raw8       bool
+	out        string
+	timeout    time.Duration
+	nframes    int
+	usb2       bool // force the USB2 readout path regardless of model/link
+	discard    bool // capture frames via the stream but don't write (pure-capture benchmark)
+	highspeed  bool // 10-bit high-speed readout (implies raw8)
+	fpsPerc    int  // bandwidth-overload / FPS percent (40..100); 0 = bus default
+	fixDefects bool // apply the factory defect map to the frame; opt-in
 }
 
 func (o captureOpts) binOr1() int {
@@ -499,6 +513,20 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 		if cam.Color() {
 			bayer = info.Bayer
 		}
+		// Opt-in factory defect correction. OFF by default — raw frames are better cleaned by
+		// dithering + sigma-clipped integration. Full-frame RAW16 only (the map is full-sensor).
+		if o.fixDefects {
+			if step == 2 && x == 0 && y == 0 && w == info.MaxWidth && h == info.MaxHeight {
+				if dm, derr := cam.LoadDefectMap(info.MaxWidth, info.MaxHeight); derr != nil {
+					fmt.Printf("  -fixdefects: %v (frame left raw)\n", derr)
+				} else {
+					dm.ApplyRAW16(buf[:n])
+					fmt.Printf("  -fixdefects: corrected %d factory defect pixels\n", dm.Count())
+				}
+			} else {
+				fmt.Printf("  -fixdefects: only full-frame RAW16 is supported; frame left raw\n")
+			}
+		}
 		if werr := writeFrameFile(o.out, buf[:n], w, h, step, bayer, info.PixelUm, o.exposure, o.gain, cam.Name()); werr != nil {
 			fmt.Printf("  warning: writing %s: %v\n", o.out, werr)
 		}
@@ -632,6 +660,55 @@ func doSerial(serial string) error {
 // doThermal reads temperature + humidity off a (cooled) camera via the decoded hardware
 // Thermal backend, and dumps the raw 0xB3 temp bytes so the decode can be checked against
 // the SDK. Read-only — it does NOT drive the TEC, fan, or heater.
+// doDumpFlash reads the factory defect-map blob from SPI flash (FlashHPCMapAddr) and writes the
+// raw compressed bytes to a file for inspection. Layout: a 2 KiB header with magic "ASID"
+// (defect) / "ASIG" (gain) + a big-endian uint32 payload length at offset 4, then the compressed
+// 1-bit-per-pixel defect bitmap.
+func doDumpFlash(pid uint16, path string) error {
+	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	cam, err := astrocam.Open(raw, astrocam.ZWO.VID, pid)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("connected %04x:%04x  %s\n", astrocam.ZWO.VID, pid, cam.Name())
+
+	// The flash read needs the firmware + GPIF up, so Init first.
+	if err := cam.Init(); err != nil {
+		return fmt.Errorf("init: %w", err)
+	}
+	head, err := cam.ReadSPIFlash(astrocam.FlashHPCMapAddr, 2048)
+	if err != nil {
+		return fmt.Errorf("read header: %w", err)
+	}
+	if len(head) < 16 {
+		return fmt.Errorf("short header read (%d B)", len(head))
+	}
+	magic := string(head[:4])
+	length := binary.BigEndian.Uint32(head[4:8])
+	fmt.Printf("flash @0x%05x: magic=%q  payload_len=%d (0x%x)  next8=% x\n",
+		astrocam.FlashHPCMapAddr, magic, length, length, head[8:16])
+	if magic != "ASID" && magic != "ASIG" {
+		fmt.Println("  NOTE: no ASID/ASIG header — flash region may be empty/erased or a different layout")
+	}
+	if length == 0 || length > 0x30000 {
+		return fmt.Errorf("implausible payload length %d", length)
+	}
+	total := int((length + 2047) &^ 2047)
+	blob, err := cam.ReadSPIFlash(astrocam.FlashHPCMapAddr, total)
+	if err != nil {
+		return fmt.Errorf("read blob (%d B): %w", total, err)
+	}
+	if err := os.WriteFile(path, blob, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %d bytes -> %s\n", len(blob), path)
+	return nil
+}
+
 func doThermal(pid uint16) error {
 	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
 	if err != nil {

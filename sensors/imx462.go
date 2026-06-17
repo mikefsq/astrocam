@@ -131,6 +131,8 @@ var IMX462 = Sensor{
 	StreamStop:  func(rm Regmap) error { return rm.WriteReg(imx462RegStandby, 1) }, // standby on (the capture worker)
 	StreamStart: func(rm Regmap) error { return rm.WriteReg(imx462RegStandby, 0) }, // standby off
 	Worker:      imx462Worker,
+
+	FX3DMAMarkers: true, // FX3 brackets each frame with 0x5A7E/0x3CF0 marker words (HW-confirmed)
 }
 
 // imx462Worker — the capture worker, the host-timed single-shot capture. Same skeleton

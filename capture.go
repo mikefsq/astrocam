@@ -391,6 +391,36 @@ const frameReadAttempts = 3
 // must be at least FrameBytes. It validates the frame by size and RETRIES with recovery
 // on a failed/short read, mirroring the SDK's re-arm-and-retry rather than failing the
 // whole capture on a single transient hiccup.
+// RepairDMAMarkers controls whether captured frames have their FX3 DDR frame header/footer
+// marker words stripped (on by default). Set false to receive the genuine raw frame with the
+// marker pixels intact — for wire analysis or to handle them downstream.
+var RepairDMAMarkers = true
+
+// repairFX3DMAMarkers strips the FX3 bridge's frame markers. The FX3 brackets every DDR frame
+// with a fixed header word (0x00005A7E low half) and footer word (0x3CF0 high half) — so the
+// first and last 32-bit DMA word are NOT sensor data (2 pixels each in RAW16, 4 each in RAW8).
+// This is an FX3-bridge artifact common to these cameras (confirmed on IMX455 + IMX462), gated
+// per-sensor by Sensor.FX3DMAMarkers. It is also signature-detected (the 0x5A7E/0x3CF0 byte
+// pattern at the very start/end), so it is a safe no-op on any frame that does not carry the
+// markers; when present, each marker word is overwritten by edge-replicating the nearest real
+// pixel. bpp is the output bytes-per-pixel (1 = RAW8, 2 = RAW16).
+func repairFX3DMAMarkers(buf []byte, bpp int) {
+	n := len(buf)
+	if bpp < 1 || n < 8 || n%bpp != 0 {
+		return
+	}
+	if buf[0] != 0x7E || buf[1] != 0x5A || buf[n-2] != 0xF0 || buf[n-1] != 0x3C {
+		return
+	}
+	fill := func(lo, hi, src int) {
+		for off := lo; off < hi; off += bpp {
+			copy(buf[off:off+bpp], buf[src:src+bpp])
+		}
+	}
+	fill(0, 4, 4)         // leading marker word <- first real pixel (at byte 4)
+	fill(n-4, n, n-4-bpp) // trailing marker word <- last real pixel (ends at byte n-4)
+}
+
 func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 	// Snapshot the state the read needs, then release the lock for the duration of the
 	// (multi-second) USB read so concurrent status polls / aborts aren't blocked.
@@ -413,6 +443,9 @@ func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 		if n < c.FrameBytes() {
 			c.setStatus(ExpFailed)
 			return n, fmt.Errorf("asicam: short frame (%d of %d bytes)", n, c.FrameBytes())
+		}
+		if RepairDMAMarkers && c.sensor.FX3DMAMarkers {
+			repairFX3DMAMarkers(buf[:n], ModeOf(c.rm).BytesPerPx)
 		}
 		n = c.binFrame(buf, n) // RAW16 host-side bin (no-op unless SoftBin>1)
 		c.setStatus(ExpIdle)   // one-shot consume

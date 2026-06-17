@@ -157,6 +157,13 @@ func FPGAWrite16(rm Regmap, loReg, hiReg, val uint16) error {
 	return rm.WriteFPGAReg(fpgaStrobe, 0)
 }
 
+// SetFPGAHBLK / SetFPGAVBLK program the FX3 optical-black crop: the count of leading blank /
+// optical-black columns (HBLK → FPGA 0x02/0x03) and rows (VBLK → 0x06/0x07) the sensor emits
+// ahead of the active image, so the readout windows past them and the OB margin never reaches
+// the host frame. Values are sensor-specific (from the profile).
+func SetFPGAHBLK(rm Regmap, hblk uint16) error { return FPGAWrite16(rm, fpgaHBLK0, fpgaHBLK1, hblk) }
+func SetFPGAVBLK(rm Regmap, vblk uint16) error { return FPGAWrite16(rm, fpgaVBLK0, fpgaVBLK1, vblk) }
+
 // SetFPGAOutputWidth programs the FX3 output bit width: FPGA reg 0xa bit0 = ADC enable
 // (always 1), bit4 = output width (1 = 16-bit RAW16, 0 = 8-bit RAW8). This is the live
 // form of what InitFPGA sets at bringup from the output depth.

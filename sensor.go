@@ -58,6 +58,15 @@ type Sensor struct {
 	// WriteFPGAReg regardless of Bus.
 	Bus RegBus
 
+	// FX3DMAMarkers marks a sensor whose FX3 readout brackets every frame with fixed DDR
+	// header/footer marker words — the first and last 32-bit DMA word (0x5A7E header / 0x3CF0
+	// footer) are NOT pixel data. When set, GetDataAfterExp runs the frame through
+	// repairFX3DMAMarkers (which still signature-checks each frame, so it cannot corrupt a frame
+	// that lacks the markers). Leave false on sensors not yet verified — including any non-Sony
+	// die that may frame differently — so their edge pixels are never touched. Confirmed: IMX455,
+	// IMX462.
+	FX3DMAMarkers bool
+
 	// Init is the sensor-side init sequence (ZWO/FPGA-facing — NOT a kernel
 	// driver's CSI-2 init, which configures a different output interface).
 	Init []RegVal

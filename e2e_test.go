@@ -51,9 +51,12 @@ func TestE2ECapture(t *testing.T) {
 			if ft.Reads == 0 {
 				t.Errorf("no frame read was served")
 			}
-			// The stub served a 16-bit ramp (pixel 0=0, pixel 1=1); confirm it round-tripped.
-			if buf[0] != 0 || buf[1] != 0 || buf[2] != 1 || buf[3] != 0 {
-				t.Errorf("frame head = % x, want ramp 00 00 01 00", buf[:4])
+			// The stub served a 16-bit ramp (pixel i = i); confirm it round-tripped. Check
+			// interior pixels 2,3 (= 02 00 03 00) rather than 0,1: the IMX455 worker repairs the
+			// FX3 DDR header/footer marker words, which edge-replicate pixels 0,1 (and the last
+			// two), so the very first pixels are intentionally no longer the raw ramp there.
+			if buf[4] != 2 || buf[5] != 0 || buf[6] != 3 || buf[7] != 0 {
+				t.Errorf("frame px2,3 = % x, want ramp 02 00 03 00", buf[4:8])
 			}
 			// The control plane must have actually programmed the camera (init + ops).
 			if len(ft.Log) < 20 {
