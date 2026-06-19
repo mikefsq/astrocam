@@ -764,11 +764,18 @@ static void asi_close(asicam_dev* d) {
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 	"unsafe"
 )
+
+// errClosed is returned by a transfer attempted after Close has freed the handle —
+// instead of dereferencing the dangling t.d (a SIGSEGV inside the C library). A
+// readout in flight when the camera is torn down (unplug/reconnect) sees this on its
+// next transfer and unwinds cleanly.
+var errClosed = errors.New("asicam: transport closed")
 
 // IOReturn codes we special-case for diagnostics.
 const (
@@ -788,6 +795,14 @@ type darwinDevice struct {
 	// the same reason). Bulk reads (EP 0x81) are a separate pipe and stay UNLOCKED,
 	// so a multi-second readout can't stall a TEC tick.
 	ctrlMu sync.Mutex
+
+	// closeMu guards the handle's lifetime against the transfers that use it. Every
+	// operation that touches t.d takes it as a reader (so several — a readout plus a
+	// TEC tick — still run concurrently); Close takes it as the writer, so it cannot
+	// free t.d while any transfer is mid-flight, and any transfer started after Close
+	// sees closed and returns errClosed instead of dereferencing freed memory.
+	closeMu sync.RWMutex
+	closed  bool
 }
 
 // OpenIOUSBHost finds the first device matching vid/pid via IOKit, opens it, and
@@ -886,6 +901,11 @@ func (t *darwinDevice) Describe() string {
 func (t *darwinDevice) SuperSpeed() bool { return int(t.diag.inMaxPacket) >= 1024 }
 
 func (t *darwinDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, data []byte) (int, error) {
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+	if t.closed {
+		return 0, errClosed
+	}
 	t.ctrlMu.Lock()
 	defer t.ctrlMu.Unlock()
 	var done C.uint32_t
@@ -913,6 +933,11 @@ func (t *darwinDevice) ControlIn(bRequest uint8, wValue, wIndex uint16, data []b
 func (t *darwinDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
+	}
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+	if t.closed {
+		return 0, errClosed
 	}
 	ms := timeout.Milliseconds()
 	if ms <= 0 {
@@ -947,6 +972,11 @@ func (t *darwinDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+	if t.closed {
+		return 0, errClosed
+	}
 	idleMs := idle.Milliseconds()
 	if idleMs <= 0 {
 		idleMs = 800
@@ -974,6 +1004,11 @@ type darwinStream struct {
 // StartStream opens a persistent windowed stream and primes it. frameBytes is informational
 // (each Next call passes the actual buffer); total is the per-transfer timeout.
 func (t *darwinDevice) StartStream(frameBytes int, total time.Duration) (FrameStream, error) {
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+	if t.closed {
+		return nil, errClosed
+	}
 	totalMs := total.Milliseconds()
 	if totalMs <= 0 {
 		totalMs = 5000
@@ -1056,7 +1091,17 @@ func (t *darwinDevice) ResetDevice() error {
 	return nil
 }
 
+// Close releases the IOKit interfaces and frees the handle. It takes closeMu as the
+// writer, so it blocks until every in-flight transfer has returned and no new one can
+// start (they observe closed and return errClosed). Idempotent: a second call is a
+// no-op, so the adapter's teardown and graceful Close can both call it safely.
 func (t *darwinDevice) Close() error {
+	t.closeMu.Lock()
+	defer t.closeMu.Unlock()
+	if t.closed {
+		return nil
+	}
+	t.closed = true
 	C.asi_close(t.d)
 	C.free(unsafe.Pointer(t.d))
 	return nil
