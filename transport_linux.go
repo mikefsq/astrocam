@@ -208,6 +208,14 @@ func (d *usbfsDevice) ControlIn(bRequest uint8, wValue, wIndex uint16, data []by
 // 1 MiB matches the SDK/darwin xferLen and stays well clear of it.
 const maxBulkChunk = 1 << 20
 
+// bulkReadStall bounds, once a frame has started arriving, both the per-read blocking
+// window and how long BulkRead keeps cycling on a no-data read (a mid-frame ZLP or a
+// per-read timeout) before concluding the frame is genuinely over. It must comfortably
+// exceed the FX3's held-tail commit latency (sub-second) yet stay small so a truly short
+// frame is reported promptly. It does NOT bound the wait for the first byte — that uses the
+// full deadline, since the sensor self-times the exposure before any data arrives.
+const bulkReadStall = 1500 * time.Millisecond
+
 // bulkOne issues one USBDEVFS_BULK read of up to len(buf) bytes and returns the
 // count actually transferred (which is < len(buf) when the device ends with a short
 // packet).
@@ -240,6 +248,19 @@ func (d *usbfsDevice) bulkOne(buf []byte, timeoutMs uint32) (int, error) {
 //
 // This mirrors the darwin async pump's windowed read; the difference from the prior
 // single-ioctl version is why a whole-frame read worked on macOS but not here.
+//
+// A ZERO-length packet (n==0) needs care. The FX3 emits a non-terminal ZLP at the 1-MiB
+// DMA-buffer boundary and then HOLDS the frame's final partial buffer (the tail past the
+// last 1-MiB boundary) for a beat before committing it — so once the frame has started, a
+// ZLP with the frame still short of len(buf) is NOT the end; we must keep cycling until the
+// tail lands. Breaking on it returned a short frame. That is exactly the ASI174MM Mini's
+// >4 s single-shot TRIGGER capture failing on Linux but not on macOS: macOS's
+// asi_read_frame_async posts every transfer up front, so the held tail still lands in an
+// already-posted transfer, while this sequential reader gave up on the boundary ZLP. The
+// free-run <4 s band streams continuously (no boundary stall) and so never tripped it.
+// BEFORE the first byte, a no-data read is left blocking for the full deadline: the sensor
+// self-times the exposure before any data arrives, so capping/giving-up there would abandon
+// a long (but valid) <4 s frame.
 func (d *usbfsDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
@@ -247,20 +268,35 @@ func (d *usbfsDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
 	deadline := time.Now().Add(timeout)
 	scratch := make([]byte, maxBulkChunk)
 	total := 0
+	lastData := time.Now()
 	for total < len(buf) {
-		ms := time.Until(deadline).Milliseconds()
-		if ms <= 0 {
+		rem := time.Until(deadline)
+		if rem <= 0 {
 			break // out of time; return what arrived (caller validates by frame size)
 		}
-		n, err := d.bulkOne(scratch, uint32(ms))
+		// Once the frame has started, cap each read at bulkReadStall so a mid-frame ZLP/
+		// stall can't park us on one blocking ioctl for the whole (multi-second) deadline —
+		// we re-decide between reads. Before the first byte, allow the full remaining wait.
+		ms := rem
+		if total > 0 && ms > bulkReadStall {
+			ms = bulkReadStall
+		}
+		n, err := d.bulkOne(scratch, uint32(ms.Milliseconds()))
 		if n > 0 {
 			total += copy(buf[total:], scratch[:n])
+			lastData = time.Now()
+			continue
 		}
-		if err != nil {
+		// No data this read — a zero-length packet or a per-read timeout (ETIMEDOUT/ETIME).
+		// A genuine pipe/device error still aborts.
+		if errno, ok := err.(syscall.Errno); err != nil && (!ok || (errno != syscall.ETIMEDOUT && errno != syscall.ETIME)) {
 			return total, err
 		}
-		if n == 0 {
-			break // no more data = frame end
+		// Before any data, a ZLP is the frame end (preserve the prior behavior); once data
+		// has started, keep cycling for the held tail until the buffer fills or bulkReadStall
+		// elapses with no data at all (a genuine stall / short frame).
+		if total == 0 || time.Since(lastData) >= bulkReadStall {
+			break
 		}
 	}
 	return total, nil
