@@ -6,12 +6,15 @@
 //
 // HARDWARE-VALIDATED against real cameras — ASI174MM Mini (USB2) and ASI6200MM Pro
 // (USB3, full 122 MB frames): serial-bind enumeration plus capture. Frame reads go
-// through fixed 1 MiB usbfs bulk transfers assembled to a contiguous watermark
-// (BulkRead / ReadFrameStream), for usbfs-specific reasons a single whole-frame ioctl
-// gets wrong: usbfs kmallocs a contiguous kernel buffer per transfer (so a multi-MB
-// read fails with ENOMEM), and the FX3's mid-frame short packets / ZLPs must be read
-// THROUGH rather than taken as the frame end. Needs a udev rule granting access to the
-// ZWO VID 0x03C3 (see deploy/).
+// through fixed 1 MiB usbfs bulk transfers, for usbfs-specific reasons a single
+// whole-frame ioctl gets wrong: usbfs kmallocs a contiguous kernel buffer per transfer
+// (so a multi-MB read fails with ENOMEM), and the FX3's mid-frame short packets / ZLPs
+// must be read THROUGH rather than taken as the frame end. Two read paths: BulkRead uses
+// the async-URB API (SUBMITURB/REAPURB) to post all of a frame's transfers up front with
+// the last sized to the exact remainder — the only way the FX3 releases its held final
+// partial DMA buffer (the >4 s single-shot TRIGGER tail); ReadFrameStream uses the
+// synchronous windowed-read loop with a FPGABufReload tail-flush for the USB3 DDR parts.
+// Needs a udev rule granting access to the ZWO VID 0x03C3 (see deploy/).
 
 package astrocam
 
@@ -31,11 +34,35 @@ import (
 func ioc(dir, nr, size uintptr) uintptr { return dir<<30 | size<<16 | 0x55<<8 | nr }
 
 var (
-	usbdevfsControl        = ioc(3, 0, 24) // _IOWR('U',0,usbdevfs_ctrltransfer)
-	usbdevfsBulk           = ioc(3, 2, 24) // _IOWR('U',2,usbdevfs_bulktransfer)
-	usbdevfsClaimInterface = ioc(2, 15, 4) // _IOR('U',15,uint)
-	usbdevfsClearHalt      = ioc(2, 21, 4) // _IOR('U',21,uint)
+	usbdevfsControl        = ioc(3, 0, 24)  // _IOWR('U',0,usbdevfs_ctrltransfer)
+	usbdevfsBulk           = ioc(3, 2, 24)  // _IOWR('U',2,usbdevfs_bulktransfer)
+	usbdevfsSubmitURB      = ioc(2, 10, 56) // _IOR('U',10,usbdevfs_urb)  = 0x8038550a (64-bit)
+	usbdevfsDiscardURB     = ioc(0, 11, 0)  // _IO('U',11)                = 0x0000550b
+	usbdevfsReapURB        = ioc(1, 12, 8)  // _IOW('U',12,void*)         = 0x4008550c (blocking)
+	usbdevfsReapURBNDelay  = ioc(1, 13, 8)  // _IOW('U',13,void*)         = 0x4008550d (non-blocking)
+	usbdevfsClaimInterface = ioc(2, 15, 4)  // _IOR('U',15,uint)
+	usbdevfsClearHalt      = ioc(2, 21, 4)  // _IOR('U',21,uint)
 )
+
+// usbURB is the 64-bit <linux/usbdevice_fs.h> struct usbdevfs_urb (56 bytes, no trailing
+// iso packet descriptors). It is what the async SUBMITURB/REAPURB path posts and reaps.
+type usbURB struct {
+	typ          uint8
+	endpoint     uint8
+	_            [2]byte
+	status       int32
+	flags        uint32
+	buffer       uintptr
+	bufferLength int32
+	actualLength int32
+	startFrame   int32
+	numberOfPkts int32 // union with stream_id
+	errorCount   int32
+	signr        uint32
+	usercontext  uintptr
+}
+
+const urbTypeBulk = 3 // USBDEVFS_URB_TYPE_BULK
 
 // Kernel structs (64-bit layout from <linux/usbdevice_fs.h>).
 type usbCtrlTransfer struct {
@@ -208,17 +235,10 @@ func (d *usbfsDevice) ControlIn(bRequest uint8, wValue, wIndex uint16, data []by
 // 1 MiB matches the SDK/darwin xferLen and stays well clear of it.
 const maxBulkChunk = 1 << 20
 
-// bulkReadStall bounds, once a frame has started arriving, both the per-read blocking
-// window and how long BulkRead keeps cycling on a no-data read (a mid-frame ZLP or a
-// per-read timeout) before concluding the frame is genuinely over. It must comfortably
-// exceed the FX3's held-tail commit latency (sub-second) yet stay small so a truly short
-// frame is reported promptly. It does NOT bound the wait for the first byte — that uses the
-// full deadline, since the sensor self-times the exposure before any data arrives.
-const bulkReadStall = 1500 * time.Millisecond
-
 // bulkOne issues one USBDEVFS_BULK read of up to len(buf) bytes and returns the
 // count actually transferred (which is < len(buf) when the device ends with a short
-// packet).
+// packet). Used by ReadFrameStream (the synchronous windowed pump); BulkRead uses the
+// async-URB path instead — see readFrameURBs.
 func (d *usbfsDevice) bulkOne(buf []byte, timeoutMs uint32) (int, error) {
 	bt := usbBulkTransfer{ep: bulkEndpoint, len: uint32(len(buf)), timeout: timeoutMs}
 	if len(buf) > 0 {
@@ -231,73 +251,145 @@ func (d *usbfsDevice) bulkOne(buf []byte, timeoutMs uint32) (int, error) {
 	return int(r), nil
 }
 
-// BulkRead reads one frame from the bulk-IN endpoint into buf. It issues fixed,
-// maxBulkChunk-sized reads into a scratch buffer and copies each to a running
-// watermark in buf, for three reasons the obvious single whole-buffer ioctl gets
-// wrong on usbfs:
-//
-//   - Allocation: usbfs kmallocs a contiguous kernel buffer per ioctl, so a multi-MB
-//     whole-frame request fails with ENOMEM. 1 MiB stays under the kernel limit.
-//   - Mid-frame short packets: the FX3 ends each DDR buffer with a short packet that
-//     is NOT the frame end. Breaking on it (or reading to a fixed per-chunk offset)
-//     truncates the frame; the watermark copy keeps it contiguous and we read on.
-//   - Overflow: a request whose length is not a multiple of the endpoint max-packet
-//     size overflows (EOVERFLOW) when the device delivers a full packet into the
-//     short remainder. A full maxBulkChunk request is always packet-aligned, so the
-//     incoming packet always fits.
-//
-// This mirrors the darwin async pump's windowed read; the difference from the prior
-// single-ioctl version is why a whole-frame read worked on macOS but not here.
-//
-// A ZERO-length packet (n==0) needs care. The FX3 emits a non-terminal ZLP at the 1-MiB
-// DMA-buffer boundary and then HOLDS the frame's final partial buffer (the tail past the
-// last 1-MiB boundary) for a beat before committing it — so once the frame has started, a
-// ZLP with the frame still short of len(buf) is NOT the end; we must keep cycling until the
-// tail lands. Breaking on it returned a short frame. That is exactly the ASI174MM Mini's
-// >4 s single-shot TRIGGER capture failing on Linux but not on macOS: macOS's
-// asi_read_frame_async posts every transfer up front, so the held tail still lands in an
-// already-posted transfer, while this sequential reader gave up on the boundary ZLP. The
-// free-run <4 s band streams continuously (no boundary stall) and so never tripped it.
-// BEFORE the first byte, a no-data read is left blocking for the full deadline: the sensor
-// self-times the exposure before any data arrives, so capping/giving-up there would abandon
-// a long (but valid) <4 s frame.
+// bulkTrace, when ASTROCAM_BULK_TRACE is set, logs one line per submitted/reaped urb to
+// stderr so a real capture reveals exactly what the wire does (held-tail / short-packet
+// timing). Diagnostic only — left off by default.
+var bulkTrace = os.Getenv("ASTROCAM_BULK_TRACE") != ""
+
+// BulkRead reads one whole frame from the bulk-IN endpoint into buf via the async-URB pump
+// (readFrameURBs), which is what gets the FX3's held >4 s TRIGGER tail. See that function.
 func (d *usbfsDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
+	return d.readFrameURBs(buf, timeout)
+}
+
+// readFrameURBs reads one whole frame through the usbfs ASYNC urb API, mirroring the macOS
+// asi_read_frame_async pump that the SDK/darwin path uses. It submits ceil(len/chunk)
+// bulk-IN transfers up front (USBDEVFS_SUBMITURB) — each into its slice of buf at a fixed
+// offset, the LAST sized to the exact remainder, not a padded full chunk — then reaps them
+// in completion order (USBDEVFS_REAPURBNDELAY) and counts contiguous bytes up to the first
+// short or failed transfer (the FX3 ends a frame with a short packet).
+//
+// The exact-remainder final transfer is the crux of the >4 s single-shot TRIGGER fix. The
+// FX3 commits whole 1-MiB DMA buffers and HOLDS the frame's final partial buffer; when the
+// host asks for a full 1 MiB it cannot fill, it keeps holding (a synchronous USBDEVFS_BULK
+// or a 1-MiB async transfer just sits there — the read returns ~4 MiB short). Requesting
+// exactly the pending tail bytes is what makes it deliver — which is why macOS, sizing its
+// last transfer to bufSize-off, never saw the bug. usbfs reports a short bulk-IN as status 0
+// with actual_length < buffer_length (no error), so a short transfer marks the frame end.
+func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
-	deadline := time.Now().Add(timeout)
-	scratch := make([]byte, maxBulkChunk)
-	total := 0
-	lastData := time.Now()
-	for total < len(buf) {
-		rem := time.Until(deadline)
-		if rem <= 0 {
-			break // out of time; return what arrived (caller validates by frame size)
+	start := time.Now()
+	deadline := start.Add(timeout)
+	n := (len(buf) + maxBulkChunk - 1) / maxBulkChunk
+	urbs := make([]usbURB, n)
+	submitted := make([]bool, n)
+	done := make([]bool, n)
+	slotOf := func(p uintptr) int {
+		for i := range urbs {
+			if p == uintptr(unsafe.Pointer(&urbs[i])) {
+				return i
+			}
 		}
-		// Once the frame has started, cap each read at bulkReadStall so a mid-frame ZLP/
-		// stall can't park us on one blocking ioctl for the whole (multi-second) deadline —
-		// we re-decide between reads. Before the first byte, allow the full remaining wait.
-		ms := rem
-		if total > 0 && ms > bulkReadStall {
-			ms = bulkReadStall
+		return -1
+	}
+	// On any exit, discard + blocking-drain every submitted-but-unreaped urb so no
+	// completion lands against buf after we return.
+	defer func() {
+		for i := range submitted {
+			if submitted[i] && !done[i] {
+				_ = d.ioctl(usbdevfsDiscardURB, unsafe.Pointer(&urbs[i]))
+			}
 		}
-		n, err := d.bulkOne(scratch, uint32(ms.Milliseconds()))
-		if n > 0 {
-			total += copy(buf[total:], scratch[:n])
-			lastData = time.Now()
-			continue
+		for {
+			pending := false
+			for i := range submitted {
+				if submitted[i] && !done[i] {
+					pending = true
+				}
+			}
+			if !pending {
+				break
+			}
+			var p uintptr
+			if err := d.ioctl(usbdevfsReapURB, unsafe.Pointer(&p)); err != nil {
+				break
+			}
+			if i := slotOf(p); i >= 0 {
+				done[i] = true
+			}
 		}
-		// No data this read — a zero-length packet or a per-read timeout (ETIMEDOUT/ETIME).
-		// A genuine pipe/device error still aborts.
-		if errno, ok := err.(syscall.Errno); err != nil && (!ok || (errno != syscall.ETIMEDOUT && errno != syscall.ETIME)) {
-			return total, err
+	}()
+
+	for i := 0; i < n; i++ {
+		off := i * maxBulkChunk
+		l := maxBulkChunk
+		if off+l > len(buf) {
+			l = len(buf) - off // last transfer: the exact remainder (see doc)
 		}
-		// Before any data, a ZLP is the frame end (preserve the prior behavior); once data
-		// has started, keep cycling for the held tail until the buffer fills or bulkReadStall
-		// elapses with no data at all (a genuine stall / short frame).
-		if total == 0 || time.Since(lastData) >= bulkReadStall {
+		urbs[i] = usbURB{typ: urbTypeBulk, endpoint: bulkEndpoint,
+			buffer: uintptr(unsafe.Pointer(&buf[off])), bufferLength: int32(l)}
+		if err := d.ioctl(usbdevfsSubmitURB, unsafe.Pointer(&urbs[i])); err != nil {
+			if i == 0 {
+				return 0, err // couldn't post a single transfer — fatal
+			}
+			break // submit what we can; the reaped prefix is still a valid frame
+		}
+		submitted[i] = true
+	}
+	if bulkTrace {
+		fmt.Fprintf(os.Stderr, "[urb] start want=%d n=%d timeout=%s\n", len(buf), n, timeout)
+	}
+
+	// Reap in completion order (== submission order on a single pipe) until every submitted
+	// transfer is in or the deadline hits.
+	for {
+		pending := false
+		for i := range submitted {
+			if submitted[i] && !done[i] {
+				pending = true
+			}
+		}
+		if !pending || time.Now().After(deadline) {
 			break
 		}
+		var p uintptr
+		err := d.ioctl(usbdevfsReapURBNDelay, unsafe.Pointer(&p))
+		if err == syscall.EAGAIN {
+			time.Sleep(200 * time.Microsecond)
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if i := slotOf(p); i >= 0 {
+			done[i] = true
+			if bulkTrace {
+				fmt.Fprintf(os.Stderr, "[urb] t=%.3fs slot=%d n=%d status=%d\n",
+					time.Since(start).Seconds(), i, urbs[i].actualLength, urbs[i].status)
+			}
+		}
+	}
+
+	// Assemble: contiguous bytes in order, up to and including the frame-terminating short
+	// transfer. A slot that never completed or failed (status != 0) truncates the frame.
+	total := 0
+	for i := 0; i < n; i++ {
+		if !done[i] || urbs[i].status != 0 {
+			break
+		}
+		req := maxBulkChunk
+		if off := i * maxBulkChunk; off+req > len(buf) {
+			req = len(buf) - off
+		}
+		total += int(urbs[i].actualLength)
+		if int(urbs[i].actualLength) < req {
+			break // short packet = end of frame
+		}
+	}
+	if bulkTrace {
+		fmt.Fprintf(os.Stderr, "[urb] done total=%d/%d elapsed=%.3fs\n", total, len(buf), time.Since(start).Seconds())
 	}
 	return total, nil
 }
