@@ -15,7 +15,7 @@
 //	SetStartPos       (0x3018=0x14; ROI X 0x303c/3d align 2, Y 0x3044/45 align 4)
 //	SetGain           (clamp 0..600; HCG when gain>199 → conv 0x3030=1 and eff=gain-150; LCG eff=gain;
 //	                   code = eff/3 (eff*0xaaab>>17) → 0x306c/0x306d 16-bit LE; latch 0x3001)
-//	SetExp            (SHS 24-bit 0x3050-52; line_time=HMAX*1000/clock; VMAX=height+60;
+//	SetExp            (SHS 24-bit 0x3050-52; line_time=HMAX*1000/clock; VMAX=height+2;
 //	                   SHS=clamp((VMAX-8)-lines, 8, VMAX-8); ≥1 s → FPGA trigger mode)
 //	SetBrightness     (offset -> 0x30dc (low) / 0x30dd (high), 16-bit LE; latch 0x3001)
 //	Start/StopSensorStreaming (start: 0x3004=0, 0x3000=0, FPGAStart; stop: FPGAStop, 0x3000=1)
@@ -66,13 +66,15 @@ const (
 	// Die/mode readout facts (shared engine: fps.go / shutter.go). Geometry is image-orientation;
 	// horizontal 3840, vertical 2160 (= the line count VMAX uses). IMX585 effective 4K (3840×2160).
 	imx585FullWidth  = 3840  // horizontal (lit16 0x3440)
-	imx585FullHeight = 2160  // vertical — the line count VMAX = height + 60 uses
+	imx585FullHeight = 2160  // vertical — the line count VMAX = height + 2 uses
 	imx585ClkKHz     = 20000 // 20 MHz
 	imx585HMAX       = 192   // the BAKED line-period HMAX; fixed post-init (SetCMOSClk writes no
 	//                          static floor). The FPS-percent default 80 is NOT a floor.
 	//                          line_time = 192·1e6/20000 = 9600 ns.
-	imx585VBlankAdd = 60 // VMAX = height + 60 (the default-mode vblank; HDR mode uses 30)
-	imx585SHSGuard  = 8  // SHS = clamp((VMAX-8) − lines, 8, VMAX-8) (the -8 / floor 8)
+	imx585VBlankAdd = 2 // VMAX = height + 2. (The 60 used for the Sony output-height registers
+	//                     0x3046/0x3047 in Cam_SetResolution is NOT the VMAX addend.) Affects the
+	//                     frame period, not the integration time.
+	imx585SHSGuard = 8 // SHS = clamp((VMAX-8) − lines, 8, VMAX-8) (the -8 / floor 8)
 )
 
 // imx585Init — the InitCamera reglist: 226 records, [reg:u16le][val:u16le], reg 0xffff = delay ms.
@@ -192,13 +194,28 @@ func imx585SetGain(rm Regmap, gain int) error {
 }
 
 // imx585SetExposure — STARVIS-2 rolling shutter: line_time = HMAX·1000/clock (HMAX baked at 192),
-// VMAX = height + 60, SHS = clamp((VMAX-8) − lines, 8, VMAX-8) to the 24-bit 0x3050-52 (bracketed by
+// VMAX = height + 2, SHS = clamp((VMAX-8) − lines, 8, VMAX-8) to the 24-bit 0x3050-52 (bracketed by
 // 0x3001), VMAX to the FPGA (SetFPGAVMAX). Exposures ≥ 1 s engage FPGA trigger mode (reg0 bit7) and the
 // worker host-times them.
 func imx585SetExposure(rm Regmap, d time.Duration) error {
 	trigger := d >= imx585LongExpUs*time.Microsecond
-	if err := SetFPGABit(rm, 0x00, 0x80, trigger); err != nil {
-		return err
+	// Engage BOTH FPGA flags for the ≥1 s band and clear both below. imx585 uses its own inline
+	// math (not ApplyExposure), so it sets reg0 bit6 (EnableFPGAWaitMode) + bit7
+	// (EnableFPGATriggerMode) itself: WaitMode then TriggerMode to set, the reverse to clear.
+	if trigger {
+		if err := SetFPGABit(rm, 0x00, 0x40, true); err != nil { // EnableFPGAWaitMode
+			return err
+		}
+		if err := SetFPGABit(rm, 0x00, 0x80, true); err != nil { // EnableFPGATriggerMode
+			return err
+		}
+	} else {
+		if err := SetFPGABit(rm, 0x00, 0x80, false); err != nil { // EnableFPGATriggerMode off
+			return err
+		}
+		if err := SetFPGABit(rm, 0x00, 0x40, false); err != nil { // EnableFPGAWaitMode off
+			return err
+		}
 	}
 	lineNs := uint64(imx585HMAX) * 1_000_000 / imx585ClkKHz // 9600 ns
 	lines := ExposureLines(d, lineNs, imx585ExpMinUs, imx585ExpMaxUs)

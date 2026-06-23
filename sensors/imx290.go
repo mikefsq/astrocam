@@ -1,14 +1,16 @@
-// This profile captured full 1936×1096 16-bit frames
-// on real hardware across 0.2 s / 2 s / 4 s / 10 s. Confirmed: the reglist + tail + FPGA
-// bringup (incl. the reg0xa=0x51 output-width fire), the host-timed worker (imx290Worker),
-// the stream gate, the USB2 bandwidth-overload of 40 (HMAX 0x07fa=2042), the exposure math
-// (SHS=0xcc at 0.2 s), AND the ≥1 s FPGA trigger-mode band (reg0 bit7) — without it the
-// free-running sensor delivered a partial frame caught mid-readout.
+// This profile captures full 1936×1096 16-bit frames on real hardware. The exposure register
+// programming is confirmed on hardware: at 0.2 s the driver writes HMAX 0x0662 / VMAX 0x0008e0 /
+// SHS 1 / gain 0. Confirmed:
+// the reglist + tail + FPGA bringup (incl. the reg0xa=0x51 output-width fire), the host-timed worker
+// (imx290Worker), the stream gate, the mode-dependent pixel clock (18562 for normal RAW16), and the
+// ≥1 s FPGA trigger-mode band (reg0 bit7) — without it the free-running sensor delivers a partial
+// frame caught mid-readout.
 //
-// STILL UNVERIFIED: exposure-time *accuracy* (the bandwidth-overload of 40 is inferred, not
-// measured — needs a light-vs-time sweep), binning, and the SetCMOSClk 0x3009 seam. NOTE:
-// every captured frame carries a 4-byte "7e 5a 01 00" start marker that capture.go does not
-// yet strip (it searches for 0xBB00AA11) — that marker is likely this camera's frame header.
+// STILL UNVERIFIED: absolute exposure-time accuracy via a light-vs-time sweep (frame brightness is
+// not a clean check on an uncovered sensor); the HMAX floor (not exercised at full-frame, which is
+// bandwidth-limited); the high-speed and binned readout modes. NOTE: every captured frame carries a
+// 4-byte "7e 5a 01 00" start marker that capture.go does not yet strip (it searches for 0xBB00AA11)
+// — that marker is likely this camera's frame header.
 package sensors
 
 import . "github.com/mikefsq/astrocam"
@@ -68,12 +70,18 @@ const (
 	// geometry. The line time is COMPUTED from these, never baked.
 	imx290FullWidth  = 1936 // MaxWidth (full-frame exposure/HMAX assumption)
 	imx290FullHeight = 1096 // MaxHeight
-	imx290ClkKHz     = 9281 // pixel clock in kHz (SetCMOSClk): INCK 37.125 MHz / 4, USB2/12-bit base mode
-	imx290HMAXFloor  = 203  // REG_FRAME_LENGTH_PKG_MIN: HMAX lower bound
-	imx290VBlankAdd  = 18   // VMAX = height + 18 (0x12) (SetExp)
-	imx290SHSOffset  = 17   // SHS = (height + 17 (0x11)) - exposureLines (SetExp)
-	imx290HBLK       = 0    // SetFPGAHBLK(0)  (Cam_SetResolution)
-	imx290VBLK       = 9    // SetFPGAVBLK(9)  (Cam_SetResolution) — sensor-specific blanking
+	// The pixel clock is mode-dependent: normal RAW16 = 18562, 10-bit high-speed = 37124, bin-2 =
+	// 9281. RAW16 imaging runs Bin=1/SoftBin, so only the normal/high-speed clocks are modelled here
+	// (the bin-2 9281 path isn't hit). The normal clock (18562) is confirmed on hardware — at 0.2 s
+	// the resulting HMAX is 0x0662. The HMAX floor and high-speed pair are not yet exercised.
+	imx290ClkKHz      = 18562 // normal RAW16 pixel clock (hardware-confirmed)
+	imx290HMAXFloor   = 261   // line-time floor for 18562 (UNVERIFIED — not exercised at full-frame)
+	imx290ClkKHzHS    = 37124 // 10-bit high-speed pixel clock — used only when ModeOf(rm).HighSpeed (UNVERIFIED)
+	imx290HMAXFloorHS = 245   // high-speed line-time floor for 37124 (UNVERIFIED)
+	imx290VBlankAdd   = 18    // VMAX = height + 18 (0x12) (SetExp)
+	imx290SHSOffset   = 17    // SHS = (height + 17 (0x11)) - exposureLines (SetExp)
+	imx290HBLK        = 0     // SetFPGAHBLK(0)  (Cam_SetResolution)
+	imx290VBLK        = 9     // SetFPGAVBLK(9)  (Cam_SetResolution) — sensor-specific blanking
 )
 
 // imx290Init is the InitCamera sensor-write sequence: the 47-entry `reglist` table
@@ -315,14 +323,25 @@ func imx290SetGain(rm Regmap, gain int) error {
 // SHSOffset - 1), with VMAX stretched (SHS = 1) when the exposure exceeds one frame.
 var imx290Shutter = ShutterModel{
 	SHS0: imx290RegSHS0, SHS1: imx290RegSHS1, SHS2: imx290RegSHS2,
-	SHSOffset:     imx290SHSOffset,
-	MinExpUs:      imx290ExpMinUs,
-	MaxExpUs:      imx290ExpMaxUs,
-	Clock:         imx290ClkKHz,
-	FloorHMAX:     imx290HMAXFloor,
-	VBlankAdd:     imx290VBlankAdd,
-	DefaultWidth:  imx290FullWidth,
-	DefaultHeight: imx290FullHeight,
+	SHSOffset:          imx290SHSOffset,
+	MinExpUs:           imx290ExpMinUs,
+	MaxExpUs:           imx290ExpMaxUs,
+	Clock:              imx290ClkKHz,
+	FloorHMAX:          imx290HMAXFloor,
+	HighSpeedClock:     imx290ClkKHzHS,
+	HighSpeedFloorHMAX: imx290HMAXFloorHS,
+	VBlankAdd:          imx290VBlankAdd,
+	DefaultWidth:       imx290FullWidth,
+	DefaultHeight:      imx290FullHeight,
+}
+
+// imx290ClockFloor returns the pixel clock + HMAX floor for the live readout mode: the 10-bit
+// high-speed pair (37124/245) when mode.HighSpeed, else normal RAW16 (18562/261).
+func imx290ClockFloor(rm Regmap) (clock, floor int) {
+	if ModeOf(rm).HighSpeed {
+		return imx290ClkKHzHS, imx290HMAXFloorHS
+	}
+	return imx290ClkKHz, imx290HMAXFloor
 }
 
 // imx290SetExposure programs the STARVIS VMAX/SHS (ApplyExposure) and, for exposures ≥ 1 s,
@@ -333,8 +352,19 @@ var imx290Shutter = ShutterModel{
 // (e.g. 1027 of 1096 rows at 2 s). Below 1 s the bit is cleared (short free-run path).
 // (The SDK also calls SelectExtTrigExp here; not yet reproduced — revisit if needed.)
 func imx290SetExposure(rm Regmap, d time.Duration) error {
-	trigger := d >= imx290LongExpUs*time.Microsecond // ≥ 1 s (SetExp cmp #0xf4240)
-	if err := SetFPGABit(rm, 0x00, 0x80, trigger); err != nil {
+	trigger := d >= imx290LongExpUs*time.Microsecond            // ≥ 1 s
+	if err := SetFPGABit(rm, 0x00, 0x80, trigger); err != nil { // EnableFPGATriggerMode (bit7); WaitMode (bit6) is set by ApplyExposure
+		return err
+	}
+	// Program the computed HMAX so the FPGA line rate agrees with the SHS math: the pixel clock
+	// drives the line time, so a stale fast HMAX would overflow one frame and collapse to the
+	// VMAX-stretch / SHS=1 path. Use the live ROI dims when set, else full-frame.
+	hw, hh := imx290FullWidth, imx290FullHeight
+	if rd := ModeOf(rm); rd.Width > 0 {
+		hw, hh = rd.Width, rd.Height
+	}
+	clk, floor := imx290ClockFloor(rm)
+	if err := WriteFPGAHMAX(rm, HMAX(hw, hh, clk, floor, imx290VBlankAdd, ModeOf(rm))); err != nil {
 		return err
 	}
 	// ≥1 s host-times the integration via the trigger-mode capture path in imx290Worker
@@ -438,5 +468,6 @@ func imx290SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if err := ProgramFrameGeometry(rm, w, h, imx290HBLK, imx290VBLK); err != nil {
 		return err
 	}
-	return ProgramHMAX(rm, w, h, imx290ClkKHz, imx290HMAXFloor, imx290VBlankAdd)
+	clk, floor := imx290ClockFloor(rm)
+	return ProgramHMAX(rm, w, h, clk, floor, imx290VBlankAdd)
 }

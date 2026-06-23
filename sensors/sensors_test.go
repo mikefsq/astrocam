@@ -167,7 +167,7 @@ func TestIMX585Gain(t *testing.T) {
 	}
 }
 
-// TestIMX585Exposure locks the STARVIS-2 exposure (baked HMAX 192 → line 9600 ns, VMAX=height+60,
+// TestIMX585Exposure locks the STARVIS-2 exposure (baked HMAX 192 → line 9600 ns, VMAX=height+2,
 // SHS=clamp((VMAX-8)-lines,8,VMAX-8) to 0x3050-52) and the ≥1 s trigger mode.
 func TestIMX585Exposure(t *testing.T) {
 	f := &fakeRegmap{}
@@ -175,12 +175,12 @@ func TestIMX585Exposure(t *testing.T) {
 		t.Fatal(err)
 	}
 	sens, fpga := lastVals(f.writes), lastVals(f.fpgaWrites)
-	// lines = 10_000_000/9600 = 1041; VMAX = 2160+60 = 2220 = 0x0008ac; SHS = (2220-8)-1041 = 1171 = 0x000493.
-	if fpga[0x10] != 0xac || fpga[0x11] != 0x08 || fpga[0x12] != 0x00 {
-		t.Errorf("VMAX = %02x/%02x/%02x, want ac/08/00 (2220)", fpga[0x10], fpga[0x11], fpga[0x12])
+	// lines = 10_000_000/9600 = 1041; VMAX = 2160+2 = 2162 = 0x000872; SHS = (2162-8)-1041 = 1113 = 0x000459.
+	if fpga[0x10] != 0x72 || fpga[0x11] != 0x08 || fpga[0x12] != 0x00 {
+		t.Errorf("VMAX = %02x/%02x/%02x, want 72/08/00 (2162)", fpga[0x10], fpga[0x11], fpga[0x12])
 	}
-	if sens[0x3050] != 0x93 || sens[0x3051] != 0x04 || sens[0x3052] != 0x00 {
-		t.Errorf("SHS = %02x/%02x/%02x, want 93/04/00 (1171)", sens[0x3050], sens[0x3051], sens[0x3052])
+	if sens[0x3050] != 0x59 || sens[0x3051] != 0x04 || sens[0x3052] != 0x00 {
+		t.Errorf("SHS = %02x/%02x/%02x, want 59/04/00 (1113)", sens[0x3050], sens[0x3051], sens[0x3052])
 	}
 	g := &fakeRegmap{}
 	if err := IMX585.SetExposure(g, 2*time.Second); err != nil {
