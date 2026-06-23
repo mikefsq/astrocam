@@ -77,6 +77,16 @@ func (c *Camera) ResetEndpoint() error {
 	}
 	return nil
 }
+
+// ResetDevice performs a whole-device USB reset when the backend supports it
+// (DeviceResetter); a no-op otherwise. It is the worker's last-resort recovery for a
+// wedged readout.
+func (c *Camera) ResetDevice() error {
+	if r, ok := c.t.(DeviceResetter); ok {
+		return r.ResetDevice()
+	}
+	return nil
+}
 func (c *Camera) BulkRead(buf []byte, to time.Duration) (int, error) { return c.t.BulkRead(buf, to) }
 
 // StreamFrame reads one frame with the continuous windowed pump when the backend

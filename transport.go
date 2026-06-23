@@ -106,14 +106,14 @@ type FrameStreamZC interface {
 }
 
 // EndpointResetter is an optional Transport capability: clear a stalled/streaming
-// bulk endpoint (libusb_clear_halt / IOKit ClearPipeStall) to drop stale data
-// before a capture — ResetEndPoint(0x81), issued before each session.
+// bulk endpoint (the per-platform clear-halt) to drop stale data before a capture —
+// ResetEndpoint(0x81), issued before each session.
 type EndpointResetter interface {
 	ResetEndpoint(ep uint8) error
 }
 
 // DeviceResetter is an optional Transport capability: a USB bus reset of the whole
-// device (libusb_reset_device / IOKit ResetDevice) — the last-resort recovery when a
+// device (the per-platform whole-device USB reset) — the last-resort recovery when a
 // pipe-level reset can't unwedge the camera. It wipes the device's state, so the caller
 // must re-Init afterwards; the snap path uses it only as a final give-up to leave the
 // device clean for the next session.

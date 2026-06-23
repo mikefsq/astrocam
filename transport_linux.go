@@ -42,6 +42,7 @@ var (
 	usbdevfsReapURBNDelay  = ioc(1, 13, 8)  // _IOW('U',13,void*)         = 0x4008550d (non-blocking)
 	usbdevfsClaimInterface = ioc(2, 15, 4)  // _IOR('U',15,uint)
 	usbdevfsClearHalt      = ioc(2, 21, 4)  // _IOR('U',21,uint)
+	usbdevfsReset          = ioc(0, 20, 0)  // _IO('U',20)                = 0x00005514
 )
 
 // usbURB is the 64-bit <linux/usbdevice_fs.h> struct usbdevfs_urb (56 bytes, no trailing
@@ -445,6 +446,18 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 func (d *usbfsDevice) ResetEndpoint(ep uint8) error {
 	e := uint32(ep)
 	return d.ioctl(usbdevfsClearHalt, unsafe.Pointer(&e))
+}
+
+// ResetDevice performs a USB port reset of the whole device (USBDEVFS_RESET) — the
+// last-resort recovery when the readout wedges past a few consecutive zero-byte stalls
+// (the capture worker escalates to it before re-arming). The reset drops the kernel's
+// interface claim, so we re-claim interface 0 afterwards; the device keeps its address
+// (no node change) on a successful reset.
+func (d *usbfsDevice) ResetDevice() error {
+	if err := d.ioctl(usbdevfsReset, nil); err != nil {
+		return err
+	}
+	return d.claim(0) // the reset releases the interface claim — re-take it
 }
 
 func (d *usbfsDevice) Close() error { return d.f.Close() }

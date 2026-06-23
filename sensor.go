@@ -117,6 +117,7 @@ type WorkerCtl interface {
 	Rm() Regmap                                              // sensor + FPGA register R/W
 	VendorCmd(cmd uint8) error                               // FX3 vendor cmd (0xAA/0xA9/0xAF)
 	ResetEndpoint() error                                    // clear the bulk-IN pipe (EP 0x81)
+	ResetDevice() error                                      // USB device reset (last-resort readout-wedge recovery; no-op on backends without it)
 	BulkRead(buf []byte, timeout time.Duration) (int, error) // whole-frame bulk read
 	FrameBytes() int                                         // bytes to read off the wire (W*H*bpp; ×SoftBin² for RAW16 software bin)
 	// StreamFrame reads one frame with the continuous windowed pump (the USB3

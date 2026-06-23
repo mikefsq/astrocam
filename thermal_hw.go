@@ -10,8 +10,8 @@ package astrocam
 //	SetHeater    SetLensHeat    — WriteFPGAREG reg 0x2a = %, + EnableWarm
 //	             EnableWarm       — RMW FPGA reg 0x19 bit6 (0x40)
 //
-// In the SDK, SendCMD/WriteFPGAREG/ReadFPGAREG are just libusb_control_transfer wrappers,
-// which are exactly Transport.ControlIn/ControlOut and the Regmap FPGA accessors here.
+// SendCMD/WriteFPGAREG/ReadFPGAREG are vendor control transfers — exactly
+// Transport.ControlIn/ControlOut and the Regmap FPGA accessors here.
 //
 // VARIANTS NOT REPLICATED (no hardware to verify): older non-FPGA cameras (ASI071/1600
 // class) drive the TEC through a calibrated DAC — SetDA → the power-to-DAC conversion (float) cubic →

@@ -136,16 +136,17 @@ var IMX174 = Sensor{
 	Worker:      imx174Worker,
 }
 
-// imx174Worker is the capture worker — the host-timed single-shot capture.
-// It drives the FPGA trigger SIGNAL (EnableFPGATriggerSignal 1→0, reg 0x0b bit0), which is
-// what releases each frame, especially in the >4 s trigger MODE (SetExp's reg0 bit7) where
-// the FPGA otherwise holds the frame forever (the ≥4 s hang).
+// imx174Worker is the host-timed single-shot capture worker. It arms the sensor, integrates
+// (host-timed only in the >4 s trigger band), then reads the frame with the async windowed bulk
+// pump, and RECOVERS on a short/stalled read by re-arming — escalating to a full ResetDevice.
+// The previous code issued a single one-shot BulkRead with no recovery, which intermittently
+// short-read or wedged the FX3 readout at short exposures; the pump-and-recover loop masks those
+// rare stalls.
 //
 //	arm-1:  SendCMD(0xAA)·FPGAStop·0x212=1·0x200=1·SendCMD(0xA9)·0x200=0·10ms·FPGAStart·0x212=0·50ms·0x22e=0x0a
-//	        ResetEndpoint · EnableFPGATriggerSignal(1)
-//	expose: ≤1s usleep(exposure−200ms); >1s poll-sleep(100ms) until elapsed ≥ exposure
-//	arm-2:  ResetEndpoint·0x212=1·0x200=1·0x200=0·10ms·FPGAStart·0x212=0·50ms·0x22e=0x0a (no FX3 stop/start)
-//	fire:   EnableFPGATriggerSignal(0) · BulkRead
+//	integrate: trigger band only — EnableFPGATriggerSignal(1)·poll-sleep until elapsed·(0)·release
+//	read:   ctl.BulkRead = async urb pump w/ exact-remainder tail (gets the FX3 held tail); no FPGABufReload
+//	recover: on short read -> ResetEndpoint + re-arm (no re-integrate); after 4 stalls -> ResetDevice + arm-1
 func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 	// FPGA reg0 bit4 = readout stop (FPGAStop/Start); reg 0x0b bit0 = the trigger signal.
@@ -201,33 +202,82 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		return rm.WriteReg(0x22e, 0x0a)
 	}
 
-	// arm-1
-	if err := armSensor(true); err != nil {
-		return 0, err
-	}
-	_ = ctl.ResetEndpoint()
+	triggerBand := exposure.Microseconds() >= imx174TriggerUs
 
-	// Only the >4 s TRIGGER band is HOST-driven: EnableFPGATriggerSignal(1) opens the
-	// integration window, the host waits it out (poll-sleep), then
-	// EnableFPGATriggerSignal(0) closes it and releases the held frame. The 0.4–4 s
-	// cycle-count band and short free-run are SENSOR-timed (the IMX174 counts LINES
-	// line-periods on-chip, or free-runs): NO trigger signal, NO host window — the bulk
-	// read just blocks until the held frame is delivered. Confirmed on the SDK 2 s wire:
-	// zero reg 0x0b writes below 4 s, and our reg-0x0b 1→0 in that band is what doubled it.
-	if exposure.Microseconds() >= imx174TriggerUs {
-		if err := trigger(true); err != nil { // EnableFPGATriggerSignal(1)
-			return 0, err
-		}
-		start := time.Now()
-		for time.Since(start) < exposure {
-			time.Sleep(100 * time.Millisecond)
+	// expose arms the sensor and, for the >4 s TRIGGER band, opens/closes the HOST
+	// integration window. Only that band is host-driven: EnableFPGATriggerSignal(1) opens
+	// integration, the host waits it out, EnableFPGATriggerSignal(0) releases the held
+	// frame. The ≤4 s bands are SENSOR-timed (the IMX174 self-times on-chip or free-runs):
+	// no trigger signal, no host window — the read just pulls the delivered frame. full
+	// selects arm-1 (FX3 stop/start) vs the arm-2 re-arm (sensor toggle + FPGAStart only).
+	expose := func(full bool) error {
+		if err := armSensor(full); err != nil {
+			return err
 		}
 		_ = ctl.ResetEndpoint()
-		if err := trigger(false); err != nil { // EnableFPGATriggerSignal(0) = release
-			return 0, err
+		if triggerBand {
+			if err := trigger(true); err != nil { // EnableFPGATriggerSignal(1)
+				return err
+			}
+			start := time.Now()
+			for time.Since(start) < exposure {
+				time.Sleep(100 * time.Millisecond)
+			}
+			_ = ctl.ResetEndpoint()
+			if err := trigger(false); err != nil { // EnableFPGATriggerSignal(0) = release
+				return err
+			}
+		}
+		return nil
+	}
+
+	// readFrame pulls one whole frame via BulkRead, which is the ASYNC urb pump
+	// (readFrameURBs): it submits the whole frame's transfers up front — sustaining the
+	// trigger band's fast post-release burst — and sizes the LAST transfer to the exact
+	// remainder, which is what makes the FX3 deliver its held final partial DMA buffer (a
+	// padded 1-MiB request just sits there and returns ~4 MiB short). No FPGABufReload: a
+	// wire trace of the SDK shows it never touches reg 0x18 during readout in any band.
+	target := ctl.FrameBytes()
+	if target > len(buf) {
+		target = len(buf)
+	}
+	// readTimeout: the trigger band already integrated in expose(), so the read is just the
+	// readout; the ≤4 s bands are sensor-timed DURING the read, so it must cover the exposure.
+	readTimeout := 3 * time.Second
+	if !triggerBand {
+		readTimeout = exposure + 3*time.Second
+	}
+	readFrame := func() (int, error) { return ctl.BulkRead(buf[:target], readTimeout) }
+
+	// Integrate once, then read; on a short/stalled read, RECOVER: ResetEndpoint + re-arm,
+	// escalating to a full ResetDevice after a few consecutive stalls. The re-arm restarts the
+	// stream WITHOUT re-running the (costly) trigger integration: the trigger-band frame is
+	// already held, and a ≤4 s sensor-timed frame re-times during the next read. This keeps a
+	// stuck read bounded to maxAttempts×readTimeout instead of re-integrating every retry.
+	const maxAttempts = 6
+	const resetDeviceAfter = 4 // device-reset escalation after this many readout stalls
+	if err := expose(true); err != nil {
+		return 0, err
+	}
+	var n int
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			_ = ctl.ResetEndpoint() // clear the pipe before re-arming
+			if attempt >= resetDeviceAfter {
+				_ = ctl.ResetDevice() // last-resort whole-device USB reset
+			}
+			if err = armSensor(attempt >= resetDeviceAfter); err != nil {
+				continue
+			}
+			_ = ctl.ResetEndpoint()
+		}
+		n, err = readFrame()
+		if err == nil && n >= target {
+			return n, nil
 		}
 	}
-	return ctl.BulkRead(buf, exposure+3*time.Second)
+	return n, err
 }
 
 // imx174InitFPGA is the MODERN (firmware-subtype >= 0x12) FPGA bringup InitCamera performs

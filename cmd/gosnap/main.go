@@ -44,8 +44,8 @@ func main() {
 	roi := flag.String("roi", "", "sub-frame ROI as x,y,w,h in BINNED pixels (with -capture); empty = full binned frame")
 	raw8 := flag.Bool("raw8", false, "capture RAW8 (1 byte/pixel) instead of RAW16 (with -capture)")
 	highspeed := flag.Bool("highspeed", false, "10-bit HIGH-SPEED readout (~2× fps; implies RAW8): the sensor's ASI_HIGH_SPEED_MODE — shorter ADC ramp at a doubled pixel clock (with -capture)")
-	usb2 := flag.Bool("usb2", false, "force the USB2 HighSpeed readout path (bwUSB2 + 40% FPS) regardless of the model/link — toggle the USB2 vs USB3 behavior on a fixed physical link without replugging")
-	fpsPerc := flag.Int("fps", 0, "bandwidth-overload / FPS percent 40..100 (0 = bus default: USB2→40, USB3→100). 100 = max throughput")
+	usb2 := flag.Bool("usb2", false, "force the USB2 HighSpeed readout path (bwUSB2 bandwidth budget) regardless of the model/link — toggle the USB2 vs USB3 behavior on a fixed physical link without replugging")
+	fpsPerc := flag.Int("fps", 0, "bandwidth-overload / FPS percent 40..100 (0 = default 100 = max throughput, matching the SDK). Lower throttles the readout (larger HMAX)")
 	out := flag.String("out", "frame.fits", "frame output file (with -capture); .fits/.fit writes FITS, any other extension writes raw RAW16")
 	timeout := flag.Duration("timeout", 5*time.Second, "max wait for the frame (with -capture)")
 	replay := flag.String("replay", "", "replay an SDK 'req reg val' write sequence (file) then read a frame")
@@ -203,8 +203,8 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 		return fmt.Errorf("bind PID 0x%04x: %w", pid, err)
 	}
 	if o.usb2 {
-		cam.SetUSB3(false) // force the USB2 readout path (bwUSB2 + 40% FPS)
-		fmt.Println("  link mode: FORCED USB2 (bwUSB2 + 40% FPS) via -usb2")
+		cam.SetUSB3(false) // force the USB2 readout path (bwUSB2 bandwidth budget)
+		fmt.Println("  link mode: FORCED USB2 (bwUSB2) via -usb2")
 	}
 	if o.fpsPerc != 0 {
 		cam.SetFPSPercent(o.fpsPerc) // bandwidth-overload override (40..100); raises USB2 throughput

@@ -88,11 +88,10 @@ func Open(t Transport, vid, pid uint16) (*Camera, error) {
 	if sr, ok := t.(superSpeedReporter); ok {
 		usb3 = sr.SuperSpeed()
 	}
-	fps := 40 // USB2 HighSpeed default (bandwidth-overload)
-	if usb3 {
-		fps = 100
-	}
-	mode := ReadoutMode{USB3: usb3, BytesPerPx: bpp, FPSPercent: fps}
+	// FPSPercent (the ASI bandwidth-overload) defaults to 100 = full speed / least throttle,
+	// matching the SDK (which runs the 174 on USB2 at 100, HMAX 1735 — not the 40% / HMAX 4337
+	// we used before). It is an independent parameter; override per session with SetFPSPercent.
+	mode := ReadoutMode{USB3: usb3, BytesPerPx: bpp, FPSPercent: 100}
 	c := &Camera{
 		t: t, model: m, sensor: m.Sensor, rm: vend.newRegmap(t, m.Sensor.Bus, mode), pid: pid,
 		roiW: m.Sensor.Info.MaxWidth, roiH: m.Sensor.Info.MaxHeight, bin: 1,
@@ -115,21 +114,15 @@ func (c *Camera) SetFPSPercent(pct int) {
 	}
 }
 
-// SetUSB3 forces the readout mode's link-speed assumption (the bandwidth budget and the
-// default FPS-overload the HMAX/line-time math uses): true = USB3 SuperSpeed (bwUSB3,
-// 100%), false = USB2 HighSpeed (bwUSB2, 40%). The driver normally takes this from the
-// model, but forcing it lets you exercise the USB2 vs USB3 readout path on a fixed
-// physical link (e.g. while the camera is bridged through an analyzer) without replugging.
-// It resets FPSPercent to the forced speed's default; call SetFPSPercent after to override.
+// SetUSB3 forces the readout mode's link-speed assumption — the bandwidth budget the
+// HMAX/line-time math uses: true = USB3 SuperSpeed (bwUSB3), false = USB2 HighSpeed (bwUSB2).
+// The driver normally takes this from the model, but forcing it lets you exercise the USB2 vs
+// USB3 readout path on a fixed physical link (e.g. while bridged through an analyzer) without
+// replugging. It does NOT change FPSPercent — that is an independent parameter (default 100);
+// set it with SetFPSPercent.
 func (c *Camera) SetUSB3(usb3 bool) {
 	if r, ok := c.rm.(modeCarrier); ok {
-		m := r.liveMode()
-		m.USB3 = usb3
-		if usb3 {
-			m.FPSPercent = 100
-		} else {
-			m.FPSPercent = 40
-		}
+		r.liveMode().USB3 = usb3
 	}
 }
 
@@ -438,6 +431,16 @@ func (c *Camera) OffsetRange() (min, max, def int, ok bool) {
 func (c *Camera) SetExposure(d time.Duration) error {
 	if c.sensor.SetExposure == nil {
 		return fmt.Errorf("asicam: %s SetExposure not implemented", c.sensor.Name)
+	}
+	// Clamp to the sensor's exposure range, mirroring the SDK's SetExp (e.g. IMX174 clamps
+	// ≤31µs→32µs and >2000s→2000s). Clamping here (not just in the per-sensor line math) keeps
+	// the stored expDur — which the host-timed capture worker integrates against — in range, so
+	// an out-of-range request can't desync the worker's sleep from the programmed registers.
+	if min := time.Duration(c.sensor.ExpMinUs) * time.Microsecond; c.sensor.ExpMinUs > 0 && d < min {
+		d = min
+	}
+	if max := time.Duration(c.sensor.ExpMaxUs) * time.Microsecond; c.sensor.ExpMaxUs > 0 && d > max {
+		d = max
 	}
 	if err := c.sensor.SetExposure(c.rm, d); err != nil {
 		return err
