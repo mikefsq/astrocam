@@ -191,6 +191,9 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		// Trigger mode (≥1 s): the trigger-signal hold IS the integration, so wait the FULL
 		// exposure (not exp−200 ms — that under-integrates the exactly-1 s boundary by 200 ms).
 		for start := time.Now(); time.Since(start) < exposure; {
+			if ctl.Aborted() {
+				return 0, errExposureAborted // StopExposure ran: bail instead of waiting out the integration
+			}
 			time.Sleep(100 * time.Millisecond)
 		}
 	}

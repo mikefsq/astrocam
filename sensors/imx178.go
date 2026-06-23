@@ -188,6 +188,9 @@ func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		}
 	} else {
 		for start := time.Now(); time.Since(start) < exposure; {
+			if ctl.Aborted() {
+				return 0, errExposureAborted // StopExposure ran: bail instead of waiting out the integration
+			}
 			time.Sleep(100 * time.Millisecond)
 		}
 	}

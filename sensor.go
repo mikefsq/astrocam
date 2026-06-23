@@ -118,6 +118,7 @@ type WorkerCtl interface {
 	VendorCmd(cmd uint8) error                               // FX3 vendor cmd (0xAA/0xA9/0xAF)
 	ResetEndpoint() error                                    // clear the bulk-IN pipe (EP 0x81)
 	ResetDevice() error                                      // USB device reset (last-resort readout-wedge recovery; no-op on backends without it)
+	Aborted() bool                                           // StopExposure was called: a host-timed integration loop should bail out instead of waiting out the full exposure
 	BulkRead(buf []byte, timeout time.Duration) (int, error) // whole-frame bulk read
 	FrameBytes() int                                         // bytes to read off the wire (W*H*bpp; ×SoftBin² for RAW16 software bin)
 	// StreamFrame reads one frame with the continuous windowed pump (the USB3

@@ -147,6 +147,10 @@ var IMX174 = Sensor{
 //	integrate: trigger band only — EnableFPGATriggerSignal(1)·poll-sleep until elapsed·(0)·release
 //	read:   ctl.BulkRead = async urb pump w/ exact-remainder tail (gets the FX3 held tail); no FPGABufReload
 //	recover: on short read -> ResetEndpoint + re-arm (no re-integrate); after 4 stalls -> ResetDevice + arm-1
+// errExposureAborted is returned by a capture worker when StopExposure interrupts it mid-flight,
+// so the driver can drop the (discarded) frame and the abort path returns promptly.
+var errExposureAborted = fmt.Errorf("exposure aborted")
+
 func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 	// FPGA reg0 bit4 = readout stop (FPGAStop/Start); reg 0x0b bit0 = the trigger signal.
@@ -221,6 +225,9 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 			}
 			start := time.Now()
 			for time.Since(start) < exposure {
+				if ctl.Aborted() {
+					return errExposureAborted // StopExposure ran: bail instead of waiting out the integration
+				}
 				time.Sleep(100 * time.Millisecond)
 			}
 			_ = ctl.ResetEndpoint()
@@ -262,6 +269,9 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	var n int
 	var err error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctl.Aborted() {
+			return 0, errExposureAborted // don't keep retrying a read for an aborted exposure
+		}
 		if attempt > 0 {
 			_ = ctl.ResetEndpoint() // clear the pipe before re-arming
 			if attempt >= resetDeviceAfter {

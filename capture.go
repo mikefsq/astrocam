@@ -288,6 +288,16 @@ func (c *Camera) setStatus(s ExposureStatus) {
 	c.mu.Unlock()
 }
 
+// Aborted reports that the exposure is no longer in flight — i.e. StopExposure ran (it sets
+// ExpIdle) while a capture worker was integrating. A host-timed worker polls this so an abort
+// cuts the integration short instead of waiting out the full exposure (which would pin the
+// readout, the driver's AbortExposure join, and the client's abort request for the whole exposure).
+func (c *Camera) Aborted() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.status != ExpWorking
+}
+
 // expDuration returns the last-set exposure under the lock — used by the read paths to
 // size their bulk timeout while SetExposure may be updating it from another goroutine.
 func (c *Camera) expDuration() time.Duration {

@@ -349,7 +349,12 @@ func imx455Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		if err := triggerSignal(true); err != nil {
 			return 0, err
 		}
-		time.Sleep(exposure)
+		for start := time.Now(); time.Since(start) < exposure; {
+			if ctl.Aborted() {
+				return 0, errExposureAborted // StopExposure ran: bail instead of waiting out the integration
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 		if err := triggerSignal(false); err != nil {
 			return 0, err
 		}
