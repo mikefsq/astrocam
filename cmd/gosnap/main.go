@@ -1,10 +1,8 @@
 // Command gosnap is the bring-up tool for the pure-Go ZWO camera driver.
 //
-// Default mode detects the camera, connects, prints its identity, and disconnects
-// (control transfers only). With -capture it additionally runs the full init +
-// single exposure and tries to read one frame — the first-light test. With -v it
-// logs every USB transfer on the wire, so an init/arm sequence can be debugged
-// against the real device.
+// Default mode connects, prints the camera identity, and disconnects. With -capture
+// it runs full init + one exposure and reads a frame. With -v it logs every USB
+// transfer on the wire.
 //
 // Usage:
 //
@@ -25,6 +23,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -70,6 +70,14 @@ func main() {
 	seed := flag.Float64("seed", 0, "-regulate warm-start TEC power %% (0 = none; high values overshoot)")
 	maxerr := flag.Float64("maxerr", 0, "-regulate clamp on |temp-setpoint| °C the PID acts on (0 = off; ~3 = SDK-like gentle glide, both directions)")
 	regtarget2 := flag.Float64("regtarget2", math.NaN(), "-regulate second target °C: after reaching -regtarget, ramp to this (tests warmup); unset = single phase")
+	wedge := flag.Bool("wedge", false, "REPRODUCE the USB2 readout wedge: run continuous USB2 captures while an antagonist goroutine fires ControlIn(0xB3) into the bulk-read window (the goastro telemetry-poll interleave), loop until a frame fails, then confirm the wedge is sticky and recover via ResetDevice+Init")
+	wedgeIters := flag.Int("wedgeiters", 5000, "with -wedge: max frames to capture before giving up")
+	wedgeAntagonist := flag.Bool("wedgeantagonist", true, "with -wedge: run the concurrent ControlIn(0xB3) antagonist. false = A/B control (single-threaded stress should NOT wedge)")
+	wedgeInterval := flag.Int("wedgeinterval", 2, "with -wedge: antagonist ControlIn(0xB3) interval in ms (smaller = more overlap with the readout)")
+	wedgeMaxSec := flag.Int("wedgemaxsec", 90, "with -wedge: hard wall-clock cap in seconds (never runs longer)")
+	soak := flag.Bool("soak", false, "single-threaded continuous-capture SOAK: run -soakframes frames (no antagonist) and report the readout StallCount — finds whether soft stalls still happen absent concurrency. Honors -exposure/-gain/-usb2/-fps")
+	soakFrames := flag.Int("soakframes", 5000, "with -soak: number of frames to capture")
+	soakVideo := flag.Bool("soakvideo", false, "with -soak: use the FREE-RUN path (StartVideo arm-once + ReadFrame loop, the SDK ASIStartVideoCapture shape) instead of single-shot arm-per-frame — the discriminator for whether the per-frame arm sequence is what wedges the FX3")
 	flag.Parse()
 	if *keepMarkers {
 		astrocam.RepairDMAMarkers = false
@@ -154,6 +162,18 @@ func main() {
 		raw8: *raw8 || *highspeed, out: *out, timeout: *timeout, nframes: *nframes, usb2: *usb2,
 		discard: *discard, highspeed: *highspeed, fpsPerc: *fpsPerc, fixDefects: *fixDefects,
 	}
+	if *wedge {
+		if err := doWedge(uint16(*pid), o, *wedgeIters, *wedgeAntagonist, *wedgeInterval, *wedgeMaxSec); err != nil {
+			log.Fatalf("wedge error: %v", err)
+		}
+		return
+	}
+	if *soak {
+		if err := doSoak(uint16(*pid), o, *soakFrames, *soakVideo); err != nil {
+			log.Fatalf("soak error: %v", err)
+		}
+		return
+	}
 	if err := run(uint16(*pid), *capture, *verbose, o); err != nil {
 		log.Fatalf("error: %v", err)
 	}
@@ -237,7 +257,7 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 		return nil
 	}
 
-	// --- first-light test: full init + one exposure + read one frame ---
+	// first-light test: full init + one exposure + read one frame
 	step := func(name string, err error) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", name, err)
@@ -291,9 +311,8 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 	if err := step("StartExposure", cam.StartExposure(true)); err != nil {
 		return err
 	}
-	// Burst path: .ser writes a SER video container; -discard captures with NO write (the
-	// pure-capture throughput benchmark, apples-to-apples with the SDK video bench — both just
-	// read frames into a buffer and drop them). Both arm once and pull from a resident stream.
+	// Burst path: .ser writes a SER video container; -discard captures with no write
+	// (pure-capture throughput benchmark). Both arm once and pull from a resident stream.
 	isSer := strings.HasSuffix(strings.ToLower(o.out), ".ser")
 	if isSer || o.discard {
 		bpp := cam.OutputDepth()
@@ -318,28 +337,24 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 		t0 := time.Now()
 		idle, total := time.Second, o.exposure+2*time.Second
 		streamed := false
-		var capEnd time.Time // capture-loop end stamp (before teardown), for an SDK-fair rate
-		// Preferred path: arm once for free-run, then a RESIDENT stream session — the windowed
-		// pump is primed once and each frame is pulled with Next, so the per-frame setup cost is
-		// gone (the planetary hot path). Falls back to the single-shot worker if unsupported.
+		var capEnd time.Time // capture-loop end stamp (before teardown), for a fair rate
+		// Preferred path: arm once for free-run, then a resident stream session (each frame
+		// pulled with Next). Falls back to the single-shot worker if unsupported.
 		if verr := cam.StartVideo(true); verr == nil {
 			if sess, serr := cam.StartStream(total); serr == nil {
-				// Warm-up frame doubles as a free-run PROBE: DDR cameras (6200/585) can't free-run a
-				// resident stream (the FX3 holds each frame's final partial buffer for the worker's
-				// FPGABufReload), so a short/empty warm-up means fall back to the single-shot worker
-				// loop below. Free-run cameras (290/462/174) return a full frame and stream as before.
+				// Warm-up frame doubles as a free-run probe: DDR cameras (6200/585) can't free-run
+				// a resident stream, so a short/empty warm-up means fall back to the single-shot
+				// worker loop below. Free-run cameras (290/462/174) return a full frame and stream.
 				wn, _ := sess.Next(buf, idle)
 				streamed = wn == fbytes
 				if streamed && o.discard {
-					// Pure-capture benchmark: read a frame, drop it — exactly the SDK video bench's
-					// loop, so the comparison is driver-read vs driver-read. Use the ZERO-COPY path
-					// when the backend offers it (no per-frame memcpy), to isolate read overhead.
-					// Zero-copy only when a whole frame fits in one transfer (sub-MiB ROI); larger
-					// frames span chunks and aren't contiguous in one scratch, so fall back to Next.
+					// Pure-capture benchmark: read a frame, drop it. Use the zero-copy path when
+					// the backend offers it (no per-frame memcpy), only when a whole frame fits in
+					// one transfer (sub-MiB ROI); larger frames span chunks, so fall back to Next.
 					zc, hasZC := sess.(astrocam.FrameStreamZC)
 					hasZC = hasZC && fbytes <= (1<<20)
-					ivs := make([]float64, 0, nf) // per-frame intervals (ms) — drop vs bandwidth probe
-					t0 = time.Now()               // time ONLY the steady-state loop (exclude arm/prime/warm-up)
+					ivs := make([]float64, 0, nf) // per-frame intervals (ms)
+					t0 = time.Now()               // time only the steady-state loop
 					last := t0
 					for f := 0; f < nf; f++ {
 						if hasZC {
@@ -361,8 +376,8 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 						last = now
 						count++
 					}
-					// Interval distribution: a tight unimodal spread = bandwidth-limited (no drops);
-					// a cluster of ~2× intervals = dropped frames at the sensor's higher true rate.
+					// Interval distribution: tight unimodal spread = bandwidth-limited (no drops);
+					// a cluster of ~2× intervals = dropped frames at the higher true rate.
 					if len(ivs) > 2 {
 						s := append([]float64(nil), ivs...)
 						sort.Float64s(s)
@@ -375,8 +390,7 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 						}
 						fmt.Printf("  intervals(ms): med=%.2f p1=%.2f p99=%.2f max=%.2f | >1.5×med (likely drops)=%d/%d\n",
 							med, s[len(s)/100], s[len(s)*99/100], s[len(s)-1], gaps, len(ivs))
-						// Dump the raw per-frame interval (ms) of every frame to -out, so the
-						// full run can be plotted (frame-time vs frame number — jitter/drift).
+						// Dump the per-frame interval (ms) of every frame to -out for plotting.
 						if o.out != "" {
 							var b strings.Builder
 							for _, v := range ivs {
@@ -388,9 +402,8 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 						}
 					}
 				} else if streamed {
-					// Async double-buffered writer: SER disk I/O runs on its own goroutine so it
-					// overlaps the NEXT frame's capture — the read loop then runs at the sensor's
-					// full rate instead of stalling on each write (the full-res ~2 ms/frame tax).
+					// Async double-buffered writer: SER disk I/O runs on its own goroutine,
+					// overlapping the next frame's capture so the read loop runs at full rate.
 					const pool = 4
 					free := make(chan []byte, pool)
 					queue := make(chan []byte, pool)
@@ -429,16 +442,16 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 					}
 				}
 				if streamed {
-					capEnd = time.Now() // stamp BEFORE teardown — sess.Close (abort+join) must not count toward fps, matching the SDK bench which stamps before ASIStopVideoCapture
+					capEnd = time.Now() // stamp before teardown: sess.Close (abort+join) must not count toward fps
 				}
 				sess.Close()
 			}
 		}
 		if !streamed {
-			// Fallback: single-shot worker, one full arm→expose→read per frame. This is the path
-			// for DDR cameras (6200/585) that can't free-run a resident stream — each frame is a
-			// complete arm + windowed read + FPGABufReload, like the SDK's per-frame capture worker.
-			t0 = time.Now() // time ONLY the worker loop (exclude the failed free-run probe + arming)
+			// Fallback: single-shot worker, one full arm/expose/read per frame. The path for
+			// DDR cameras (6200/585) that can't free-run a resident stream: each frame is a
+			// complete arm + windowed read + FPGABufReload.
+			t0 = time.Now() // time only the worker loop
 			ivs := make([]float64, 0, nf)
 			last := t0
 			for f := 0; f < nf; f++ {
@@ -485,9 +498,8 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 		}
 		return nil
 	}
-	// Continuous test (-n N): one arm, then N back-to-back reads (no re-arm, no pipe
-	// reset). If frame 0 is ~2× the exposure and frames 1..N-1 are ~1×, the 2× is a
-	// one-time cold-start throwaway and a warm/streaming sensor reads at 1×.
+	// Continuous test (-n N): one arm, then N back-to-back reads (no re-arm). Frame 0
+	// at ~2× the exposure with frames 1..N-1 at ~1× means a one-time cold-start throwaway.
 	if o.nframes > 1 {
 		cbuf := make([]byte, cam.FrameBytes())
 		for f := 0; f < o.nframes; f++ {
@@ -499,10 +511,9 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 	}
 	_ = o.timeout
 	fmt.Printf("%s begin readout (read blocks until the frame arrives)\n", el())
-	// Read EXACTLY one frame. An over-sized buffer would make the read wait for the
-	// NEXT frame to top off the extra bytes — and in long-exposure mode frames aren't
-	// back-to-back (a full integration period sits between them), so a 64 KiB margin
-	// cost a whole extra exposure (the "2× latency"). FrameBytes ends on frame 1.
+	// Read exactly one frame: an over-sized buffer makes the read wait for the next frame
+	// to top off the extra bytes, and in long-exposure mode frames aren't back-to-back, so
+	// a margin costs a whole extra exposure. FrameBytes ends on frame 1.
 	buf := make([]byte, cam.FrameBytes())
 	n, err := cam.GetDataAfterExp(buf)
 	fmt.Printf("%s readout returned %d bytes (err: %v)\n", el(), n, err)
@@ -513,8 +524,7 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 		if cam.Color() {
 			bayer = info.Bayer
 		}
-		// Opt-in factory defect correction. OFF by default — raw frames are better cleaned by
-		// dithering + sigma-clipped integration. Full-frame RAW16 only (the map is full-sensor).
+		// Opt-in factory defect correction (off by default). Full-frame RAW16 only.
 		if o.fixDefects {
 			if step == 2 && x == 0 && y == 0 && w == info.MaxWidth && h == info.MaxHeight {
 				if dm, derr := cam.LoadDefectMap(info.MaxWidth, info.MaxHeight); derr != nil {
@@ -530,8 +540,7 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 		if werr := writeFrameFile(o.out, buf[:n], w, h, step, bayer, info.PixelUm, o.exposure, o.gain, cam.Name()); werr != nil {
 			fmt.Printf("  warning: writing %s: %v\n", o.out, werr)
 		}
-		// Raw pixel stats — proof of real signal, and STDEV (the read-noise metric a dark-frame
-		// gain sweep needs to find the HCG break). Pixels are RAW16 LE or RAW8 per OutputDepth.
+		// Raw pixel stats (min/max/avg/stdev). Pixels are RAW16 LE or RAW8 per OutputDepth.
 		mn, mx, cnt, sum, sumsq := 1<<16, 0, 0, 0.0, 0.0
 		for i := 0; i+step <= n; i += step {
 			v := int(buf[i])
@@ -559,15 +568,15 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 			n, o.out, x, y, w, h, step*8, mn, mx, avg, sd)
 		return nil
 	}
-	// Even on a timeout/over-read, data may have flowed — inspect it. n is the
-	// bytes that arrived; scan for the frame header to confirm we have real frames.
+	// On a timeout/over-read, data may still have flowed: scan the n arrived bytes for
+	// the frame header to confirm real frames.
 	if n <= 0 {
 		return fmt.Errorf("no data on EP 0x81 (sensor not streaming): %w", err)
 	}
 	fmt.Printf("  got %d bytes (err: %v)\n", n, err)
 	fmt.Printf("  first 16 bytes: % x\n", buf[:16])
 	off := findMagic(buf[:n])
-	rawOut := rawPath(o.out)                 // a partial frame is raw — no valid FITS dims
+	rawOut := rawPath(o.out)                 // a partial frame is raw: no valid FITS dims
 	_ = os.WriteFile(rawOut, buf[:n], 0o644) // dump the raw stream for inspection
 	fmt.Printf("%s wrote %s (%d bytes)\n", el(), rawOut, n)
 	if off >= 0 {
@@ -590,8 +599,7 @@ func writeFrameFile(path string, data []byte, w, h, bpp int, bayer string, pixel
 	return os.WriteFile(path, data, 0o644)
 }
 
-// rawPath swaps a .fits/.fit extension for .raw (partial/debug dumps are always raw,
-// since a truncated frame has no valid FITS dimensions).
+// rawPath swaps a .fits/.fit extension for .raw (partial/debug dumps are always raw).
 func rawPath(p string) string {
 	l := strings.ToLower(p)
 	switch {
@@ -603,11 +611,7 @@ func rawPath(p string) string {
 	return p
 }
 
-// doReplay sends a captured SDK 'req reg val' (hex) write sequence verbatim, then
-// reads one frame — a ground-truth test that our transport can drive the camera,
-// independent of our decoded init.
-// doList enumerates attached ZWO cameras and reads each one's factory serial (opening
-// then closing it) — the Alpaca "what's plugged in, by stable id" listing.
+// doList enumerates attached ZWO cameras and reads each one's factory serial.
 func doList() error {
 	devs, err := astrocam.Enumerate()
 	if err != nil {
@@ -637,8 +641,7 @@ func doList() error {
 	return nil
 }
 
-// doSerial opens the camera with the given factory serial (the stable Alpaca bind) and
-// prints its identity, proving the enumerate -> open-by-location -> match-serial search.
+// doSerial opens the camera by factory serial and prints its identity.
 func doSerial(serial string) error {
 	t, d, err := astrocam.OpenSerial(serial)
 	if err != nil {
@@ -657,13 +660,9 @@ func doSerial(serial string) error {
 	return nil
 }
 
-// doThermal reads temperature + humidity off a (cooled) camera via the decoded hardware
-// Thermal backend, and dumps the raw 0xB3 temp bytes so the decode can be checked against
-// the SDK. Read-only — it does NOT drive the TEC, fan, or heater.
-// doDumpFlash reads the factory defect-map blob from SPI flash (FlashHPCMapAddr) and writes the
-// raw compressed bytes to a file for inspection. Layout: a 2 KiB header with magic "ASID"
-// (defect) / "ASIG" (gain) + a big-endian uint32 payload length at offset 4, then the compressed
-// 1-bit-per-pixel defect bitmap.
+// doDumpFlash reads the factory defect-map blob from SPI flash (FlashHPCMapAddr) to a file.
+// Layout: 2 KiB header with magic "ASID" (defect) / "ASIG" (gain) + big-endian uint32 payload
+// length at offset 4, then the compressed 1-bit-per-pixel defect bitmap.
 func doDumpFlash(pid uint16, path string) error {
 	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
 	if err != nil {
@@ -709,6 +708,8 @@ func doDumpFlash(pid uint16, path string) error {
 	return nil
 }
 
+// doThermal reads temperature + humidity via the hardware Thermal backend and dumps the
+// raw 0xB3 temp bytes. Read-only: it does not drive the TEC, fan, or heater.
 func doThermal(pid uint16) error {
 	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
 	if err != nil {
@@ -721,7 +722,7 @@ func doThermal(pid uint16) error {
 	}
 	fmt.Printf("connected %04x:%04x  %s  cooled=%v\n", astrocam.ZWO.VID, pid, cam.Name(), cam.Cooled())
 
-	// Raw 0xB3 bytes, so we can see both candidate decodings vs the SDK ground truth.
+	// Raw 0xB3 bytes, with both candidate decodings.
 	var b [2]byte
 	if _, err := raw.ControlIn(0xB3, 0, 0, b[:]); err != nil {
 		return fmt.Errorf("read temp (0xB3): %w", err)
@@ -748,10 +749,9 @@ func doThermal(pid uint16) error {
 	return nil
 }
 
-// doCool ACTUATES the TEC on a cooled camera: first an open-loop step sweep (proving the
-// FPGA cool-power register physically cools the sensor, with the fan auto-driven), then a
-// closed-loop regulation run through the Cooler goroutine. It always returns the TEC to 0
-// and the fan off on exit — including Ctrl-C — so the camera is never left driven.
+// doCool actuates the TEC on a cooled camera: an open-loop power-step sweep then a
+// closed-loop regulation run via the Cooler goroutine. Always returns the TEC to 0 and
+// the fan off on exit (Ctrl-C included).
 func doCool(pid uint16) error {
 	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
 	if err != nil {
@@ -765,8 +765,7 @@ func doCool(pid uint16) error {
 	if !cam.Cooled() {
 		return fmt.Errorf("%s has no cooler", cam.Name())
 	}
-	// The SDK runs InitCamera (which sets up the FPGA/cooling block) before driving the
-	// TEC; doing cooling control on an uninitialized FX3/FPGA wedges control transfers.
+	// Init first: cooling control on an uninitialized FX3/FPGA wedges control transfers.
 	if err := cam.Init(); err != nil {
 		return fmt.Errorf("init: %w", err)
 	}
@@ -829,9 +828,8 @@ func doCool(pid uint16) error {
 	return nil
 }
 
-// doRegulate ACTUATES the TEC in closed loop to target °C with the per-tick power slew
-// disabled and a 50% warm-start, then watches it converge and hold — the temperature-
-// regulation test. Returns the TEC to 0 / fan off on exit (Ctrl-C included).
+// doRegulate actuates the TEC in closed loop to target °C and watches it converge and
+// hold. Returns the TEC to 0 / fan off on exit (Ctrl-C included).
 func doRegulate(pid uint16, target, kp, ki, kd, slew, seed, maxerr, target2 float64) error {
 	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
 	if err != nil {
@@ -866,8 +864,8 @@ func doRegulate(pid uint16, target, kp, ki, kd, slew, seed, maxerr, target2 floa
 	cfg := astrocam.DefaultCoolerConfig()
 	cfg.Kp, cfg.Ki, cfg.Kd = kp, ki, kd
 	cfg.SlewPerStep = slew // 0 = per-tick rate limit disabled
-	cfg.RampRate = 0       // no setpoint ramp — MaxError is what paces the approach here
-	cfg.MaxError = maxerr  // symmetric error clamp (°C); the SDK-style gentle glide
+	cfg.RampRate = 0       // no setpoint ramp; MaxError paces the approach
+	cfg.MaxError = maxerr  // symmetric error clamp (°C)
 	if err := cam.EnableCooling(nil, target, cfg); err != nil {
 		return err
 	}
@@ -911,7 +909,7 @@ func doRegulate(pid uint16, target, kp, ki, kd, slew, seed, maxerr, target2 floa
 
 	runPhase(target, 150)
 	if !math.IsNaN(target2) {
-		runPhase(target2, 150) // second leg — e.g. ramp back up (tests the clamp on warmup)
+		runPhase(target2, 150) // second leg, e.g. ramp back up (tests the clamp on warmup)
 	}
 
 	cam.DisableCooling()
@@ -919,6 +917,8 @@ func doRegulate(pid uint16, target, kp, ki, kd, slew, seed, maxerr, target2 floa
 	return nil
 }
 
+// doReplay sends a captured SDK 'req reg val' (hex) write sequence verbatim, then reads
+// one frame: a ground-truth test that the transport can drive the camera.
 func doReplay(pid uint16, file string) error {
 	data, err := os.ReadFile(file)
 	if err != nil {
@@ -948,7 +948,7 @@ func doReplay(pid uint16, file string) error {
 	if r, ok := interface{}(t).(astrocam.EndpointResetter); ok {
 		r.ResetEndpoint(0x81)
 	}
-	buf := make([]byte, 4708352) // EXACTLY one frame (no over-read)
+	buf := make([]byte, 4708352) // exactly one frame (no over-read)
 	t0 := time.Now()
 	nb, rerr := t.BulkRead(buf, 12*time.Second)
 	fmt.Printf("read took %.3fs\n", time.Since(t0).Seconds())
@@ -969,6 +969,286 @@ func doReplay(pid uint16, file string) error {
 	return nil
 }
 
+// doSoak runs a long single-threaded continuous capture (no antagonist) and reports the
+// worker's cumulative StallCount, testing whether soft stalls recur absent concurrency.
+// Honors -exposure/-gain/-usb2/-fps.
+func doSoak(pid uint16, o captureOpts, frames int, video bool) error {
+	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
+	if err != nil {
+		return fmt.Errorf("connect %04x:%04x: %w", astrocam.ZWO.VID, pid, err)
+	}
+	defer raw.Close()
+	cam, err := astrocam.Open(raw, astrocam.ZWO.VID, pid)
+	if err != nil {
+		return err
+	}
+	if o.usb2 {
+		cam.SetUSB3(false)
+	}
+	if o.fpsPerc != 0 {
+		cam.SetFPSPercent(o.fpsPerc)
+	}
+	if err := cam.Init(); err != nil {
+		return fmt.Errorf("init: %w", err)
+	}
+	defer cam.StopExposure()
+	info := cam.Info()
+	if err := cam.SetROI(0, 0, info.MaxWidth, info.MaxHeight); err != nil {
+		return err
+	}
+	_ = cam.SetGain(o.gain)
+	if err := cam.SetExposure(o.exposure); err != nil {
+		return err
+	}
+	fb := cam.FrameBytes()
+	buf := make([]byte, fb)
+	t0 := time.Now()
+	el := func() string { return fmt.Sprintf("[%6.1fs]", time.Since(t0).Seconds()) }
+	// Two paths: single-shot arms every frame (StartExposure + GetDataAfterExp); video/free-run
+	// arms once (StartVideo) then reads back-to-back (ReadFrame, no re-arm).
+	mode := "single-shot (arm every frame)"
+	arm := func() error { return cam.StartExposure(true) }
+	read := func() (int, error) { return cam.GetDataAfterExp(buf) }
+	if video {
+		if err := cam.StartVideo(true); err != nil {
+			return fmt.Errorf("start video: %w", err)
+		}
+		mode = "free-run (arm once, StartVideo + ReadFrame)"
+		arm = func() error { return nil } // armed once, up front
+		read = func() (int, error) { return cam.ReadFrame(buf, false) }
+	}
+	fmt.Printf("soak: exp %s, %d B/frame, %d frames (USB2=%v, fps=%d) — %s, counting stalls\n",
+		o.exposure, fb, frames, o.usb2, o.fpsPerc, mode)
+
+	fails := 0
+	var prevStalls int64
+	for i := 0; i < frames; i++ {
+		if err := arm(); err != nil {
+			fails++
+			fmt.Printf("%s frame %d arm error: %v [stalls=%d]\n", el(), i, err, cam.StallCount())
+			continue
+		}
+		n, err := read()
+		st := cam.StallCount()
+		switch {
+		case err != nil || n < fb:
+			fails++
+			fmt.Printf("%s frame %d FAILED: %d/%d B (err %v) [stalls=%d]\n", el(), i, n, fb, err, st)
+		case st != prevStalls:
+			fmt.Printf("%s frame %d ok but STALLED+recovered (stalls now %d)\n", el(), i, st)
+		case i%200 == 0:
+			fmt.Printf("%s frame %d ok [stalls=%d]\n", el(), i, st)
+		}
+		prevStalls = st
+	}
+	dt := time.Since(t0).Seconds()
+	fmt.Printf("\n*** SOAK *** %d frames, %d failed, %d stalls, %.1f fps (%.0fs)\n",
+		frames, fails, cam.StallCount(), float64(frames)/dt, dt)
+	if cam.StallCount() == 0 && fails == 0 {
+		fmt.Println("  clean: no stalls, no failures — soft stalls did not recur single-threaded.")
+	}
+	return nil
+}
+
+// doWedge reproduces the USB2 readout wedge on demand to prove its cause (a control transfer
+// interleaving with the in-flight bulk frame read) and verify a transport fix.
+//
+// The wedge: a concurrent ControlIn(0xB3) (the goastro telemetry poll's transfer) landing
+// mid-readout parks the GPIF; every capture then fails until a hard reset. doWedge runs
+// continuous full-frame USB2 captures while an antagonist goroutine fires ControlIn(0xB3) on
+// a tight interval until a frame fails, confirms the wedge is sticky, then recovers via
+// ResetDevice + full re-Init. -wedgeantagonist=false is the A/B control (no antagonist).
+func doWedge(pid uint16, o captureOpts, iters int, antagonist bool, intervalMs, maxSec int) error {
+	raw, err := astrocam.OpenHost(astrocam.ZWO.VID, pid)
+	if err != nil {
+		return fmt.Errorf("connect %04x:%04x: %w", astrocam.ZWO.VID, pid, err)
+	}
+	defer raw.Close()
+	cam, err := astrocam.Open(raw, astrocam.ZWO.VID, pid)
+	if err != nil {
+		return err
+	}
+	cam.SetUSB3(false)     // force the USB2 readout path (the un-buffered, wedge-prone one)
+	cam.SetFPSPercent(100) // max throughput = peak bus pressure during the read
+	if err := cam.Init(); err != nil {
+		return fmt.Errorf("init: %w", err)
+	}
+	defer cam.StopExposure()
+	info := cam.Info()
+	if err := cam.SetROI(0, 0, info.MaxWidth, info.MaxHeight); err != nil {
+		return err
+	}
+	_ = cam.SetGain(o.gain)
+	exp := o.exposure
+	if err := cam.SetExposure(exp); err != nil {
+		return err
+	}
+	fb := cam.FrameBytes()
+	buf := make([]byte, fb)
+	if intervalMs < 1 {
+		intervalMs = 1
+	}
+	if maxSec < 1 {
+		maxSec = 90
+	}
+	t0 := time.Now()
+	el := func() string { return fmt.Sprintf("[%6.1fs]", time.Since(t0).Seconds()) }
+	fmt.Printf("wedge: USB2, fps100, exp %s, %d B/frame, antagonist=%v (0xB3 every %dms), cap %ds / %d frames\n",
+		exp, fb, antagonist, intervalMs, maxSec, iters)
+
+	var curFrame, fired int64
+	var wedgeMu sync.Mutex
+	var wedgeReason string // first detector (antagonist or read) wins
+	markWedge := func(reason string) {
+		wedgeMu.Lock()
+		if wedgeReason == "" {
+			wedgeReason = reason
+			fmt.Printf("%s *** WEDGE DETECTED: %s\n", el(), reason)
+		}
+		wedgeMu.Unlock()
+	}
+	isWedged := func() bool {
+		wedgeMu.Lock()
+		defer wedgeMu.Unlock()
+		return wedgeReason != ""
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Heartbeat: 2 s tick reporting current frame + antagonist transfer count, so the run is
+	// never silent even while blocked inside a wedged frame.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tk := time.NewTicker(2 * time.Second)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+				fmt.Printf("%s …working: frame=%d antagonist_xfers=%d wedged=%v\n",
+					el(), atomic.LoadInt64(&curFrame), atomic.LoadInt64(&fired), isWedged())
+			}
+		}
+	}()
+
+	// Antagonist: fire ControlIn(0xB3) into the readout window. On its first failure it has
+	// found the wedge (EP0 stopped ACKing) so it records that and stops.
+	if antagonist {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var b [2]byte
+			tk := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
+			defer tk.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-tk.C:
+					if _, err := raw.ControlIn(0xB3, 0, 0, b[:]); err != nil {
+						markWedge(fmt.Sprintf("antagonist 0xB3 control transfer failed: %v", err))
+						return
+					}
+					atomic.AddInt64(&fired, 1)
+				}
+			}
+		}()
+	}
+
+	// captureBounded runs one frame under a watchdog: on timeout it asks the worker to abort
+	// (StopExposure), then force-returns the device with a USB reset (ResetDevice, an ioctl, works
+	// even when EP0 is timing out). The frame goroutine sends to a buffered channel so a late
+	// completion after we've given up never blocks or leaks.
+	type res struct {
+		n   int
+		err error
+	}
+	captureBounded := func(timeout time.Duration) (int, error) {
+		if err := cam.StartExposure(true); err != nil {
+			return 0, err
+		}
+		done := make(chan res, 1)
+		go func() { n, err := cam.GetDataAfterExp(buf); done <- res{n, err} }()
+		select {
+		case r := <-done:
+			return r.n, r.err
+		case <-time.After(timeout):
+		}
+		go cam.StopExposure() // gentle unblock (may itself be slow on a dead EP0)
+		select {
+		case r := <-done:
+			return r.n, r.err
+		case <-time.After(3 * time.Second):
+		}
+		_ = cam.ResetDevice() // forcible: makes the stuck read/control error out
+		select {
+		case r := <-done:
+			return r.n, r.err
+		case <-time.After(3 * time.Second):
+			return 0, fmt.Errorf("frame stuck > %s even after StopExposure+ResetDevice", timeout)
+		}
+	}
+
+	frameTimeout := 3 * time.Second // generous vs a healthy ~234 ms USB2 frame
+	deadline := time.Now().Add(time.Duration(maxSec) * time.Second)
+
+	failedAt, fN := -1, 0
+	var fErr error
+	for i := 0; i < iters; i++ {
+		atomic.StoreInt64(&curFrame, int64(i))
+		if isWedged() { // antagonist found it between frames
+			failedAt, fErr = i, fmt.Errorf("%s", wedgeReason)
+			break
+		}
+		if time.Now().After(deadline) {
+			fmt.Printf("%s reached %ds cap with no wedge.\n", el(), maxSec)
+			break
+		}
+		n, err := captureBounded(frameTimeout)
+		if err != nil || n < fb {
+			markWedge(fmt.Sprintf("frame %d read failed: %d/%d B (%v)", i, n, fb, err))
+			failedAt, fN, fErr = i, n, err
+			break
+		}
+		if i%100 == 0 {
+			fmt.Printf("%s frame %d ok (%d B, %d antagonist xfers)\n", el(), i, n, atomic.LoadInt64(&fired))
+		}
+	}
+
+	// Stop the helpers (bounded: an in-flight 0xB3 returns within the driver's 500 ms ctrl timeout).
+	close(stop)
+	wg.Wait()
+
+	if failedAt < 0 {
+		fmt.Printf("%s NO wedge (%d antagonist xfers).\n", el(), atomic.LoadInt64(&fired))
+		if antagonist {
+			fmt.Println("  Try -wedgeinterval 1 -exposure 2ms for more readout overlap.")
+		} else {
+			fmt.Println("  (antagonist off — single-threaded stress did not wedge, as expected.)")
+		}
+		return nil
+	}
+	fmt.Printf("%s WEDGED at frame %d: %d/%d B (err %v) after %d antagonist xfers\n",
+		el(), failedAt, fN, fb, fErr, atomic.LoadInt64(&fired))
+
+	// Recover via whole-device reset + full re-Init. ResetDevice may already have fired inside
+	// captureBounded; this is idempotent.
+	fmt.Println("  recovering via ResetDevice + Init...")
+	_ = cam.ResetDevice()
+	time.Sleep(300 * time.Millisecond)
+	if err := cam.Init(); err != nil {
+		return fmt.Errorf("re-init after reset: %w", err)
+	}
+	_ = cam.SetROI(0, 0, info.MaxWidth, info.MaxHeight)
+	_ = cam.SetExposure(exp)
+	n, err := captureBounded(5 * time.Second)
+	fmt.Printf("  post-recovery probe: %d/%d B (err %v) -> recovered=%v\n", n, fb, err, err == nil && n >= fb)
+	return nil
+}
+
 // findMagic scans for the FrameMagic 0xBB00AA11 (little-endian: bytes 11 AA 00 BB).
 func findMagic(b []byte) int {
 	for i := 0; i+4 <= len(b); i++ {
@@ -979,8 +1259,7 @@ func findMagic(b []byte) int {
 	return -1
 }
 
-// logT wraps a Transport and logs every transfer (the -v debug path). It forwards
-// only the Transport methods, so a streaming backend falls back to logged BulkRead.
+// logT wraps a Transport and logs every transfer (the -v debug path).
 type logT struct {
 	t     astrocam.Transport
 	w     io.Writer
@@ -1016,8 +1295,7 @@ func (l *logT) BulkRead(buf []byte, to time.Duration) (int, error) {
 	return n, err
 }
 
-// ReadFrameStream forwards the optional windowed-stream read (FrameStreamer) so the
-// IMX455 worker's real data plane runs under -v instead of falling back to BulkRead.
+// ReadFrameStream forwards the optional windowed-stream read (FrameStreamer) under -v.
 func (l *logT) ReadFrameStream(buf []byte, idle, total time.Duration) (int, error) {
 	fs, ok := l.t.(astrocam.FrameStreamer)
 	if !ok {
@@ -1031,8 +1309,7 @@ func (l *logT) ReadFrameStream(buf []byte, idle, total time.Duration) (int, erro
 
 func (l *logT) Close() error { return l.t.Close() }
 
-// SuperSpeed forwards the optional link-speed report so the readout mode tracks the live
-// USB link even under -v (the wrapper would otherwise hide it, defaulting to the model).
+// SuperSpeed forwards the optional link-speed report under -v.
 func (l *logT) SuperSpeed() bool {
 	if sr, ok := l.t.(interface{ SuperSpeed() bool }); ok {
 		return sr.SuperSpeed()

@@ -1,21 +1,17 @@
 //go:build windows
 
-// Pure-Go Windows USB transport over WinUSB, no cgo (stdlib syscall + lazy DLLs):
-// control via WinUsb_ControlTransfer and bulk-IN frame reads via overlapped
-// WinUsb_ReadPipe, bounded by the pipe's transfer-timeout policy.
+// Pure-Go Windows USB transport over WinUSB, no cgo (stdlib syscall + lazy DLLs): control
+// via WinUsb_ControlTransfer and bulk-IN frame reads via overlapped WinUsb_ReadPipe, bounded
+// by the pipe's transfer-timeout policy.
 //
-// The camera must be bound to WinUSB/libusbK (the ZWO installer or Zadig). We match
-// the device by VID/PID in its device-interface path under the generic USB device
-// interface GUID.
+// The camera must be bound to WinUSB/libusbK (the ZWO installer or Zadig). The device is
+// matched by VID/PID in its device-interface path under the generic USB device interface GUID.
 //
-// Frame reads go through fixed 1 MiB chunked reads assembled to a contiguous watermark
-// (BulkRead / ReadFrameStream) — the same shape as the darwin async pump and the Linux
-// usbfs backend: a whole-frame read must time-bound (default WinUSB blocks forever) and
-// read THROUGH the FX3's mid-frame short packets / ZLPs rather than stop on the first.
+// Frame reads use fixed 1 MiB chunked reads assembled to a contiguous watermark (BulkRead /
+// ReadFrameStream): a whole-frame read must time-bound (default WinUSB blocks forever) and
+// read through the FX3's mid-frame short packets / ZLPs rather than stop on the first.
 //
-// UNVERIFIED: compile-checked for windows/amd64 but not run on hardware. Validate on a
-// Windows box with a WinUSB-bound camera before trusting it. Mirrors the (hardware-
-// validated) Linux usbfs backend.
+// Compile-checked for windows/amd64 but not run on hardware. Mirrors the Linux usbfs backend.
 
 package astrocam
 
@@ -76,7 +72,7 @@ const (
 	pipeIn               = bulkEndpoint
 
 	// maxBulkChunk caps a single ReadPipe so a whole-frame read time-bounds and reads
-	// THROUGH mid-frame short packets at a contiguous watermark; 1 MiB matches the
+	// through mid-frame short packets at a contiguous watermark; 1 MiB matches the
 	// SDK/darwin/usbfs xferLen.
 	maxBulkChunk = 1 << 20
 
@@ -90,10 +86,12 @@ const (
 type winusbDevice struct {
 	handle syscall.Handle // file handle
 	winusb uintptr        // WINUSB_INTERFACE_HANDLE
-	// ctrlMu serializes control transfers — the capture path and the TEC loop drive
-	// one open camera concurrently. Bulk reads (EP 0x81) are a separate pipe and stay
-	// unlocked so a long readout can't stall a TEC tick. See transport_darwin.go.
-	ctrlMu sync.Mutex
+	// ioMu serializes every USB I/O the FX3 must not see interleaved: all control transfers
+	// and a whole-frame BulkRead hold it, so a control transfer can't land on the bridge
+	// mid-readout and wedge the un-buffered USB2 path. ReadFrameStream (the USB3/DDR path)
+	// stays unlocked — it needs the worker's concurrent FPGABufReload. See transport_linux.go
+	// (usbfsDevice.ioMu) for the full rationale.
+	ioMu sync.Mutex
 }
 
 // winNode is one WinUSB device-interface path with its parsed VID/PID.
@@ -166,8 +164,7 @@ func hexAfter(s, marker string) int {
 }
 
 // pathLocation hashes a device-interface path to a stable per-port location id (FNV-1a).
-// The path encodes the hub/port topology, so it survives a replug — the Windows analogue
-// of the darwin IORegistry locationID and the Linux busnum/devnum.
+// The path encodes the hub/port topology, so it survives a replug.
 func pathLocation(path string) uint32 {
 	const offset, prime = 2166136261, 16777619
 	h := uint32(offset)
@@ -231,8 +228,8 @@ type winusbSetupPacket struct {
 }
 
 func (d *winusbDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, data []byte) (int, error) {
-	d.ctrlMu.Lock()
-	defer d.ctrlMu.Unlock()
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
 	pkt := winusbSetupPacket{RequestType: reqType, Request: bRequest, Value: wValue, Index: wIndex, Length: uint16(len(data))}
 	var transferred uint32
 	var bufPtr uintptr
@@ -256,15 +253,15 @@ func (d *winusbDevice) ControlIn(bRequest uint8, wValue, wIndex uint16, data []b
 }
 
 // setPipeTimeout bounds a bulk-IN read: WinUSB cancels a ReadPipe that hasn't completed
-// within timeoutMs (0 = block forever, the default and the bug we avoid).
+// within timeoutMs (0 = block forever, the default).
 func (d *winusbDevice) setPipeTimeout(timeoutMs uint32) {
 	procWinUsbSetPipePol.Call(d.winusb, pipeIn, pipeTransferTimeout, 4, uintptr(unsafe.Pointer(&timeoutMs)))
 }
 
-// readChunk issues one overlapped ReadPipe of up to len(buf) bytes, bounded by
-// timeoutMs, and returns the count transferred. A timeout/cancel returns (n, nil) — the
-// caller's loop treats no-data as a stall; only a genuine pipe error returns non-nil.
-// Default WinUSB (no RAW_IO) returns on a short packet, so n may be < len(buf).
+// readChunk issues one overlapped ReadPipe of up to len(buf) bytes, bounded by timeoutMs,
+// and returns the count transferred. A timeout/cancel returns (n, nil); only a genuine pipe
+// error returns non-nil. Default WinUSB (no RAW_IO) returns on a short packet, so n may be
+// < len(buf).
 func (d *winusbDevice) readChunk(buf []byte, timeoutMs uint32) (int, error) {
 	d.setPipeTimeout(timeoutMs)
 	var ov overlapped
@@ -283,15 +280,16 @@ func (d *winusbDevice) readChunk(buf []byte, timeoutMs uint32) (int, error) {
 	return int(transferred), fmt.Errorf("asicam: ReadPipe failed: %v", callErr)
 }
 
-// BulkRead reads one frame from the bulk-IN endpoint into buf, in fixed maxBulkChunk
-// reads into a scratch buffer copied to a running watermark — so the read time-bounds
-// (default WinUSB blocks forever) and assembles the frame contiguously across the FX3's
-// mid-frame short packets, which a single whole-frame ReadPipe would stop on. Mirrors
-// the Linux usbfs BulkRead.
+// BulkRead reads one frame from the bulk-IN endpoint into buf, in fixed maxBulkChunk reads
+// into a scratch buffer copied to a running watermark — so the read time-bounds (default
+// WinUSB blocks forever) and assembles the frame contiguously across the FX3's mid-frame
+// short packets, which a single whole-frame ReadPipe would stop on.
 func (d *winusbDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	d.ioMu.Lock() // hold for the whole frame so no control transfer interleaves (USB2 wedge gate)
+	defer d.ioMu.Unlock()
 	deadline := time.Now().Add(timeout)
 	scratch := make([]byte, maxBulkChunk)
 	total := 0
@@ -314,12 +312,11 @@ func (d *winusbDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) 
 	return total, nil
 }
 
-// ReadFrameStream reads one whole frame, treating the FX3's mid-frame short packets and
-// ZLPs as NON-terminal (DDR cameras hold the frame's final partial buffer until
-// FPGABufReload, which the worker pulses for the duration of this call). It cycles
-// maxBulkChunk reads into scratch to a watermark until the frame is in, `idle` passes
-// with no data (a genuine stall), or the `total` deadline hits. winusbDevice satisfying
-// FrameStreamer is what makes StreamFrame use this instead of the generic loop.
+// ReadFrameStream reads one whole frame, treating the FX3's mid-frame short packets and ZLPs
+// as non-terminal (DDR cameras hold the frame's final partial buffer until FPGABufReload,
+// which the worker pulses for the duration of this call). It cycles maxBulkChunk reads into
+// scratch to a watermark until the frame is in, `idle` passes with no data (a genuine
+// stall), or the `total` deadline hits. winusbDevice satisfies FrameStreamer.
 func (d *winusbDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
@@ -354,8 +351,7 @@ func (d *winusbDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 }
 
 // ResetEndpoint clears/aborts the bulk-IN pipe (WinUsb_ResetPipe) so a stale pipe state
-// from a prior aborted read can't fail the next transfer. It is the EndpointResetter the
-// capture worker calls before each frame (was unimplemented on Windows).
+// from a prior aborted read can't fail the next transfer.
 func (d *winusbDevice) ResetEndpoint(ep uint8) error {
 	if r, _, _ := procWinUsbResetPipe.Call(d.winusb, uintptr(ep)); r == 0 {
 		return fmt.Errorf("asicam: WinUsb_ResetPipe(0x%02x) failed", ep)
@@ -378,9 +374,9 @@ func OpenHost(vid, pid uint16) (Transport, error) {
 	return d, nil
 }
 
-// enumerateRaw lists every VID-matched WinUSB device WITHOUT opening it (the shared
-// Enumerate filters these to known camera PIDs). Name is left empty (filterCameras fills
-// it from the model registry); Location is the path hash, the key OpenLocation reopens by.
+// enumerateRaw lists every VID-matched WinUSB device without opening it (the shared
+// Enumerate filters these to known camera PIDs). Name is left empty (filterCameras fills it
+// from the model registry); Location is the path hash, the key OpenLocation reopens by.
 func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 	var out []DeviceInfo
 	for _, n := range scanWinUSB(vid, 0) {
@@ -389,9 +385,8 @@ func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 	return out, nil
 }
 
-// OpenLocation opens the WinUSB device whose path hashes to loc (from a DeviceInfo) — the
-// way to bind the exact unit chosen from Enumerate when several identical cameras are
-// attached.
+// OpenLocation opens the WinUSB device whose path hashes to loc (from a DeviceInfo) — binds
+// the exact unit chosen from Enumerate when several identical cameras are attached.
 func OpenLocation(vid uint16, loc uint32) (Transport, error) {
 	for _, n := range scanWinUSB(vid, 0) {
 		if pathLocation(n.path) == loc {

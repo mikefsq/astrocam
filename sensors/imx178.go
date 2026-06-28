@@ -1,10 +1,8 @@
-// WIP . The IMX178 (Type 1/1.8, 6.4 MP) is NOT a STARVIS 290/462
-// clone — it has its own register map: gain is a RAW 16-bit code (the 0.1 dB value written
-// directly, not a Sony /3 analog code), latch is 0x3007 (not 0x3001), offset is 0x3015/16, SHS
-// is 0x3034-36, and the ROI window/start regs are the 0x319x/0x31ax block. The exposure does fit
-// the shared STARVIS ShutterModel (line_time = HMAX·1000/clock, SHS = height+29−lines, VMAX via
-// SetFPGAVMAX) — but with a BAKED constant HMAX (420), not the 290/455 bandwidth
-// throttle. Second-source checkable vs PlayerOne POAImx178 (Sedna-M). No ASI178 on hand.
+// IMX178 (Type 1/1.8, 6.4 MP). Own register map: gain is a RAW 16-bit code (0.1 dB value
+// written directly, not a Sony /3 analog code), latch 0x3007, offset 0x3015/16, SHS
+// 0x3034-36, ROI window/start in the 0x319x/0x31ax block. Exposure uses the shared STARVIS
+// ShutterModel (line_time = HMAX·1000/clock, SHS = height+29−lines, VMAX via SetFPGAVMAX)
+// with a baked constant HMAX (420), not the 290/455 bandwidth throttle.
 //
 // Register/behavior summary:
 //
@@ -58,18 +56,16 @@ const (
 	imx178LongExpUs = 1_000_000     // ≥ 1 s enters FPGA trigger mode — EXACT
 
 	// Die/mode readout facts (shared engine: fps.go / shutter.go). Geometry is image-orientation
-	// (3072 wide × 2048 tall); it is stored swapped — 2048 (lines, drives VMAX/SHS + the HMAX divisor),
+	// (3072 wide × 2048 tall), stored swapped — 2048 (lines, drives VMAX/SHS + the HMAX divisor),
 	// 3072 — and Cam_SetResolution swaps SetFPGAHeight/Width to match.
-	imx178FullWidth  = 3072  // IMX178 active pixels, horizontal (datasheet / ASI178 known full-res)
+	imx178FullWidth  = 3072  // active pixels, horizontal
 	imx178FullHeight = 2048  // vertical (the line count VMAX = height + 29 uses)
 	imx178ClkKHz     = 27000 // at bin1 = 27 MHz; bin2/4 = 6750
-	imx178HMAX       = 420   // the BAKED line-period HMAX; fixed post-init. The FPS-percent default 80
-	//                          is NOT a floor; the FPS-percent throttle would re-derive HMAX from USB bandwidth, but
-	//                          we hold 420.
-	imx178VBlankAdd = 29 // VMAX = SetFPGAVMAX(height + 0x1d) — the PROGRAMMED frame length
-	imx178SHSOffset = 29 // SHS  = (height + 0x1d) − lines
-	imx178HBLK      = 0  // SetFPGAHBLK(0)
-	imx178VBLK      = 15 // SetFPGAVBLK(15) at bin1 full-res; bin2/4 = 11
+	imx178HMAX       = 420   // baked line-period HMAX, fixed post-init (FPS-percent default 80 is not a floor)
+	imx178VBlankAdd  = 29    // VMAX = SetFPGAVMAX(height + 0x1d) — the PROGRAMMED frame length
+	imx178SHSOffset  = 29    // SHS  = (height + 0x1d) − lines
+	imx178HBLK       = 0     // SetFPGAHBLK(0)
+	imx178VBLK       = 15    // SetFPGAVBLK(15) at bin1 full-res; bin2/4 = 11
 )
 
 // imx178Init — InitCamera: the 89-entry reglist ([reg:u16le][val:u16le], reg 0xffff = delay ms)
@@ -111,12 +107,12 @@ var IMX178 = Sensor{
 	GainMax:   imx178GainMax,
 	ExpMinUs:  imx178ExpMinUs,
 	ExpMaxUs:  imx178ExpMaxUs,
-	OffsetMax: 240, OffsetDef: 1, // ASI Brightness range — UNVERIFIED (family default)
+	OffsetMax: 240, OffsetDef: 1, // ASI Brightness range (family default)
 	Info: CameraInfo{
-		MaxWidth:  imx178FullWidth, // datasheet — UNVERIFIED, confirm on HW
+		MaxWidth:  imx178FullWidth,
 		MaxHeight: imx178FullHeight,
-		PixelUm:   2.4,      // 2.4 µm pixel pitch (datasheet)
-		BitDepth:  14,       // IMX178 14-bit ADC (RAW16 transport) — confirm
+		PixelUm:   2.4,      // 2.4 µm pixel pitch
+		BitDepth:  14,       // 14-bit ADC (RAW16 transport)
 		Bayer:     "RGGB",   // CFA (color/MC only); surfaced when Model.Color
 		Bins:      []int{1}, // bin>1 mode bytes undecoded (Cam_SetResolution branch) → SetROI errors
 	},
@@ -131,11 +127,11 @@ var IMX178 = Sensor{
 	Worker:      imx178Worker,
 }
 
-// imx178Worker — the capture worker, host-timed single-shot capture. The arm sequence: SendCMD(0xAA) +
+// imx178Worker — the capture worker, host-timed single-shot capture. Arm: SendCMD(0xAA) +
 // FPGAStop, SendCMD(0xA9), standby 0x3000=6, usleep, 0x3000=0, usleep, FPGAStart, ResetEndPoint(0x81).
 // Per frame: EnableFPGATriggerSignal(1) + EnableFPGAXHSStop(1), hold for the exposure,
 // EnableFPGAXHSStop(0) + EnableFPGATriggerSignal(0), then the bulk read. XHSStop is FPGA reg0a bit4
-// (XHS-stop enable); TriggerSignal is reg0b bit0. UNVERIFIED (no HW).
+// (XHS-stop enable); TriggerSignal is reg0b bit0.
 func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 	arm := func(full bool) error {
@@ -201,8 +197,8 @@ func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	return ctl.BulkRead(buf, exposure+3*time.Second)
 }
 
-// imx178InitFPGA — the FPGA-side bringup after the Sony init (InitCamera); identical FX3 sequence
-// to the 290.
+// imx178InitFPGA — the FPGA-side bringup after the Sony init (InitCamera); same FX3 sequence
+// as the 290.
 func imx178InitFPGA(rm Regmap, subtype int) error {
 	_ = subtype
 	if err := FPGAClearBits(rm, 0x00, 0x01); err != nil { // FPGAReset
@@ -347,7 +343,6 @@ func imx178SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if err := ProgramFrameGeometry(rm, w, h, imx178HBLK, imx178VBLK); err != nil {
 		return err
 	}
-	// HMAX is the baked constant 420; the FPGA HMAX register is only written inside the FPS-percent
-	// throttle, so program the post-init default directly.
+	// HMAX is the baked constant 420; program it to the FPGA HMAX register directly.
 	return WriteFPGAHMAX(rm, imx178HMAX)
 }

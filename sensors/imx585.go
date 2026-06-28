@@ -1,9 +1,8 @@
-// WIP. The IMX585 (Type 1/1.2, 8.3 MP, STARVIS 2) is NOT a 290/462
-// clone. It has its own register map and a STARVIS-2 dual-gain: gain registers 0x3030 (conv-gain select)
-// + 0x306c/0x306d (analog code), offset 0x30dc/0x30dd, SHS 0x3050-52, ROI in the 0x303c-47 block, latch
-// 0x3001. It is a DDR-buffered USB3 camera (FPGADDRTest + EnableFPGADDR at bringup, SetFPGABinDataLen +
-// windowed startAsyncXfer for capture), so the readout path mirrors the IMX455/6200 rather than the 290.
-// Second-source checkable vs PlayerOne POAImx585 (Xena 585M). No ASI585 on hand.
+// IMX585 (Type 1/1.2, 8.3 MP, STARVIS 2). Own register map with a STARVIS-2 dual-gain: gain
+// registers 0x3030 (conv-gain select) + 0x306c/0x306d (analog code), offset 0x30dc/0x30dd, SHS
+// 0x3050-52, ROI in the 0x303c-47 block, latch 0x3001. DDR-buffered USB3 camera (FPGADDRTest +
+// EnableFPGADDR at bringup, SetFPGABinDataLen + windowed startAsyncXfer for capture), so the
+// readout path mirrors the IMX455/6200 rather than the 290.
 //
 // Register/behavior summary:
 //
@@ -64,15 +63,13 @@ const (
 	imx585LongExpUs = 1_000_000     // ≥ 1 s enters FPGA trigger mode — EXACT
 
 	// Die/mode readout facts (shared engine: fps.go / shutter.go). Geometry is image-orientation;
-	// horizontal 3840, vertical 2160 (= the line count VMAX uses). IMX585 effective 4K (3840×2160).
+	// effective 4K (3840×2160).
 	imx585FullWidth  = 3840  // horizontal (lit16 0x3440)
 	imx585FullHeight = 2160  // vertical — the line count VMAX = height + 2 uses
 	imx585ClkKHz     = 20000 // 20 MHz
-	imx585HMAX       = 192   // the BAKED line-period HMAX; fixed post-init (SetCMOSClk writes no
-	//                          static floor). The FPS-percent default 80 is NOT a floor.
-	//                          line_time = 192·1e6/20000 = 9600 ns.
-	imx585VBlankAdd = 2 // VMAX = height + 2. (The 60 used for the Sony output-height registers
-	//                     0x3046/0x3047 in Cam_SetResolution is NOT the VMAX addend.) Affects the
+	imx585HMAX       = 192   // baked line-period HMAX, fixed post-init; line_time = 192·1e6/20000 = 9600 ns
+	imx585VBlankAdd  = 2     // VMAX = height + 2 (the 60 used for the Sony output-height registers
+	//                     0x3046/0x3047 in Cam_SetResolution is NOT the VMAX addend). Affects the
 	//                     frame period, not the integration time.
 	imx585SHSGuard = 8 // SHS = clamp((VMAX-8) − lines, 8, VMAX-8) (the -8 / floor 8)
 )
@@ -131,12 +128,12 @@ var IMX585 = Sensor{
 	GainMax:   imx585GainMax,
 	ExpMinUs:  imx585ExpMinUs,
 	ExpMaxUs:  imx585ExpMaxUs,
-	OffsetMax: 240, OffsetDef: 16, // ASI Brightness range — UNVERIFIED (family default, not in this object)
+	OffsetMax: 240, OffsetDef: 16, // ASI Brightness range (family default)
 	Info: CameraInfo{
 		MaxWidth:  imx585FullWidth,
 		MaxHeight: imx585FullHeight,
-		PixelUm:   2.9,      // IMX585 2.9 µm pixel pitch (datasheet)
-		BitDepth:  12,       // IMX585 12-bit ADC (RAW16 transport) — confirm
+		PixelUm:   2.9,      // 2.9 µm pixel pitch
+		BitDepth:  12,       // 12-bit ADC (RAW16 transport)
 		Bayer:     "RGGB",   // CFA (color/MC only); surfaced when Model.Color
 		Bins:      []int{1}, // bin modes (InitSensorMode 0x30d5 branches) not yet decoded → SetROI errors
 	},
@@ -199,9 +196,8 @@ func imx585SetGain(rm Regmap, gain int) error {
 // worker host-times them.
 func imx585SetExposure(rm Regmap, d time.Duration) error {
 	trigger := d >= imx585LongExpUs*time.Microsecond
-	// Engage BOTH FPGA flags for the ≥1 s band and clear both below. imx585 uses its own inline
-	// math (not ApplyExposure), so it sets reg0 bit6 (EnableFPGAWaitMode) + bit7
-	// (EnableFPGATriggerMode) itself: WaitMode then TriggerMode to set, the reverse to clear.
+	// Engage both FPGA flags for the ≥1 s band and clear both below: reg0 bit6 (EnableFPGAWaitMode)
+	// + bit7 (EnableFPGATriggerMode), WaitMode then TriggerMode to set, the reverse to clear.
 	if trigger {
 		if err := SetFPGABit(rm, 0x00, 0x40, true); err != nil { // EnableFPGAWaitMode
 			return err
@@ -317,9 +313,9 @@ func imx585SetROI(rm Regmap, x, y, w, h, bin int) error {
 // imx585InitFPGA — the FPGA bringup after the Sony reglist (InitCamera).
 // Sequence: FPGAReset, usleep, SendCMD(0xAF) [Camera.Init], FPGADDRTest, SetFPGAAsMaster(1),
 // FPGAStop, EnableFPGADDR(1) (585 is DDR), SetFPGAADCWidthOutputWidth(adc, outputWidth),
-// SetFPGAGain(0x80×4 → 0x0c-0x0f). There is NO SetFPGABinMode here (that is an IMX455-only step).
-// FPGADDRTest is a DDR self-test with no host-visible state — omitted. outputWidth = 0
-// (8-bit) at init; bit4 is raised for RAW16 from the live ReadoutMode (the half-frame fix). UNVERIFIED.
+// SetFPGAGain(0x80×4 → 0x0c-0x0f). No SetFPGABinMode here (that is IMX455-only). FPGADDRTest is a
+// DDR self-test with no host-visible state — omitted. outputWidth = 0 (8-bit) at init; bit4 is
+// raised for RAW16 from the live ReadoutMode.
 func imx585InitFPGA(rm Regmap, subtype int) error {
 	_ = subtype
 	if err := FPGAClearBits(rm, 0x00, 0x01); err != nil { // FPGAReset
@@ -357,7 +353,7 @@ func imx585InitFPGA(rm Regmap, subtype int) error {
 // the IMX455/6200 (DDR + windowed startAsyncXfer): arm (SendCMD 0xAA + FPGAStop, SendCMD 0xA9, stream the
 // sensor, FPGAStart, ResetEndPoint), open the FPGA exposure window with EnableFPGATriggerSignal(1) +
 // EnableFPGAXHSStop(1), hold for the exposure, close it, then read one frame with the continuous windowed
-// pump. XHSStop is FPGA reg0a bit4; TriggerSignal is reg0b bit0. UNVERIFIED (no hardware).
+// pump. XHSStop is FPGA reg0a bit4; TriggerSignal is reg0b bit0.
 func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 	if err := ctl.VendorCmd(0xAA); err != nil {

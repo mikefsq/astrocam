@@ -1,20 +1,16 @@
 //go:build linux
 
 // Pure-Go Linux USB transport over usbfs (/dev/bus/usb), no cgo: control transfers
-// and bulk-IN frame reads driven directly through usbfs ioctls (the same kernel path
-// libusb uses).
+// and bulk-IN frame reads driven directly through usbfs ioctls.
 //
-// HARDWARE-VALIDATED against real cameras — ASI174MM Mini (USB2) and ASI6200MM Pro
-// (USB3, full 122 MB frames): serial-bind enumeration plus capture. Frame reads go
-// through fixed 1 MiB usbfs bulk transfers, for usbfs-specific reasons a single
-// whole-frame ioctl gets wrong: usbfs kmallocs a contiguous kernel buffer per transfer
-// (so a multi-MB read fails with ENOMEM), and the FX3's mid-frame short packets / ZLPs
-// must be read THROUGH rather than taken as the frame end. Two read paths: BulkRead uses
-// the async-URB API (SUBMITURB/REAPURB) to post all of a frame's transfers up front with
-// the last sized to the exact remainder — the only way the FX3 releases its held final
-// partial DMA buffer (the >4 s single-shot TRIGGER tail); ReadFrameStream uses the
-// synchronous windowed-read loop with a FPGABufReload tail-flush for the USB3 DDR parts.
-// Needs a udev rule granting access to the ZWO VID 0x03C3 (see deploy/).
+// Frame reads use fixed 1 MiB usbfs bulk transfers: usbfs kmallocs a contiguous kernel
+// buffer per transfer (so a multi-MB read fails with ENOMEM), and the FX3's mid-frame
+// short packets / ZLPs must be read through rather than taken as the frame end. Two read
+// paths: BulkRead uses the async-URB API (SUBMITURB/REAPURB), posting all of a frame's
+// transfers up front with the last sized to the exact remainder — the only way the FX3
+// releases its held final partial DMA buffer (the >4 s single-shot TRIGGER tail);
+// ReadFrameStream uses the synchronous windowed-read loop with a FPGABufReload tail-flush
+// for the USB3 DDR parts. Needs a udev rule granting access to the ZWO VID 0x03C3 (see deploy/).
 
 package astrocam
 
@@ -46,7 +42,7 @@ var (
 )
 
 // usbURB is the 64-bit <linux/usbdevice_fs.h> struct usbdevfs_urb (56 bytes, no trailing
-// iso packet descriptors). It is what the async SUBMITURB/REAPURB path posts and reaps.
+// iso packet descriptors), posted and reaped by the async SUBMITURB/REAPURB path.
 type usbURB struct {
 	typ          uint8
 	endpoint     uint8
@@ -88,14 +84,19 @@ type usbBulkTransfer struct {
 // usbfsDevice is a usbfs-backed Transport for one open camera.
 type usbfsDevice struct {
 	f *os.File
-	// ctrlMu serializes control transfers — the capture path and the TEC loop drive
-	// one open camera concurrently. Bulk reads (EP 0x81) are a separate pipe and stay
-	// unlocked so a long readout can't stall a TEC tick. See transport_darwin.go.
-	ctrlMu sync.Mutex
+	// ioMu serializes every USB I/O the FX3 bridge must not see interleaved: all control
+	// transfers AND a whole-frame BulkRead hold it. A control transfer (a TEC poll, or a
+	// client's CCDTemperature → 0xB3) landing on the bridge mid-readout hard-wedges the
+	// un-buffered USB2 path (ASI174) — it parks the GPIF and takes the control plane down
+	// with it (EP0 then times out, -110), recoverable only by a device reset + re-Init.
+	// bulkOne (ReadFrameStream — the USB3/6200 DDR path) deliberately does NOT take ioMu:
+	// that path requires its worker's concurrent FPGABufReload, and its DDR frame buffer
+	// makes the interleave harmless.
+	ioMu sync.Mutex
 }
 
 // usbNode is one /dev/bus/usb device node and the VID/PID read from its descriptor
-// head — the cheap identity a scan reads without claiming the device.
+// head — the identity a scan reads without claiming the device.
 type usbNode struct {
 	path     string
 	bus, dev int
@@ -103,11 +104,8 @@ type usbNode struct {
 }
 
 // location packs busnum/devnum into the platform location id used by DeviceInfo and
-// OpenLocation. On Linux this is stable only while the device stays attached: a replug
-// reassigns devnum, after which the acquire loop re-binds by serial (OpenSerial) and
-// picks up the new id. (macOS uses a topology-derived locationID that survives replug;
-// matching that on Linux would mean parsing the sysfs port path — not needed here, since
-// the serial is the durable key and the location is just the per-session open handle.)
+// OpenLocation. Stable only while the device stays attached: a replug reassigns devnum,
+// after which the acquire loop re-binds by serial (OpenSerial) and picks up the new id.
 func (n usbNode) location() uint32 { return uint32(n.bus)<<16 | uint32(n.dev&0xffff) }
 
 // busDevFromPath parses the bus and device numbers out of a /dev/bus/usb/BBB/DDD path.
@@ -121,8 +119,7 @@ func busDevFromPath(p string) (bus, dev int, err error) {
 
 // scanUSB lists every /dev/bus/usb node whose device-descriptor VID matches vid (and
 // PID, when pid != 0), reading the 18-byte descriptor head read-only — no claim, so it
-// is safe to run against a camera another process has open. Unreadable nodes (permission
-// / vanished) are skipped.
+// is safe against a camera another process has open. Unreadable nodes are skipped.
 func scanUSB(vid, pid uint16) []usbNode {
 	nodes, _ := filepath.Glob("/dev/bus/usb/*/*")
 	var out []usbNode
@@ -204,8 +201,8 @@ func (d *usbfsDevice) claim(iface uint32) error {
 }
 
 func (d *usbfsDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, data []byte) (int, error) {
-	d.ctrlMu.Lock()
-	defer d.ctrlMu.Unlock()
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
 	ct := usbCtrlTransfer{
 		bRequestType: reqType, bRequest: bRequest,
 		wValue: wValue, wIndex: wIndex, wLength: uint16(len(data)),
@@ -233,7 +230,7 @@ func (d *usbfsDevice) ControlIn(bRequest uint8, wValue, wIndex uint16, data []by
 // maxBulkChunk caps a single USBDEVFS_BULK transfer. usbfs kmallocs a physically
 // contiguous kernel buffer per ioctl, so a whole-frame read (several MB) fails with
 // ENOMEM above the kernel's per-allocation limit (~4 MB, lower under fragmentation).
-// 1 MiB matches the SDK/darwin xferLen and stays well clear of it.
+// 1 MiB matches the SDK/darwin xferLen.
 const maxBulkChunk = 1 << 20
 
 // bulkOne issues one USBDEVFS_BULK read of up to len(buf) bytes and returns the
@@ -253,30 +250,30 @@ func (d *usbfsDevice) bulkOne(buf []byte, timeoutMs uint32) (int, error) {
 }
 
 // bulkTrace, when ASTROCAM_BULK_TRACE is set, logs one line per submitted/reaped urb to
-// stderr so a real capture reveals exactly what the wire does (held-tail / short-packet
-// timing). Diagnostic only — left off by default.
+// stderr (held-tail / short-packet timing). Diagnostic only — off by default.
 var bulkTrace = os.Getenv("ASTROCAM_BULK_TRACE") != ""
 
 // BulkRead reads one whole frame from the bulk-IN endpoint into buf via the async-URB pump
-// (readFrameURBs), which is what gets the FX3's held >4 s TRIGGER tail. See that function.
+// (readFrameURBs), which gets the FX3's held >4 s TRIGGER tail. Holds ioMu for the whole
+// frame so no control transfer can interleave with the readout (see usbfsDevice.ioMu). This
+// is the un-buffered USB2 path; the USB3 DDR path reads through bulkOne/ReadFrameStream.
 func (d *usbfsDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
 	return d.readFrameURBs(buf, timeout)
 }
 
-// readFrameURBs reads one whole frame through the usbfs ASYNC urb API, mirroring the macOS
-// asi_read_frame_async pump that the SDK/darwin path uses. It submits ceil(len/chunk)
-// bulk-IN transfers up front (USBDEVFS_SUBMITURB) — each into its slice of buf at a fixed
-// offset, the LAST sized to the exact remainder, not a padded full chunk — then reaps them
-// in completion order (USBDEVFS_REAPURBNDELAY) and counts contiguous bytes up to the first
-// short or failed transfer (the FX3 ends a frame with a short packet).
+// readFrameURBs reads one whole frame through the usbfs async urb API. It submits
+// ceil(len/chunk) bulk-IN transfers up front (USBDEVFS_SUBMITURB) — each into its slice of
+// buf at a fixed offset, the last sized to the exact remainder, not a padded full chunk —
+// then reaps them in completion order (USBDEVFS_REAPURBNDELAY) and counts contiguous bytes
+// up to the first short or failed transfer (the FX3 ends a frame with a short packet).
 //
-// The exact-remainder final transfer is the crux of the >4 s single-shot TRIGGER fix. The
-// FX3 commits whole 1-MiB DMA buffers and HOLDS the frame's final partial buffer; when the
-// host asks for a full 1 MiB it cannot fill, it keeps holding (a synchronous USBDEVFS_BULK
-// or a 1-MiB async transfer just sits there — the read returns ~4 MiB short). Requesting
-// exactly the pending tail bytes is what makes it deliver — which is why macOS, sizing its
-// last transfer to bufSize-off, never saw the bug. usbfs reports a short bulk-IN as status 0
-// with actual_length < buffer_length (no error), so a short transfer marks the frame end.
+// The exact-remainder final transfer is required for the >4 s single-shot TRIGGER tail: the
+// FX3 commits whole 1-MiB DMA buffers and holds the frame's final partial buffer; asked for
+// a full 1 MiB it cannot fill, it keeps holding. Requesting exactly the pending tail bytes
+// makes it deliver. usbfs reports a short bulk-IN as status 0 with actual_length <
+// buffer_length (no error), so a short transfer marks the frame end.
 func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
@@ -395,14 +392,12 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, err
 	return total, nil
 }
 
-// ReadFrameStream reads one whole frame, treating the FX3's mid-frame short packets
-// and zero-length packets as NON-terminal (the DDR cameras — 6200/585 — hold the
-// frame's final partial buffer until FPGABufReload flushes it, which the worker
-// pulses on a ticker for the duration of this call). It keeps issuing full
-// maxBulkChunk reads into scratch and copying to a watermark until the frame is in,
-// `idle` passes with no data at all (a genuine stall), or the `total` deadline hits.
-// usbfsDevice satisfying FrameStreamer is what makes StreamFrame use this instead of
-// the generic BulkStreamer loop, which (correctly for darwin) stops on the first ZLP.
+// ReadFrameStream reads one whole frame, treating the FX3's mid-frame short packets and
+// zero-length packets as non-terminal (the DDR cameras — 6200/585 — hold the frame's final
+// partial buffer until FPGABufReload flushes it, which the worker pulses on a ticker for the
+// duration of this call). It keeps issuing full maxBulkChunk reads into scratch and copying
+// to a watermark until the frame is in, `idle` passes with no data at all (a genuine stall),
+// or the `total` deadline hits. usbfsDevice satisfies FrameStreamer.
 func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
@@ -439,20 +434,14 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 }
 
 // ResetEndpoint clears a halt/stall on the bulk-IN endpoint (USBDEVFS_CLEAR_HALT).
-// usbfsDevice satisfying EndpointResetter is what makes the capture worker's
-// ResetEndpoint() (issued before each frame) actually clear the pipe — it was a
-// silent no-op on Linux (the method was missing), so a stale pipe state from a prior
-// aborted/partial read carried into the next transfer as the intermittent EPROTO.
 func (d *usbfsDevice) ResetEndpoint(ep uint8) error {
 	e := uint32(ep)
 	return d.ioctl(usbdevfsClearHalt, unsafe.Pointer(&e))
 }
 
-// ResetDevice performs a USB port reset of the whole device (USBDEVFS_RESET) — the
-// last-resort recovery when the readout wedges past a few consecutive zero-byte stalls
-// (the capture worker escalates to it before re-arming). The reset drops the kernel's
-// interface claim, so we re-claim interface 0 afterwards; the device keeps its address
-// (no node change) on a successful reset.
+// ResetDevice performs a USB port reset of the whole device (USBDEVFS_RESET) — last-resort
+// recovery when the readout wedges. The reset drops the kernel's interface claim, so we
+// re-claim interface 0 afterwards; the device keeps its address (no node change).
 func (d *usbfsDevice) ResetDevice() error {
 	if err := d.ioctl(usbdevfsReset, nil); err != nil {
 		return err
@@ -471,10 +460,10 @@ func OpenHost(vid, pid uint16) (Transport, error) {
 	return d, nil
 }
 
-// enumerateRaw lists every VID-matched USB device under /dev/bus/usb WITHOUT opening
-// it (the shared Enumerate filters these to known camera PIDs). Name is left empty —
-// the kernel's product string isn't read here, and filterCameras fills it from the
-// model registry. Location is busnum/devnum, the key OpenLocation reopens by.
+// enumerateRaw lists every VID-matched USB device under /dev/bus/usb without opening it
+// (the shared Enumerate filters these to known camera PIDs). Name is left empty
+// (filterCameras fills it from the model registry); Location is busnum/devnum, the key
+// OpenLocation reopens by.
 func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 	var out []DeviceInfo
 	for _, n := range scanUSB(vid, 0) {
@@ -484,9 +473,9 @@ func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 }
 
 // OpenLocation opens the device at a specific busnum/devnum location (from a DeviceInfo)
-// and claims its bulk interface — the way to bind the exact unit chosen from Enumerate.
-// The descriptor VID is re-checked because devnum can be reused for a different device
-// after a replug between enumerate and open.
+// and claims its bulk interface — binds the exact unit chosen from Enumerate. The
+// descriptor VID is re-checked because devnum can be reused for a different device after a
+// replug between enumerate and open.
 func OpenLocation(vid uint16, loc uint32) (Transport, error) {
 	bus, dev := int(loc>>16), int(loc&0xffff)
 	path := fmt.Sprintf("/dev/bus/usb/%03d/%03d", bus, dev)
