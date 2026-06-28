@@ -7,11 +7,9 @@ import (
 	"time"
 )
 
-// SER v3 writer (the planetary / lucky-imaging video container: one fixed-size header,
-// then every frame's raw pixels back-to-back, then an optional per-frame timestamp
-// trailer). Written for the fast-exposure burst path — frames stream straight to disk as
-// they arrive, so RAM stays flat regardless of frame count. Read by SER Player, PIPP,
-// AutoStakkert!, FireCapture.
+// SER v3 writer: one fixed-size header, then every frame's raw pixels back-to-back, then
+// an optional per-frame timestamp trailer. Read by SER Player, PIPP, AutoStakkert!,
+// FireCapture.
 //
 // Layout (all integers little-endian; total header = 178 bytes):
 //
@@ -39,10 +37,8 @@ const (
 	serBayerBGGR = 11
 )
 
-// serLittleEndian: the camera delivers RAW16 little-endian and we write it verbatim (no
-// swap). The SER v3 spec says 1 = little-endian data; that is what we set and what
-// spec-compliant readers (SER Player, PIPP, AutoStakkert!) expect. (8-bit data is
-// byte-order-agnostic, so RAW8 SER is unaffected by this field.)
+// serLittleEndian: SER v3 field, 1 = little-endian data. The camera delivers RAW16
+// little-endian, written verbatim. (8-bit data is byte-order-agnostic.)
 const serLittleEndian = 1
 
 // netEpochTicks is the number of 100-ns ticks from the .NET epoch (0001-01-01) to the

@@ -2,8 +2,8 @@ package astrocam
 
 import "fmt"
 
-// ZWO vendor request codes. Each is a vendor control transfer carrying the register
-// in wValue and the value in wIndex (writes) — no data stage — or a 1-byte IN (reads):
+// ZWO vendor request codes. Writes: OUT 0x40, wValue=reg, wIndex=val, no data stage.
+// Reads: IN 0xC0, wValue=reg, 1-byte data.
 //
 //	WriteSONYREG         OUT 0x40 bReq 0xB6  wValue=reg wIndex=val8
 //	ReadSONYREG          IN  0xC0 bReq 0xB7  wValue=reg  -> 1B
@@ -30,10 +30,9 @@ const (
 	cmdEnableGPIF32DQ = 0xBE // EnableGPIF32DQ: enable the FPGA->FX3 32-bit data bus
 )
 
-// RegBus selects which vendor request a sensor's WriteReg/ReadReg map to. The
-// FX3 bridge routes these to different hardware: BusSony hits the Sony I2C path,
-// BusCamera the generic camera-register path. (FPGA access is a separate space —
-// see WriteFPGAReg.)
+// RegBus selects which vendor request a sensor's WriteReg/ReadReg map to: BusSony
+// the Sony I2C path, BusCamera the generic camera-register path. FPGA access is a
+// separate space (see WriteFPGAReg).
 type RegBus uint8
 
 const (
@@ -51,29 +50,25 @@ const (
 )
 
 // zwoRegmap implements Regmap over a Transport using the ZWO control-transfer
-// protocol. Sensor profiles write through this without knowing the wire format.
-// bus picks the sensor-register request (Sony vs generic camera).
+// protocol. bus picks the sensor-register request (Sony vs generic camera).
 type zwoRegmap struct {
 	t    Transport
 	bus  RegBus
 	mode ReadoutMode // live readout context (USB speed, output depth, FPS%) — set by Camera
 }
 
-// ReadoutMode implements modeReader so the shared exposure/HMAX bodies (fps.go) read the
-// live runtime context the Camera set, without threading it through every Sensor op.
+// ReadoutMode implements modeReader: returns the live runtime context the Camera set.
 func (r *zwoRegmap) ReadoutMode() ReadoutMode { return r.mode }
 
-// liveMode implements modeCarrier so the Camera mutates the live ReadoutMode (FPS%, output
-// depth, bin) through an interface instead of a concrete *zwoRegmap assertion — so any
-// vendor regmap (e.g. poaRegmap) carries those updates too.
+// liveMode implements modeCarrier: lets the Camera mutate the live ReadoutMode (FPS%,
+// output depth, bin) through the interface.
 func (r *zwoRegmap) liveMode() *ReadoutMode { return &r.mode }
 
-// VID reports the ZWO vendor id so shared sensor profiles select the ZWO gain/offset encoding.
+// VID reports the ZWO vendor id (selects the ZWO gain/offset encoding).
 func (r *zwoRegmap) VID() uint16 { return ZWO.VID }
 
-// ZWO is the vendor descriptor for ZWO ASI cameras (USB VID 0x03C3). Its Regmap
-// dialect is the control-transfer protocol decoded in this file. Registered at init so
-// the core's enumeration/Open paths discover it by VID without hardcoding the vendor.
+// ZWO is the vendor descriptor for ZWO ASI cameras (USB VID 0x03C3). Its Regmap dialect
+// is the control-transfer protocol in this file. Registered at init.
 var ZWO = &Vendor{
 	VID:  0x03C3,
 	Name: "ZWO",
@@ -103,7 +98,7 @@ func (r *zwoRegmap) WriteReg(reg, val uint16) error {
 }
 
 func (r *zwoRegmap) ReadReg(reg uint16) (uint16, error) {
-	buf := make([]byte, 1) // WriteSONYREG/ReadSONYREG are 8-bit
+	buf := make([]byte, 1) // ReadSONYREG returns 8-bit
 	if _, err := r.t.ControlIn(r.readReq(), reg, 0, buf); err != nil {
 		return 0, fmt.Errorf("read reg 0x%x: %w", reg, err)
 	}
@@ -136,10 +131,8 @@ func (r *zwoRegmap) ReadFPGAReg(reg uint16) (uint16, error) {
 }
 
 // SetVMAX programs the frame length (VMAX) into the camera FPGA: clamp to 24 bits,
-// strobe FPGA reg 1, then write VMAX little-endian to regs 0x10/0x11/0x12. Sensor
-// SetExposure ops call this to
-// set the readout period that their SHS shutter value is measured against — VMAX
-// lives in the FPGA, not the sensor, which is why it needs the FPGA bus.
+// strobe FPGA reg 1, write VMAX little-endian to regs 0x10/0x11/0x12, then release the
+// strobe. VMAX lives in the FPGA, not the sensor.
 func SetVMAX(rm Regmap, vmax uint32) error {
 	if vmax > 0xffffff {
 		vmax = 0xffffff
@@ -156,9 +149,7 @@ func SetVMAX(rm Regmap, vmax uint32) error {
 			return err
 		}
 	}
-	// Release the commit strobe (FPGA reg 1: 1 -> 0), same as SetFPGAHMAX. Pcap-
-	// confirmed the SDK clears it after the VMAX bytes ("bd 0001 00"); leaving it set
-	// holds the latch high into the arm.
+	// Release the commit strobe (FPGA reg 1: 1 -> 0) after the VMAX bytes.
 	return rm.WriteFPGAReg(fpgaVMAXStrobe, 0)
 }
 
@@ -175,15 +166,13 @@ func (c *Camera) writeFPGAReg(reg, val uint16) error {
 func (c *Camera) vendorCmd(op uint8) error { return c.t.ControlOut(op, 0, 0, nil) }
 
 // FlashHPCMapAddr is the flash address of the factory hot/dead-pixel correction map blob.
-// Layout: a 2 KiB header beginning with magic "ASID" (defect map; "ASIG" = gain map) and a
-// big-endian uint32 payload length at offset 4, followed by a compressed 1-bit-per-pixel
-// defect bitmap.
+// Layout: 2 KiB header with magic "ASID" (defect map; "ASIG" = gain map) and a big-endian
+// uint32 payload length at offset 4, followed by a compressed 1-bit-per-pixel defect bitmap.
 const FlashHPCMapAddr = 0x40000
 
 // ReadSPIFlash reads n bytes from the camera's SPI flash starting at addr, in 2 KiB vendor-IN
-// blocks (wIndex tracks addr>>8). The SPI flash and the sensor's 32-bit GPIF data bus share
-// FX3 pins, so the read is bracketed by EnableGPIF32DQ(false)/(true); the camera must be Init'd
-// first. Exposed so callers can pull the raw factory defect map (FlashHPCMapAddr) for inspection.
+// blocks (wIndex tracks addr>>8). SPI flash and the sensor's 32-bit GPIF data bus share FX3
+// pins, so the read is bracketed by EnableGPIF32DQ(false)/(true); the camera must be Init'd first.
 func (c *Camera) ReadSPIFlash(addr uint32, n int) ([]byte, error) {
 	if err := c.t.ControlOut(cmdEnableGPIF32DQ, 0, 0, nil); err != nil {
 		return nil, err
@@ -219,12 +208,11 @@ func (c *Camera) FirmwareVersion() (uint16, error) {
 	return uint16(buf[0]) | uint16(buf[1])<<8, nil
 }
 
-// Serial is the ZWO factory device ID (ASI_ID): 8 raw bytes burned at manufacture.
-// It is the only stable per-unit identifier — USB exposes no serial-number string
-// descriptor — so it is what binds an Alpaca device to a physical camera.
+// Serial is the ZWO factory device ID (ASI_ID): 8 raw bytes burned at manufacture. USB
+// exposes no serial-number descriptor, so this is the only stable per-unit identifier.
 type Serial [8]byte
 
-// String renders the serial as ZWO does in its tools: the 8 bytes as lowercase hex.
+// String renders the serial as 8 bytes of lowercase hex.
 func (s Serial) String() string {
 	const hex = "0123456789abcdef"
 	var b [16]byte
@@ -234,11 +222,8 @@ func (s Serial) String() string {
 	return string(b[:])
 }
 
-// SerialNumber reads the factory serial: a single vendor control-IN transfer —
-// bRequest 0xC8, wValue 0, wIndex 0 — returning the 8 raw ASI_ID bytes. (A legacy
-// path reads the same ID from SPI flash at 0x70000 with opcode 0xC3, guarded by an
-// "ID" magic; modern firmware answers 0xC8 directly, so that fallback is not needed
-// here.)
+// SerialNumber reads the factory serial: a single vendor control-IN transfer (bRequest
+// 0xC8, wValue 0, wIndex 0) returning the 8 raw ASI_ID bytes.
 func (c *Camera) SerialNumber() (Serial, error) {
 	var s Serial
 	if _, err := c.t.ControlIn(reqSerialNumber, 0, 0, s[:]); err != nil {

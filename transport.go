@@ -1,9 +1,7 @@
-// Package asicam is a pure-Go driver for ASI-class cameras, structured as a
-// vendor transport + per-sensor profiles (Linux-V4L2-driver style) + a model
-// table — so "support all cameras on a given Sony die" is a data problem, not a
-// code rewrite. It is VENDOR-INDEPENDENT: ZWO (VID 0x03C3) and PlayerOne (VID
-// 0xA0A0) share one profile per die; the per-vendor difference is the Regmap
-// opcode dialect and the gain/offset unit scale, selected from the regmap's VID.
+// Package asicam is a pure-Go driver for ASI-class cameras: a vendor transport +
+// per-sensor profiles + a model table. Vendor-independent: ZWO (VID 0x03C3) and
+// PlayerOne (VID 0xA0A0) share one profile per Sony die; the per-vendor difference is
+// the Regmap opcode dialect and the gain/offset unit scale, selected from the regmap's VID.
 //
 // Layering:
 //
@@ -16,27 +14,16 @@
 //	Models        (VID,PID) -> { sensor, mono|color, cooled, usb3 }
 //	Camera        binds a Transport + Model + Sensor into the control flow
 //
-// STATUS (2026-06-04): the architecture, control plane, real backends (macOS IOUSBHost,
-// Linux usbfs, Windows WinUSB), and the bulk data plane are all implemented and
-// HARDWARE-VALIDATED. Three sensor profiles capture real frames end-to-end — imx174
-// (ASI174 Mini, USB2), imx290 (ASI290MM), and imx455 (ASI6200 MM/MC, USB3 + USB2,
-// full 122 MB frames). The remaining work is breadth: further sensor profiles are decoded
-// from the static `.a` and added as needed (an open-ended set, one per Sony die), each
-// carrying an UNVERIFIED header / TODOs until hardware confirms its register table + gain curve.
-//
-// MULTI-VENDOR (2026-06): PlayerOne IMX455/IMX571 are wired and unit-tested — the poaRegmap
-// opcode dialect (protocol_poa.go) plus gain/offset/caps that dispatch on the regmap's VID
-// over the SAME shared profiles. PlayerOne being an independent implementation of the same
-// registers also second-source confirms the ASI 455/571 decode. What's left for a live
-// PlayerOne camera is hardware-gated: PID->sensor rows (PlayerOne ships no static PID
-// table) and capture-path validation.
+// Backends: macOS IOUSBHost, Linux usbfs, Windows WinUSB. Sensor profiles validated on
+// hardware: imx174 (ASI174 Mini, USB2), imx290 (ASI290MM), imx455 (ASI6200 MM/MC, USB3 +
+// USB2, 122 MB frames). PlayerOne IMX455/IMX571 are wired via poaRegmap (protocol_poa.go)
+// over the same shared profiles, unit-tested but not yet validated on a live PlayerOne camera.
 package astrocam
 
 import "time"
 
-// Transport is the per-vendor USB seam. ZWO's protocol (protocol.go) is built on
-// top of it; a real backend wraps libusb (gousb / usbfs). Control transfers are
-// always vendor-typed: ControlOut uses bmRequestType 0x40, ControlIn 0xC0.
+// Transport is the per-vendor USB seam. Control transfers are vendor-typed:
+// ControlOut uses bmRequestType 0x40, ControlIn 0xC0.
 type Transport interface {
 	// ControlOut issues a vendor OUT control transfer (bmRequestType 0x40).
 	ControlOut(bRequest uint8, wValue, wIndex uint16, data []byte) error
@@ -50,10 +37,8 @@ type Transport interface {
 }
 
 // Stream is a high-throughput bulk-IN read: the backend keeps a pool of buffers
-// submitted and resubmitted on EP 0x81, delivering completed chunks in order.
-// This is the async pump (initAsyncXfer/startAsyncXfer) —
-// a window of ~200 MB / chunk in flight is what reaches USB3 line rate, which a
-// one-shot BulkRead per frame cannot. Frame data flows through here.
+// submitted and resubmitted on EP 0x81, delivering completed chunks in order. The
+// async pump reaches USB3 line rate, which a one-shot BulkRead per frame cannot.
 type Stream interface {
 	// Next returns the next completed chunk; its length may be < bufSize on the
 	// final short packet (the FX3 frame-end delimiter). The slice is valid until
@@ -71,10 +56,9 @@ type BulkStreamer interface {
 	BulkStream(bufSize, nBuffers int) (Stream, error)
 }
 
-// FrameStreamer is an optional Transport capability: read one whole frame with the
-// continuous windowed pump (the USB3 startAsyncXfer window) — a window of transfers
-// kept cycling on EP 0x81, copied contiguously so a short packet at a burst boundary
-// can't leave a gap, until the frame is in. Needed for large USB3 frames (IMX455/571)
+// FrameStreamer is an optional Transport capability: read one whole frame with a
+// window of transfers kept cycling on EP 0x81, copied contiguously so a short packet
+// at a burst boundary can't leave a gap. Needed for large USB3 frames (IMX455/571)
 // that a one-shot BulkRead truncates; returns short on an idle stall so the caller can
 // flush/recover and continue into buf[n:].
 type FrameStreamer interface {
@@ -82,9 +66,9 @@ type FrameStreamer interface {
 }
 
 // FrameStream is a resident streaming session (the video / planetary-burst path): the
-// windowed pump is primed ONCE and Next pulls one frame per call, so the per-frame setup
-// cost (thread spawn, window prime, teardown) that ReadFrameStream pays every call is paid
-// just once for the whole burst. Close aborts and frees the session.
+// windowed pump is primed once and Next pulls one frame per call, so the per-frame setup
+// cost (thread spawn, window prime, teardown) is paid once for the whole burst. Close
+// aborts and frees the session.
 type FrameStream interface {
 	Next(buf []byte, idle time.Duration) (int, error)
 	Close() error
@@ -97,7 +81,7 @@ type StreamStarter interface {
 }
 
 // FrameStreamZC is an optional zero-copy extension a FrameStream may implement: NextZC
-// returns a slice ALIASING the session's internal buffer (no per-frame memcpy), valid until
+// returns a slice aliasing the session's internal buffer (no per-frame memcpy), valid until
 // Release re-arms the slot. Only meaningful when each frame is a single transfer (sub-MiB
 // ROI). The caller must consume the slice before Release.
 type FrameStreamZC interface {
@@ -105,34 +89,29 @@ type FrameStreamZC interface {
 	Release()
 }
 
-// EndpointResetter is an optional Transport capability: clear a stalled/streaming
-// bulk endpoint (the per-platform clear-halt) to drop stale data before a capture —
-// ResetEndpoint(0x81), issued before each session.
+// EndpointResetter is an optional Transport capability: clear a stalled bulk endpoint
+// (per-platform clear-halt) to drop stale data before a capture — ResetEndpoint(0x81),
+// issued before each session.
 type EndpointResetter interface {
 	ResetEndpoint(ep uint8) error
 }
 
 // DeviceResetter is an optional Transport capability: a USB bus reset of the whole
-// device (the per-platform whole-device USB reset) — the last-resort recovery when a
-// pipe-level reset can't unwedge the camera. It wipes the device's state, so the caller
-// must re-Init afterwards; the snap path uses it only as a final give-up to leave the
-// device clean for the next session.
+// device — last-resort recovery when a pipe-level reset can't unwedge the camera. It
+// wipes the device's state, so the caller must re-Init afterwards.
 type DeviceResetter interface {
 	ResetDevice() error
 }
 
-// Regmap is the sensor-register interface a Sensor profile writes to — the
-// pure-Go analogue of the Linux kernel's regmap. The ZWO implementation
-// (zwoRegmap) carries each access as a control transfer.
-//
-// Two register spaces are exposed because the SDK uses two distinct
-// vendor requests with different routing inside the FX3 bridge:
+// Regmap is the sensor-register interface a Sensor profile writes to. The ZWO
+// implementation (zwoRegmap) carries each access as a control transfer. Two register
+// spaces, routed through two distinct vendor requests in the FX3 bridge:
 //
 //   - WriteReg/ReadReg   → the sensor's own registers (Sony WriteSONYREG 0xB6 /
 //     ReadSONYREG 0xB7 by default; a non-Sony profile can select the generic
 //     camera-register bus 0xA6 via Sensor.Bus).
 //   - WriteFPGAReg/ReadFPGAReg → the camera FPGA's registers (0xBD / 0xBC).
-//     Exposure timing (VMAX) and HBLANK live here, NOT on the sensor — that is
+//     Exposure timing (VMAX) and HBLANK live here, not on the sensor — that is
 //     why every profile's SetExposure needs this path. See SetVMAX.
 type Regmap interface {
 	WriteReg(reg, val uint16) error

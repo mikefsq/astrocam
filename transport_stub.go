@@ -1,17 +1,15 @@
 package astrocam
 
-// StubTransport is an in-memory ZWO-camera Transport for hardware-free, end-to-end
-// tests of the capture pipeline: Init → SetROI → SetGain → SetExposure →
-// StartExposure → the post-exposure data read, exercising the per-sensor Workers and both read
-// paths. It is the test-bench sibling of transport_darwin.go / transport_linux.go /
-// transport_windows.go — no cgo, no hardware, available on every platform.
+// StubTransport is an in-memory ZWO-camera Transport for hardware-free, end-to-end tests of
+// the capture pipeline (Init → SetROI → SetGain → SetExposure → StartExposure → data read),
+// exercising the per-sensor Workers and both read paths. No cgo, no hardware, available on
+// every platform.
 //
-// It speaks the real control-transfer convention (protocol.go): register writes are
-// stored and echoed back on the matching reads, the FX3 vendor commands
-// (stop/start/flush/bank/GPIF) are accepted as no-ops, ReadFirmwareVer returns a
-// configurable version, and every bulk / windowed-stream read is filled with a
-// synthetic frame. It satisfies Transport plus EndpointResetter and FrameStreamer,
-// so the small-frame BulkRead path and the large-frame USB3 windowed pump both run.
+// It speaks the real control-transfer convention (protocol.go): register writes are stored
+// and echoed back on the matching reads, the FX3 vendor commands (stop/start/flush/bank/GPIF)
+// are accepted as no-ops, ReadFirmwareVer returns a configurable version, and every bulk /
+// windowed-stream read is filled with a synthetic frame. It satisfies Transport plus
+// EndpointResetter and FrameStreamer.
 
 import (
 	"sync"

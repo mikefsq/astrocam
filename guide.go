@@ -2,17 +2,11 @@ package astrocam
 
 import "time"
 
-// ST4 autoguider pulse output: PulseGuideOn / PulseGuideOff / pulseGuide.
-//
-// Each is a single vendor OUT control transfer issued through the generic
-// SendCMD(bReq, wValue, wIndex, isRead=0, data=NULL, wLen=0) — i.e. bmRequestType
-// 0x40, no data stage. The DIRECTION rides in
-// wValue (PulseGuideOn: `and w2, dir, #0xffff` → arg2 = wValue), NOT a
-// fixed 0. The bare 1-arg sendCmd in protocol.go (wValue=0) would always guide
-// North; ST4 must carry the direction here.
+// ST4 autoguider pulse output. Each call is a single vendor OUT control transfer
+// (bmRequestType 0x40, no data stage); the direction rides in wValue.
 
-// GuideDir is an ST4 pulse direction, matching ASI_GUIDE_DIRECTION in
-// ASICamera2.h (NORTH=0, SOUTH=1, EAST=2, WEST=3).
+// GuideDir is an ST4 pulse direction, matching ASI_GUIDE_DIRECTION (NORTH=0, SOUTH=1,
+// EAST=2, WEST=3).
 type GuideDir uint8
 
 const (
@@ -36,9 +30,7 @@ func (d GuideDir) String() string {
 	return "?"
 }
 
-// PulseGuideOn asserts the ST4 line for dir (SendCMD 0xB0, wValue=dir). Mirrors
-// PulseGuideOn: dir>3 is a no-op (the SDK returns success without a
-// transfer), so an out-of-range direction silently does nothing.
+// PulseGuideOn asserts the ST4 line for dir (SendCMD 0xB0, wValue=dir). dir>3 is a no-op.
 func (c *Camera) PulseGuideOn(dir GuideDir) error {
 	if dir > GuideWest {
 		return nil
@@ -54,9 +46,8 @@ func (c *Camera) PulseGuideOff(dir GuideDir) error {
 	return c.t.ControlOut(cmdST4F, uint16(dir), 0, nil)
 }
 
-// PulseGuide asserts dir, waits d, then releases — pulseGuide
-// (on → usleep(ms*1000) → off). The wait is host-timed, exactly as the SDK does
-// it; the firmware does not gate the pulse width.
+// PulseGuide asserts dir, waits d (host-timed), then releases. The firmware does not gate
+// the pulse width.
 func (c *Camera) PulseGuide(dir GuideDir, d time.Duration) error {
 	if err := c.PulseGuideOn(dir); err != nil {
 		return err

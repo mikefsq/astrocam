@@ -2,14 +2,9 @@ package astrocam
 
 import "fmt"
 
-// PlayerOne control-transfer opcodes. Each is a
-// vendor control transfer via UsbCmd(bRequest, wValue, wIndex, isRead, buf, len)
-// — the same FX3 bridge as ZWO, a different host dialect.
-//
-// CRITICAL: PlayerOne's argument order is the OPPOSITE of ZWO's. ZWO's WriteSONYREG puts
-// the register in wValue and the value in wIndex; PlayerOne's Fx3ImgSenWrite puts the
-// VALUE in wValue and the REGISTER in wIndex. Transport.ControlOut/In is generic
-// (bRequest, wValue, wIndex, data), so this file just supplies PlayerOne's order.
+// PlayerOne control-transfer opcodes. Same FX3 bridge as ZWO, different host dialect.
+// Argument order is the OPPOSITE of ZWO's: PlayerOne puts the VALUE in wValue and the
+// REGISTER in wIndex (ZWO is reg in wValue, value in wIndex).
 //
 //	Fx3ImgSenWrite(reg,val)      OUT bReq 0xB0  wValue=val wIndex=reg
 //	Fx3ImgSenRead(reg)           IN  bReq 0xB2  wValue=0   wIndex=reg
@@ -23,24 +18,19 @@ const (
 	poaReqFpgaWrite   = 0xC0 // camera-FPGA register write (8-bit value)
 	poaReqFpgaRead    = 0xC2 // camera-FPGA register read (IN)
 
-	// poaCrypRegBias is the additive obfuscation PlayerOne applies to a protected
-	// register address before CrypWrite: wire_reg = (reg + 0xABCD) & 0xffff. Equivalently
-	// it adds -0x5433 (= +0xABCD mod 2^16); it is NOT encryption, just a fixed offset.
+	// poaCrypRegBias is the additive address obfuscation applied before CrypWrite:
+	// wire_reg = (reg + 0xABCD) & 0xffff. A fixed offset, not encryption.
 	poaCrypRegBias uint16 = 0xABCD
 )
 
-// poaProtectedRegs are the registers PlayerOne writes via the obfuscated CrypWrite path
-// instead of a plain sensor write, per CamGainSet — the
-// only protected register on either Sony die is the gain-setup 0x67f (four CrypWrite
-// call sites each, all reg 0x67f). Shared across PlayerOne's Sony dies; extend per-sensor
-// if new CrypWrite sites are found. Read-only after init.
+// poaProtectedRegs are the registers written via the obfuscated CrypWrite path instead of
+// a plain sensor write. The only protected register on either Sony die is the gain-setup
+// 0x67f. Read-only after init.
 var poaProtectedRegs = map[uint16]bool{0x67f: true}
 
-// poaRegmap implements Regmap over a Transport using PlayerOne's control-transfer
-// protocol. The Sony dies (IMX455/571/…) and their register semantics are identical to
-// ZWO's — so the sensor profiles are shared unchanged; only this wire dialect differs.
-// protected routes the gain-setup register through CrypWrite automatically, so a profile
-// can call WriteReg(0x67f, …) without knowing the vendor obfuscation.
+// poaRegmap implements Regmap over a Transport using PlayerOne's control-transfer protocol.
+// The Sony dies and register semantics are identical to ZWO's; only this wire dialect
+// differs. protected routes the gain-setup register through CrypWrite automatically.
 type poaRegmap struct {
 	t         Transport
 	bus       RegBus // PlayerOne's Sony dies all use the ImgSen path; kept for interface parity
@@ -48,22 +38,19 @@ type poaRegmap struct {
 	protected map[uint16]bool
 }
 
-// ReadoutMode implements modeReader so the shared exposure/HMAX bodies (fps.go) read the
-// live runtime context the Camera set.
+// ReadoutMode implements modeReader: returns the live runtime context the Camera set.
 func (r *poaRegmap) ReadoutMode() ReadoutMode { return r.mode }
 
-// liveMode implements modeCarrier so the Camera can mutate the live ReadoutMode (FPS%,
-// output depth, bin) without a concrete-type assertion. (Named liveMode, not mode, to
-// avoid colliding with the mode field.)
+// liveMode implements modeCarrier: lets the Camera mutate the live ReadoutMode (FPS%,
+// output depth, bin).
 func (r *poaRegmap) liveMode() *ReadoutMode { return &r.mode }
 
-// VID reports the PlayerOne vendor id so shared sensor profiles select the PlayerOne
-// gain/offset encoding at call time.
+// VID reports the PlayerOne vendor id (selects the PlayerOne gain/offset encoding).
 func (r *poaRegmap) VID() uint16 { return POA.VID }
 
-// WriteReg writes a sensor register. A protected register (the gain-setup 0x67f) goes via
-// CrypWrite — distinct opcode 0xB3 and an address offset by +0xABCD — exactly as the
-// PlayerOne SDK does; the value is unchanged. All others use the plain sensor write 0xB0.
+// WriteReg writes a sensor register. A protected register (gain-setup 0x67f) goes via
+// CrypWrite (opcode 0xB3, address offset by +0xABCD); the value is unchanged. All others
+// use the plain sensor write 0xB0.
 func (r *poaRegmap) WriteReg(reg, val uint16) error {
 	if r.protected[reg] {
 		return r.t.ControlOut(poaReqImgSenCryp, val, reg+poaCrypRegBias, nil)
@@ -92,8 +79,7 @@ func (r *poaRegmap) WriteRegBits(reg uint16, lo, hi uint8, val uint16) error {
 }
 
 // WriteFPGAReg writes a camera-FPGA register (Fx3FpgaWrite 0xC0; reg in wIndex, value in
-// wValue). PlayerOne's single-register form carries an 8-bit value (the low byte) — which
-// matches how the FPGA register block is used (byte-wide regs, written one byte at a time).
+// wValue). Carries an 8-bit value (the low byte): FPGA regs are byte-wide.
 func (r *poaRegmap) WriteFPGAReg(reg, val uint16) error {
 	return r.t.ControlOut(poaReqFpgaWrite, val, reg, nil)
 }
@@ -107,15 +93,12 @@ func (r *poaRegmap) ReadFPGAReg(reg uint16) (uint16, error) {
 	return uint16(buf[0]), nil
 }
 
-// POA is the vendor descriptor for PlayerOne Astronomy cameras (USB VID 0xA0A0).
-// Its Regmap dialect is defined above. Registered at init so the
-// enumeration/Open paths discover it by VID — exactly like [[ZWO]], no core changes.
+// POA is the vendor descriptor for PlayerOne Astronomy cameras (USB VID 0xA0A0). Its
+// Regmap dialect is defined above. Registered at init.
 //
-// NOTE: PlayerOne product rows (PID -> sensor) are not yet registered. Unlike ZWO, the
-// PlayerOne SDK carries no static PID->sensor table — it filters on VID 0xA0A0 and reads
-// the sensor identity from the opened device at runtime — so the per-product PIDs must be
-// captured from real hardware (or a runtime sensor probe added) before IMX455/571
-// PlayerOne bodies enumerate. The transport dialect, however, is complete.
+// NOTE: PlayerOne product rows (PID -> sensor) are not yet registered. The PlayerOne SDK
+// carries no static PID->sensor table (it reads sensor identity from the opened device at
+// runtime), so per-product PIDs must be captured from hardware before enumeration works.
 var POA = &Vendor{
 	VID:  0xA0A0,
 	Name: "PlayerOne",

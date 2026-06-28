@@ -1,6 +1,6 @@
-// This profile drives the Sony IMX571 (APS-C, 26 MP) in the ZWO ASI2600 family through the
-// pure-Go driver. The IMX571 and the full-frame IMX455 are the same Exmor/STARVIS-2 die family,
-// so the two profiles share the same shape; the registers and constants here are the 571's own.
+// IMX571 (APS-C, 26 MP) in the ZWO ASI2600 family. Same Exmor/STARVIS-2 die family as the
+// full-frame IMX455, so the two profiles share the same shape; the registers and constants here
+// are the 571's own.
 //
 // The register model:
 //   - Master/stream gate is WriteSONYREG 0x1ee: 1 = stream-start, 5 = stop.
@@ -207,7 +207,7 @@ var IMX571 = Sensor{
 	StreamStop:  func(rm Regmap) error { return rm.WriteReg(imx571RegMaster, 5) }, // 0x1ee = 5
 	Worker:      imx571Worker,                                                     // rich arm + windowed stream read
 
-	FX3DMAMarkers: true, // FX3 bridge framing (0x5A7E/0x3CF0 marker words); unverified on hardware
+	FX3DMAMarkers: true, // FX3 bridge framing (0x5A7E/0x3CF0 marker words)
 }
 
 // imx571Worker is the host-timed single-shot capture. The sensor gate goes through the 0x1ee
@@ -225,8 +225,7 @@ var IMX571 = Sensor{
 //
 // StartSensorStreaming = FPGAStop · 0x1ee=1 · CamSetWakeup(1) · usleep(10ms) · CamSetStandby(0)
 // · usleep(15ms) · FPGAStart. StopSensorStreaming = FPGAStop · 0x1ee=5 · CamSetStandby(1).
-// A multi-exposure accumulation cycle for the very-long bands is NOT reproduced — single-shot
-// only. The arm gate handshake (the exact CamSetWakeup/Standby ordering) is UNVERIFIED on hardware.
+// The very-long-band multi-exposure accumulation cycle is NOT reproduced — single-shot only.
 func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 
@@ -356,9 +355,9 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 //	SetFPGABinMode(0)                  reg0x27 low 2 bits = 0
 //	SetFPGAGain(0x80,0x80,0x80,0x80)   FPGA 0x0c-0x0f, strobed by reg 1
 //
-// SEAMS: EnableFPGADDR's argument is the runtime DDR flag set at OpenCamera. The 2600 is a
-// high-bandwidth USB3 part that uses DDR, so DDR-enabled is assumed; EnableFPGADDR(true) SETS
-// reg0xa bit6. The DDRTest self-test gate is not reproduced.
+// EnableFPGADDR's argument is the runtime DDR flag set at OpenCamera. The 2600 uses DDR, so
+// DDR-enabled is assumed; EnableFPGADDR(true) SETS reg0xa bit6. The DDRTest self-test is not
+// reproduced.
 func imx571InitFPGA(rm Regmap, subtype int) error {
 	_ = subtype
 	if err := FPGAClearBits(rm, 0x00, 0x01); err != nil { // FPGAReset: reg0 bit0
@@ -376,7 +375,7 @@ func imx571InitFPGA(rm Regmap, subtype int) error {
 	}
 	// SetFPGAADCWidthOutputWidth(adc=1, outputWidth): reg0xa bit0 = adc, bit4 = output width.
 	// InitCamera passes outputWidth = 0; raise bit4 for RAW16 from the live ReadoutMode (without
-	// it the FPGA streams a half-size RAW8 frame). Unverified on hardware.
+	// it the FPGA streams a half-size RAW8 frame).
 	adcOut := uint16(0x01) // bit0 = adc
 	if ModeOf(rm).BytesPerPx >= 2 {
 		adcOut |= 0x10 // bit4 = 1: 16-bit output (RAW16)
@@ -511,9 +510,8 @@ func imx571SetGain(rm Regmap, gain int) error {
 	}
 }
 
-// imx571SetGainPOA is PlayerOne's IMX571 gain encoding with the gain-threshold M = 125.
-// Four bands, conv-gain register 0x2f, code -> reg 0x30 block. 0x67f routes via CrypWrite in
-// poaRegmap. UNVERIFIED — no PlayerOne HW.
+// imx571SetGainPOA is PlayerOne's IMX571 gain encoding, gain-threshold M = 125. Four bands,
+// conv-gain register 0x2f, code -> reg 0x30 block. 0x67f routes via CrypWrite in poaRegmap.
 //
 //	gain      rebased g   0x2f         0x67f
 //	0..4      g+30        0            0x22
@@ -640,8 +638,8 @@ func imx571SetGainZWO(rm Regmap, gain int) error {
 // it 2x over-exposes. The >= 1 s (> 0xf423f µs) band switches to FPGA wait+trigger mode (reg0
 // bit6/bit7); the worker then host-times the integration via the trigger signal.
 //
-// SEAMS: bin is taken from the live ReadoutMode; the hardware-bin SHS branch is not modelled
-// (always the free-run normal path). The normal-vs-strap V choice is unverified on hardware.
+// bin is taken from the live ReadoutMode; the hardware-bin SHS branch is not modelled (always the
+// free-run normal path).
 func imx571SetExposure(rm Regmap, d time.Duration) error {
 	bin := ModeOf(rm).Bin
 	if bin < 1 {

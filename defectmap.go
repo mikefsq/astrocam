@@ -5,15 +5,10 @@ import (
 	"fmt"
 )
 
-// DefectMap is the camera's factory hot/dead-pixel map — the per-unit list of defective sensor
-// pixels burned into SPI flash at manufacture. It is read once from flash (LoadDefectMap),
-// decompressed, and can then be applied to a captured frame to substitute each defect with its
-// neighbours.
-//
-// The driver does NOT apply this by default: a raw acquisition frame should pass the sensor's
-// native output through untouched, and dithering + sigma-clipped integration removes defects
-// without fabricating data. The map is exposed so callers can OPT IN (a preview/EAA convenience)
-// or emit it as a sidecar (a bad-pixel list for PixInsight CosmeticCorrection).
+// DefectMap is the camera's factory hot/dead-pixel map: the per-unit list of defective sensor
+// pixels burned into SPI flash at manufacture. Read once from flash (LoadDefectMap),
+// decompressed, then optionally applied to a captured frame to substitute each defect with its
+// neighbours. Not applied by default; callers opt in.
 type DefectMap struct {
 	W, H    int    // full-sensor dimensions the map is indexed in
 	Color   bool   // Bayer sensor → same-colour neighbour stride 2 (mono → 1)
@@ -89,13 +84,11 @@ func decompressASID(blob []byte, length, npix int) []byte {
 	return bitmap
 }
 
-// ApplyRAW16 corrects each defect pixel IN PLACE in a full-frame little-endian RAW16 buffer
-// (W*H 16-bit pixels, matching the map's full-sensor dimensions). Each defect is replaced by the
-// average of its in-bounds orthogonal neighbours (up/left/right/down) at the same-Bayer-colour
-// stride (2 colour, 1 mono), skipping neighbours that are themselves still-uncorrected defects;
-// if no neighbour is usable it copies the previous pixel. Defects are walked in ascending index
-// order so an earlier-corrected defect neighbour is reused. Full-frame only — the map is in
-// full-sensor coordinates; a sub-frame would need a ROI offset/clip first.
+// ApplyRAW16 corrects each defect pixel in place in a full-frame little-endian RAW16 buffer
+// (W*H 16-bit pixels). Each defect is replaced by the average of its in-bounds orthogonal
+// neighbours at the same-Bayer-colour stride (2 colour, 1 mono), skipping still-uncorrected
+// defect neighbours; if none is usable it copies the previous pixel. Defects are walked in
+// ascending index order. Full-frame only (the map is in full-sensor coordinates).
 func (m *DefectMap) ApplyRAW16(frame []byte) {
 	W, H := m.W, m.H
 	if len(frame) < W*H*2 {

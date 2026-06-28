@@ -7,18 +7,15 @@ import (
 	"strings"
 )
 
-// writeFITS writes a single 16-bit image as a FITS primary HDU that any astronomy
-// viewer (ASIStudio, PixInsight, DS9, AstroImageJ) opens directly.
+// writeFITS writes a single image as a FITS primary HDU.
 //
-// The camera delivers RAW16 little-endian UNSIGNED samples. FITS BITPIX=16 is SIGNED
-// big-endian, so we use the universal unsigned-16 convention — store (v - 32768) as
-// signed and advertise BZERO=32768/BSCALE=1 so readers reconstruct the original value.
-// Subtracting 32768 from a 16-bit value is exactly toggling its top bit, so per sample
+// The camera delivers RAW16 little-endian unsigned samples. FITS BITPIX=16 is signed
+// big-endian, so it uses the unsigned-16 convention: store (v - 32768) as signed and
+// advertise BZERO=32768/BSCALE=1. That subtraction is a top-bit toggle, so per sample
 // the conversion is: swap to big-endian and XOR 0x80 into the high byte.
 //
-// data is width*height*2 bytes (full frame). bayer is "" for mono; for a color sensor
-// pass the CFA pattern (e.g. "RGGB") so the viewer debayers. Rows are written sensor
-// order (top row first) with ROWORDER=TOP-DOWN, matching ZWO's own FITS files.
+// data is width*height*bpp bytes. bayer is "" for mono, else the CFA pattern (e.g.
+// "RGGB"). Rows are written top-first with ROWORDER=TOP-DOWN.
 func writeFITS(path string, data []byte, width, height, bpp int, bayer string, exposureSec, pixUm float64, gain int, model string) error {
 	f, err := os.Create(path)
 	if err != nil {

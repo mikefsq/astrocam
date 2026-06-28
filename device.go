@@ -5,12 +5,10 @@ import (
 	"fmt"
 )
 
-// DeviceInfo describes one attached ZWO camera discovered on the USB bus WITHOUT
-// opening it — the cheap identity the host can read straight from the OS USB registry:
-// VID/PID, the USB product-name string, and a platform location id. The factory serial
-// is deliberately absent: these cameras carry no USB serial-number descriptor (it lives
-// in SPI flash, behind the 0xC8 read decoded in GetSerialNumber), so reading it means
-// opening the device — see OpenSerial / Camera.SerialNumber.
+// DeviceInfo describes one attached camera discovered on the USB bus without opening it:
+// VID/PID, the USB product-name string, and a platform location id. The factory serial is
+// absent (no USB serial-number descriptor; reading it means opening the device — see
+// OpenSerial / Camera.SerialNumber).
 type DeviceInfo struct {
 	VID, PID uint16
 	Name     string // USB product-name string, e.g. "ASI6200MC Pro"
@@ -24,12 +22,10 @@ func (d DeviceInfo) String() string {
 // errEnumUnsupported is returned by the not-yet-implemented platform backends.
 var errEnumUnsupported = errors.New("asicam: USB enumeration not implemented on this platform yet")
 
-// Enumerate lists attached cameras (across every known vendor VID) that map to a
-// registered camera model, without opening any of them. For each VID the driver knows
-// (KnownVIDs), the platform backend (enumerateRaw) supplies every VID-matched USB
-// device; this filters to (VID,PID) pairs that resolve to a registered camera Model,
-// dropping other USB devices that share a vendor id — notably EFW filter wheels.
-// Location is what binds a result to a physical port for OpenLocation.
+// Enumerate lists attached cameras (across every known vendor VID) that map to a registered
+// camera model, without opening any of them. Devices that share a vendor id but aren't
+// cameras (e.g. EFW filter wheels) are filtered out. Location binds a result to a physical
+// port for OpenLocation.
 func Enumerate() ([]DeviceInfo, error) {
 	var raw []DeviceInfo
 	for _, vid := range KnownVIDs() {
@@ -43,9 +39,8 @@ func Enumerate() ([]DeviceInfo, error) {
 }
 
 // filterCameras keeps only the raw USB devices whose PID resolves to a registered camera
-// Model (dropping non-camera ZWO devices on the same VID, e.g. EFW wheels) and fills a
-// missing Name from the registry. Split out from Enumerate so it is testable without a
-// platform backend.
+// Model (dropping non-camera devices on the same VID, e.g. EFW wheels) and fills a missing
+// Name from the registry.
 func filterCameras(raw []DeviceInfo) []DeviceInfo {
 	out := make([]DeviceInfo, 0, len(raw))
 	for _, d := range raw {
@@ -61,8 +56,8 @@ func filterCameras(raw []DeviceInfo) []DeviceInfo {
 	return out
 }
 
-// readSerial reads the 8-byte factory serial straight off a Transport — the 0xC8
-// vendor-IN decoded in GetSerialNumber — without binding a full Camera (no model needed).
+// readSerial reads the 8-byte factory serial off a Transport (the 0xC8 vendor-IN) without
+// binding a full Camera.
 func readSerial(t Transport) (Serial, error) {
 	var s Serial
 	if _, err := t.ControlIn(reqSerialNumber, 0, 0, s[:]); err != nil {
@@ -72,10 +67,8 @@ func readSerial(t Transport) (Serial, error) {
 }
 
 // OpenSerial finds and opens the attached camera whose factory serial matches (hex, as
-// Serial.String renders it). This is the stable bind an Alpaca device should persist:
-// USB exposes no serial string and bus locations move when the camera is replugged or
-// the hub topology changes, so the serial is the only durable per-unit key. It
-// enumerates, opens each candidate by location, reads its serial, and returns the match
+// Serial.String renders it) — the stable per-unit key, since bus locations move on replug.
+// It enumerates, opens each candidate by location, reads its serial, and returns the match
 // (closing the others). Errors if no attached camera has that serial.
 func OpenSerial(serial string) (Transport, DeviceInfo, error) {
 	devs, err := Enumerate()

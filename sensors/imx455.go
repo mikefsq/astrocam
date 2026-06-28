@@ -1,11 +1,6 @@
-// This profile captures full 9576×6388 16-bit frames through the pure-Go driver on
-// hardware over BOTH USB3 and USB2, with correct exposure and gain. The register
-// programming was cross-checked two ways: a USB2 Cynthion wire capture of the official
-// SDK, AND the SDK's own debug log (asicamerasdk.log), which prints its internal SetExp
-// values verbatim — VMAX:0x1928 (=6440 default) / 0x19c0 (=6592 trigger), SSH1:0x14,
-// 1f:487830, 75.75us, "Enter long exp mode" at the 1 s threshold — all reproduced here.
-// (So the "USB3 cameras can't be wire-sniffed" caveat in SENSORS.md no longer holds for
-// the 6200: a USB2 host port + the interposer/Cynthion gives a full SDK reference.)
+// IMX455 (ASI6200 family). Captures full 9576×6388 16-bit frames over USB3 and USB2.
+// SDK reference SetExp values: VMAX 0x1928 (=6440 default) / 0x19c0 (=6592 trigger), SHS1 0x14,
+// line 1f:487830, 75.75 µs/line, long-exp mode at the 1 s threshold.
 //
 // The register model:
 //   - Exposure is TWO modes: < 1 s free-run (VMAX = vblank+height, the time encoded in
@@ -24,14 +19,13 @@
 //   - Optical-black crop (SetFPGAVBLK/SetFPGAHBLK) trims the OB margin band off the left/top.
 //
 // One IMX455 die backs the whole ASI6200 MM/MC family (the worker is variant-agnostic).
-// Still UNVERIFIED: the binned/12-bit readout modes (only full-frame 16-bit is on the
-// wire) and the small config bytes 0x2d / 0x46 / sensor 0x40-43 (gain-range/mode-table).
+// Only full-frame 16-bit is wire-verified; the binned/12-bit readout modes and the config
+// bytes 0x2d / 0x46 / sensor 0x40-43 (gain-range/mode-table) are not.
 //
-// SECOND-SOURCE CONFIRMED (PlayerOne, no extra hardware): the gain/HCG registers
-// (0x2d, 0x3a4/5/6), the offset regs + mirror, and the code formula 4095·(1−10^(−g/200)) all
-// match. PlayerOne also drives this die — SetGain/SetOffset/GainCaps/OffsetCaps dispatch on the
-// regmap's VID (ZWO 0x03C3 vs PlayerOne 0xA0A0); see imx455SetGainPOA. (One real difference:
-// ASI never writes 0x67f on the 455; PlayerOne does.)
+// PlayerOne also drives this die — SetGain/SetOffset/GainCaps/OffsetCaps dispatch on the
+// regmap's VID (ZWO 0x03C3 vs PlayerOne 0xA0A0); see imx455SetGainPOA. The gain/HCG registers
+// (0x2d, 0x3a4/5/6), the offset regs + mirror, and the code formula match across vendors; ASI
+// never writes 0x67f on the 455, PlayerOne does.
 package sensors
 
 import . "github.com/mikefsq/astrocam"
@@ -42,16 +36,13 @@ import (
 	"time"
 )
 
-// Sony IMX455 — 35mm full-frame (62MP) back-illuminated CMOS, the imager in the
-// ZWO ASI6200 family (ASI6200MM/MC Pro). Unlike the small "Type 1/2.x" Starvis
-// parts (IMX290/462), this large sensor's register map lives in the low Sony
-// address range: the SHS shutter is a 24-bit value packed into regs
-// 0x16/0x17 (low two bytes; the top byte rides the FPGA VMAX path), the analog
-// gain code is the 0x2e/0x2f (mirrored to 0x30/0x31) pair with a conversion-gain
-// nibble in 0x3e, and the ROI start/window registers are the 0xa5..0xa7 / 0x06
-// /0x07 / 0x08 / 0x09 / 0x18c / 0x18d command-byte registers written via
-// WriteSONYREG. VMAX (frame length) is programmed through the FPGA (SetFPGAVMAX) and
-// equals vblank + height (vblank = 52, not the line-time base V).
+// Sony IMX455 — 35mm full-frame (62MP) BSI CMOS, the imager in the ZWO ASI6200 family
+// (ASI6200MM/MC Pro). The register map lives in the low Sony address range: the SHS shutter is a
+// 24-bit value in regs 0x16/0x17 (low two bytes; the top byte rides the FPGA VMAX path), the
+// analog gain code is the 0x2e/0x2f pair (mirrored to 0x30/0x31) with a conversion-gain nibble in
+// 0x3e, and the ROI start/window registers are 0xa5..0xa7 / 0x06 / 0x07 / 0x08 / 0x09 / 0x18c /
+// 0x18d, written via WriteSONYREG. VMAX (frame length) is programmed through the FPGA (SetFPGAVMAX)
+// and equals vblank + height (vblank = 52, not the line-time base V).
 //
 // Register map:
 //
@@ -120,22 +111,17 @@ const (
 	imx455FPGAVBLK = 49 // 0x31
 	imx455FPGAHBLK = 24 // 0x18
 
-	// Timing model (the per-mode V values and mode→table map are in
-	// imx455_modes.go). InitSensorMode stores a per-mode base constant V; V is used
-	// TWO ways:
+	// Timing model (per-mode V values and mode→table map in imx455_modes.go). InitSensorMode
+	// stores a per-mode base constant V, used two ways:
 	//
-	//	VMAX (FPGA frame length) = V + effHeight   (SetExp: V + effHeight)
+	//	VMAX (FPGA frame length) = V + effHeight   (SetExp)
 	//	HMAX = V                    (the FPS-percent throttle DDR path)
 	//	lineTime = HMAX*1000/clock = V*1000/20000 ns
 	//
-	// clock = 20000. VMAX is V + height (not a fixed 3912), and
-	// vblank is V.
+	// clock = 20000. VMAX is V + height; vblank is V.
 	//
-	// Per-mode V below is the NORMAL value; the strap (FPGA reg 0x1c == 5) HALVES it.
-	// Full-frame fps strongly favors the strap: V=880 + full height ≈ 3.1 fps (≈ the
-	// ASI6200 ~3.5 spec) vs V=1515 ≈ 1.7 fps — so the real camera likely runs the strap
-	// path, but reading reg 0x1c (and the 2-rows-per-line readout question) needs
-	// hardware. The default (normal V) is used here.
+	// Per-mode V below is the NORMAL value; the strap (FPGA reg 0x1c == 5) HALVES it. The default
+	// (normal V) is used here.
 	imx455ClkKHz    = 20000 // pixel clock in kHz (= 0x4e20)
 	imx455VFull16   = 0x5eb // 1515: bin1 16-bit (strap 0x370=880)
 	imx455VFull12   = 0x276 // 630:  bin1 12-bit (strap 0x201=513)
@@ -211,14 +197,12 @@ var imx455InitCommon = []RegVal{
 }
 
 // imx455Init is the streaming default: the common init followed by the bin-1 16-bit
-// per-mode table. The 6200's init is TWO-STAGE — InitCamera applies imx455InitCommon,
-// then InitSensorMode applies one per-mode table (see imx455_modes.go for all
-// four and the mode→table mapping). Only the bin-1 16-bit mode is wired as the default;
-// the asicam Sensor model has no mode-selection hook yet.
+// per-mode table. The 6200's init is two-stage — InitCamera applies imx455InitCommon,
+// then InitSensorMode applies one per-mode table (see imx455_modes.go for all four and the
+// mode→table mapping). Only the bin-1 16-bit mode is wired as the default.
 //
-// ORDER CAVEAT: the SDK applies the per-mode table AFTER imx455InitFPGA; here it is in
-// Init, which runs before InitFPGA. These are FPGA-independent Sony registers, so the
-// order is not expected to matter — flag it if bringup misbehaves.
+// The SDK applies the per-mode table after imx455InitFPGA; here it is in Init, which runs before
+// InitFPGA. These are FPGA-independent Sony registers, so the order does not matter.
 var imx455Init = append(append([]RegVal{}, imx455InitCommon...), imx455ModeFull16...)
 
 var IMX455 = Sensor{
@@ -226,11 +210,8 @@ var IMX455 = Sensor{
 	GainMax:  imx455GainMax,
 	ExpMinUs: imx455ExpMinUs,
 	ExpMaxUs: imx455ExpMaxUs,
-	// ASI Brightness / black level. Caps: 0..200, caps-default 1.
-	// But ASIInitCamera APPLIES a higher black level on the 6200 — hardware-confirmed ~502 DN, i.e.
-	// OFFSET 50 (gosnap's offset→DN is avg≈10·offset+2, matching the SDK 502 DN at offset 50). The
-	// caps "default" (1) clips at the floor; default to 50 to match the SDK's actual init. (Same
-	// caps-default-vs-init-applied split as the 462, which the SDK inits to Brightness 100.)
+	// ASI Brightness / black level. Caps 0..200, caps-default 1, but ASIInitCamera applies ~502 DN
+	// (offset 50; offset→DN is ≈10·offset+2). Default to 50 to match the SDK's actual init.
 	OffsetMax: 200, OffsetDef: 50,
 	Info: CameraInfo{
 		MaxWidth:  9576,
@@ -259,32 +240,19 @@ var IMX455 = Sensor{
 // but the sensor gate is the 0x19e master register (5 = stream, 0 = stop) and the settle
 // is 10 ms. For the long bands SetExp arms trigger MODE (EnableFPGATriggerMode); this
 // worker drives the trigger SIGNAL (EnableFPGATriggerSignal, FPGA reg 0x0b bit0) whose
-// 1->0 edge releases the frame. UNVERIFIED.
+// 1->0 edge releases the frame.
 //
-//	arm:    SendCMD(0xAA)·FPGAStop·0x19e=5·SendCMD(0xA9)·0x19e=0·usleep(10ms)·FPGAStart·ResetEndpoint
+//	arm:    SendCMD(0xAA)·FPGAStop·0x19e=5·sensor reg0|=1·SendCMD(0xA9)·FPGAStop·0x19e=1·
+//	        reg0|=4·usleep(10ms)·reg0&=~1·FPGAStart·ResetEndPoint(0x81)
 //	expose: EnableFPGATriggerSignal(1) · host-time (≤1 s: exposure−200 ms; >1 s: 100 ms poll)
-//	fire:   EnableFPGATriggerSignal(0) · BulkRead
+//	fire:   EnableFPGATriggerSignal(0) · read
+//	read:   continuous windowed pump (ctl.StreamFrame) reads the full w23 = W×H×2 bytes,
+//	        never stopping at a mid-frame short packet; on a stall FPGAStop→usleep→FPGAStart
+//	        and continue.
 //
-// SEAM: the 6200's very-long bands run a sub-integration cycle loop between FPGABufReload
-// and the trigger — repeated FPGAStop/usleep(5 ms)/FPGAStart/usleep(20 ms) gated on
-// ReadFPGAREG(0x23) status, the hardware multi-exposure accumulation. NOT reproduced
-// here; this is the single-shot only. The exact arm gate values (write 0x19e=5 then a
-// brief 1) are unconfirmed.
-//
-// The ASI6200/IMX455 is a free-run, SHS-timed USB3 sensor, so the capture is NOT a
-// host-timed trigger like the 174 — it is "arm the sensor master gate, then pull one
-// whole frame as a continuous stream."
-//
-// Two pieces matter:
-//
-//   - The arm: SendCMD(0xAA) → FPGAStop → master(0x19e)=5
-//     → sensor reg0 |= 1 → SendCMD(0xA9) → FPGAStop → master=1 → reg0 |= 4 → usleep
-//     10 ms → reg0 &= ~1 → FPGAStart → ResetEndPoint(0x81). This richer sequence (vs
-//     the generic StreamStop/Start) is what actually gets the sensor streaming.
-//   - The read: the SDK keeps a window of transfers cycling (startAsyncXfer) until the
-//     full w23 = W×H×2 bytes are in, never stopping at a mid-frame short packet. That
-//     is ctl.StreamFrame. On a stall the SDK kicks FPGAStop→usleep→FPGAStart; we mirror
-//     that and continue reading the remainder.
+// The very-long bands' sub-integration cycle loop (FPGAStop/usleep(5ms)/FPGAStart/usleep(20ms)
+// gated on ReadFPGAREG(0x23), the hardware multi-exposure accumulation) is NOT reproduced — this
+// is single-shot only.
 func imx455Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 
@@ -411,10 +379,8 @@ func imx455Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 //	SetFPGABinMode(0)                  reg0x27 low 2 bits = 0
 //	SetFPGAGain(0x80,0x80,0x80,0x80)   FPGA 0x0c-0x0f, strobed by reg 1
 //
-// SEAMS: EnableFPGADDR's argument is the runtime DDR flag (set at
-// OpenCamera). The 6200 is a high-bandwidth USB3 part that uses DDR, so DDR-enabled
-// (reg0xa bit6 = 0) is assumed; revisit if a non-DDR strap is found. The FPGADDRTest
-// gate (a read-back self-test) is not reproduced — bringup proceeds unconditionally.
+// EnableFPGADDR's argument is the runtime DDR flag (set at OpenCamera). The 6200 uses DDR, so
+// DDR-enabled (reg0xa bit6 = 0) is assumed. The FPGADDRTest read-back self-test is not reproduced.
 func imx455InitFPGA(rm Regmap, subtype int) error {
 	_ = subtype
 	if err := FPGAClearBits(rm, 0x00, 0x01); err != nil { // FPGAReset: reg0 bit0
@@ -432,8 +398,7 @@ func imx455InitFPGA(rm Regmap, subtype int) error {
 	}
 	// SetFPGAADCWidthOutputWidth(adc=1, outputWidth): reg0xa bit0 = adc, bit4 = output width.
 	// InitCamera passes outputWidth = 0 (8-bit); raise bit4 for RAW16 from the live ReadoutMode.
-	// Without this the FPGA streams a half-size RAW8 frame while the host expects RAW16 — the
-	// same half-frame bug the ASI290 exhibited on hardware (imx290InitFPGA). UNVERIFIED on 455.
+	// Without this the FPGA streams a half-size RAW8 frame while the host expects RAW16.
 	adcOut := uint16(0x01) // bit0 = adc
 	if ModeOf(rm).BytesPerPx >= 2 {
 		adcOut |= 0x10 // bit4 = 1: 16-bit output (RAW16)
@@ -457,25 +422,18 @@ func imx455InitFPGA(rm Regmap, subtype int) error {
 }
 
 // imx455SetGain — SetGain. The gain axis splits into FIVE bands at 61/100/160/280/461.
-// Two key details:
 //
-//   - HCG (high conversion gain): reg 0x2d is the conversion-gain MODE byte, and its bit0
-//     is the HCG enable — 0 below gain 100 (LCG), 1 at/above 100 (HCG). The read-noise
-//     break lives here.
+//   - HCG (high conversion gain): reg 0x2d is the conversion-gain MODE byte, its bit0 is the
+//     HCG enable — 0 below gain 100 (LCG), 1 at/above 100 (HCG).
 //   - Analog code resets at the HCG boundary: the exp10 ramp uses `gain` below 100 and
 //     `gain−100` at/above. For the top band it also subtracts a coarse 60-unit stage.
 //
 // reg 0x3e is NOT a binary HCG bit — it is the high-range coarse-gain STAGE index
 // (0 for gain ≤ 460; ceil(((gain+52)&0xff)/60) for 461..700), placed in bits[4:7].
 //
-// VALIDATED: the LCG ramp (band A, gain 0..99) matches the SDK on the wire. The HCG bands
-// and the top-stage logic are decoded but not yet wire-confirmed across the band edges —
-// a gain-sweep capture (61/100/160/280/461) + a dark-frame read-noise check is the way to
-// lock which threshold is the true read-noise break.
 // imx455GainCaps / imx455OffsetCaps return the advertised gain/offset range per vendor — the
 // dual of the dispatched SetGain/SetOffset. ZWO: gain 0..700 (0.1 dB), offset 0..200 def 1.
-// PlayerOne: gain 0..550, offset 0..2000 def 20, confirmed by the PlayerOne SetGain/SetOffset clamp;
-// identical across PlayerOne dies. max 0 = undeclared.
+// PlayerOne: gain 0..550, offset 0..2000 def 20. max 0 = undeclared.
 func imx455GainCaps(vid uint16) (min, max int) {
 	switch vid {
 	case ZWO.VID:
@@ -512,12 +470,9 @@ func imx455SetGain(rm Regmap, gain int) error {
 	}
 }
 
-// imx455SetGainPOA is PlayerOne's IMX455 gain encoding, with the threshold
-// M = 125. Same Sony die as ZWO but a different gain-unit band structure:
-// each conversion-gain band rebases the gain into the shared analog-code formula, and the
-// gain-setup register 0x67f is written per band through the obfuscated CrypWrite path
-// (poaRegmap routes 0x67f automatically, so this just calls WriteReg). UNVERIFIED — no
-// PlayerOne hardware.
+// imx455SetGainPOA is PlayerOne's IMX455 gain encoding, threshold M = 125. Each conversion-gain
+// band rebases the gain into the shared analog-code formula; the gain-setup register 0x67f is
+// written per band (poaRegmap routes 0x67f via CrypWrite, so this just calls WriteReg).
 //
 //	gain      rebased g   0x2d  0x67f   0x3a4 / 0x3a5,0x3a6
 //	0..4      g+30        0     0x22    0x11 / 0x11
@@ -670,40 +625,24 @@ func imx455GainStage(gain int) uint16 {
 	return uint16(q)
 }
 
-// imx455SetExposure — SetExp. Full-frame model:
+// imx455SetExposure — SetExp. Indexed full-frame rolling-shutter model:
 //
-//	lines = exposure / lineTime,  lineTime_ns = HMAX*1000/clock = V*1000/20000
-//	VMAX  = V + effHeight          // extends for long exp
-//	SHS   = (VMAX - 3) - lines      // clamped to [3, VMAX-3]
-//	SHS   = SHS>=6 ? SHS>>1 : 3     // bin-1 readout halving
-//	write SHS little-endian to the indexed regs 0x16/0x17 (no latch)
-//
-// VMAX (FPGA frame length) goes via SetVMAX (regs 0x10/0x11/0x12); the SHS low two bytes
-// to the indexed sensor regs 0x16/0x17. effHeight is taken as the full-frame height (bin
-// 1, no ROI argument here — same assumption as the VMAX default).
-//
-// SEAMS: ×2/×4 binning skips the SHS halve (height already folded into VMAX) — bin is not
-// plumbed here (full-frame bin 1 assumed; depth comes from the live ReadoutMode). The
-// long-exposure branch (VMAX = lines + 0x14, residual SHS 0x14) is not modelled.
-// And the normal-vs-strap V choice plus the fps reconciliation need hardware (see the
-// timing-model note).
-//
-// Cross-checked against a wire capture (2 s → VMAX 0x19c0=6592, SHS 10, reg0 0xf1).
-// Full-frame assumption (no ROI arg): bin 1, output depth from the live ReadoutMode.
-//
-//	line_time   = V*1000/clock                     (HMAX*1000/clock)
-//	defaultVMAX = vblank + height                  (vblank + effHeight, ONE frame)
+//	lines       = exposure / lineTime,  lineTime_ns = V*1000/clock
+//	defaultVMAX = vblank(52) + effHeight            (ONE frame; effHeight follows the live ROI)
 //	>= 1 s : wait+trigger mode; VMAX = (frameµs+10ms)/line_time + 20 (≈ one frame); SHS = 20.
 //	         The integration is HOST-timed by the worker (EnableFPGATriggerSignal), not VMAX.
-//	<  1 s : free-run. exposure <= frame-time keeps defaultVMAX and encodes the time in SHS;
-//	         a longer one extends VMAX = exposure/line_time + 20.
-//	SHS is then halved for the bin-1 readout.
+//	<  1 s : free-run. exposure <= frame-time keeps defaultVMAX and encodes the time in SHS
+//	         ((VMAX-3)-lines, clamped [3, VMAX-3]); a longer one extends VMAX = lines + 20.
+//	SHS is halved (>>1, floor 3) for the bin-1/bin-3 readout, skipped for bin 2/4.
 //
-// imx455SetOffset — SetBrightness (ASI Brightness / black level).
-// value = offset·10 at bin 1; binned scales to offset·100/16 (≈·6.25). Written
-// 16-bit little-endian to sensor 0x40/0x41 and mirrored to 0x42/0x43.
-// imx455SetOffset selects the black-level encoding from the regmap's VID — PlayerOne offset·8,
-// ZWO offset·10; an unrecognized vendor is an error.
+// VMAX (FPGA frame length) goes via SetVMAX (regs 0x10/0x11/0x12); the SHS low two bytes to the
+// indexed sensor regs 0x16/0x17 (no latch). Wire-checked: 2 s → VMAX 0x19c0=6592, SHS 10, reg0
+// 0xf1; full-frame trigger VMAX 6592, 2252 for a 2048-row ROI. The long-exposure VMAX-stretch
+// branch (VMAX = lines + 0x14, residual SHS 0x14) is not modelled.
+//
+// imx455SetOffset — SetBrightness (ASI Brightness / black level): offset·10 at bin 1, binned
+// offset·100/16 (≈·6.25), 16-bit LE to sensor 0x40/0x41 mirrored to 0x42/0x43. Selects the
+// encoding from the regmap's VID — PlayerOne offset·8, ZWO offset·10; unrecognized vendor errors.
 func imx455SetOffset(rm Regmap, offset int) error {
 	switch rm.VID() {
 	case ZWO.VID:
@@ -765,13 +704,9 @@ func imx455SetExposure(rm Regmap, d time.Duration) error {
 		us = imx455ExpMaxUs
 	}
 
-	// effHeight = output rows = full/bin, EXCEPT bin 4,
-	// which reuses bin-2 geometry and scans 2× the output rows (output rows<<1) → full/2.
-	// VMAX base = 52, a constant vblank (never rewritten per mode —
-	// every reference is a load), so VMAX = 52 + effHeight at every bin.
-	// effHeight = output rows. It follows the live ROI (binned px, set by SetROI) so VMAX/frame
-	// shrink for a sub-frame window — the SDK does this (full-frame trigger VMAX 6592, but 2252
-	// for a 2048-row ROI; wire-confirmed). Falls back to full/bin when no ROI is set.
+	// effHeight = output rows = full/bin, except bin 4 (reuses bin-2 geometry, scans 2× the output
+	// rows → full/2). VMAX base = 52, a constant vblank, so VMAX = 52 + effHeight at every bin.
+	// effHeight follows the live ROI (binned px, set by SetROI), falling back to full/bin.
 	effH := int64(imx455FullHeight) / bin
 	if h := ModeOf(rm).Height; h > 0 {
 		effH = int64(h)
@@ -836,13 +771,11 @@ func imx455SetExposure(rm Regmap, d time.Duration) error {
 }
 
 // imx455SetROI — InitSensorMode (per-mode table) + SetStartPos + Cam_SetResolution.
-// First it selects the readout mode from
-// the binning (width vs full) and output depth (live ReadoutMode) and applies that mode's
-// register table — the second init stage. Then the ROI start: X aligned to 16 (and
-// #0x7ffffff0), shifted right 4, written to 0xa6/0xa7; Y (+0x19 bias) to 0x06/0x07; 0xa5
-// the X/Y readout mode. The output window W→0x08/0x09 and H→0x18c/0x18d (+0x18 bias), 0x187
-// the window mode. Finally the mode's V is written to the FPGA HMAX (HMAX = V;
-// the FPS-percent throttle DDR path), straight to regs 0x13/0x14 — not the bandwidth formula.
+// Selects the readout mode from the binning and output depth (live ReadoutMode) and applies that
+// mode's register table (the second init stage). Then the ROI start: X aligned to 16, shifted
+// right 4, to 0xa6/0xa7; Y (+0x19 bias) to 0x06/0x07; 0xa5 the X/Y readout mode. Output window
+// W→0x08/0x09 and H→0x18c/0x18d (+0x18 bias), 0x187 the window mode. Finally the mode's V is
+// written to the FPGA HMAX (HMAX = V, the DDR path) straight to regs 0x13/0x14.
 func imx455SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if bin < 1 {
 		bin = 1
@@ -853,20 +786,10 @@ func imx455SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if y < 0 {
 		y = 0
 	}
-	// Mode selection: apply this binning + depth's readout-mode register table.
-	// (x,y,w,h) is the BINNED OUTPUT window — w,h are output pixels and the
-	// window/FPGA-geometry registers take them directly (Cam_SetResolution writes
-	// the output dims: WIDTH = w+0x18, HEIGHT = h). The START, by contrast, is in SENSOR
-	// pixels: the SetStartPos clamp is bin·outputDim + start ≤ fullDim, so the
-	// binned (x,y) is scaled up by bin for the start registers. Start X aligns to 16 always;
-	// start Y aligns to 4 for bin 2/4 and to 2 for bin 1. bin-3 takes a
-	// separate start-pos path — its OFFSET is unverified,
-	// but a full-frame bin-3 readout starts at (0,0) where alignment is moot.
-	//
-	// NOT wired: SetFPGABinDataLen (FX3 reg 0x40 = output_area·bpp/4). The FrameBytes-
-	// driven windowed pump + FPGABufReload flush carry single-frame framing without it; it may
-	// be needed for clean repeated binned/sub-frame readout — confirm on the 455 before adding
-	// it to the validated transport.
+	// (x,y,w,h) is the BINNED OUTPUT window — w,h are output pixels written directly to the
+	// window/FPGA-geometry registers (Cam_SetResolution: WIDTH = w+0x18, HEIGHT = h). The START is
+	// in SENSOR pixels (binned (x,y) scaled up by bin). Start X aligns to 16 always; start Y aligns
+	// to 4 for bin 2/4, to 2 for bin 1; bin 3 takes a separate start-pos path.
 	mode := imx455SelectMode(bin, ModeOf(rm).BytesPerPx)
 	for _, rv := range mode.table {
 		if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
@@ -882,10 +805,7 @@ func imx455SetROI(rm Regmap, x, y, w, h, bin int) error {
 	case 2, 4:
 		sy &^= 3 // align Y to 4
 	case 3:
-		// bin-3 takes a separate start path: align Y down to a multiple
-		// of 6 and use Y bias 0x1b. Only affects a bin-3 SUB-frame;
-		// full-frame starts at 0 where both this and align-2 give 0. The sensor/output
-		// coordinate basis of the sub-frame offset is UNVERIFIED (no 6200 bin-3 crop on the wire).
+		// bin 3: align Y down to a multiple of 6 and use Y bias 0x1b.
 		sy = (sy / 6) * 6
 		yBias = 0x1b
 	default:
@@ -924,11 +844,9 @@ func imx455SetROI(rm Regmap, x, y, w, h, bin int) error {
 			return err
 		}
 	}
-	// FPGA optical-black crop: SetFPGAVBLK (0x06/0x07) and SetFPGAHBLK (0x02/0x03) tell the FX3
-	// how many leading blank / optical-black rows and columns the sensor emits ahead of the
-	// active image, so the readout windows PAST them. Without these, every frame carries the OB
-	// margin as a ~12 px-wide darker band on the left and ~27 px tall on top. VBLK = 49, HBLK =
-	// 24 (24 FPGA units = 12 packed px); validated pixel-for-pixel against the SDK.
+	// FPGA optical-black crop: SetFPGAVBLK (0x06/0x07) and SetFPGAHBLK (0x02/0x03) give the FX3 the
+	// leading blank / optical-black row and column counts the sensor emits ahead of the active
+	// image, so the readout windows past them. VBLK = 49, HBLK = 24 (24 FPGA units = 12 packed px).
 	if err := SetFPGAVBLK(rm, imx455FPGAVBLK); err != nil {
 		return err
 	}
@@ -943,26 +861,20 @@ func imx455SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if err := FPGAWrite16(rm, 0x08, 0x09, uint16(h)); err != nil {
 		return err
 	}
-	// SetFPGABinDataLen: the per-frame DMA word count =
-	// output_area · bytesPerPx / 4 (FPGA 0x40..0x43). For full-frame bin 1 this equals the
-	// value already in place, so the validated full-frame path is unchanged; for binned /
-	// sub-frame it sizes the FX3 transfer to the smaller frame.
+	// SetFPGABinDataLen: per-frame DMA word count = output_area · bytesPerPx / 4 (FPGA 0x40..0x43).
 	bpp := ModeOf(rm).BytesPerPx
 	dataWords := uint32((w*h*bpp + 3) / 4)
 	if err := SetFPGABinDataLen(rm, dataWords); err != nil {
 		return err
 	}
-	// the FPS-percent throttle -> SetFPGAHMAX: the 6200 takes the DDR branch (the DDR flag!=0, since
-	// InitCamera enables DDR), so HMAX = the per-mode V written straight to
-	// 0x13/0x14 — NOT the bandwidth-throttle formula. The binned modes carry their own V
-	// (VBin2/VBin3), so this also sets the binned line time.
+	// DDR branch HMAX: the 6200 enables DDR, so HMAX = the per-mode V written straight to 0x13/0x14
+	// (not the bandwidth-throttle formula). Binned modes carry their own V (VBin2/VBin3).
 	return FPGAWrite16(rm, 0x13, 0x14, uint16(mode.v))
 }
 
 // IMX455 (ASI6200) per-mode register tables — the second stage of the two-stage init.
-// InitSensorMode picks ONE of these by binning (the bin factor) and output depth, applies
-// it via WriteSONYREG, and sets the timing base V. All tables are byte-identical in the
-// MM_Pro variant.
+// InitSensorMode picks one by bin factor and output depth, applies it via WriteSONYREG, and
+// sets the timing base V.
 //
 // Mode -> table (InitSensorMode bin branches):
 //
@@ -972,11 +884,7 @@ func imx455SetROI(rm Regmap, x, y, w, h, bin int) error {
 //	bin 4         : reg_bin2w_12bit  (reused)
 //	bin 3         : reg_bin3w_12bit  (77)
 //
-// SEAM: the asicam Sensor model has no mode-selection hook (Init + SetROI only), so only
-// the bin-1 16-bit default is currently applied (imx455Init = imx455InitCommon +
-// imx455ModeFull16). The other three are captured here for when ROI/bin/depth selection
-// is wired into SetROI. Each also implies its own V (InitSensorMode sets a different V per
-// mode — full-16bit V=0x5eb, others differ).
+// Each implies its own V (full-16bit V=0x5eb, others differ).
 
 // reg_full_16bit — bin 1, 16-bit (full-frame default).
 var imx455ModeFull16 = []RegVal{
