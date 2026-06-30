@@ -39,6 +39,7 @@ var (
 	procWinUsbReadPipe   = modWinUSB.NewProc("WinUsb_ReadPipe")
 	procWinUsbSetPipePol = modWinUSB.NewProc("WinUsb_SetPipePolicy")
 	procWinUsbResetPipe  = modWinUSB.NewProc("WinUsb_ResetPipe")
+	procWinUsbQueryPipe  = modWinUSB.NewProc("WinUsb_QueryPipe")
 	procCreateFile       = modKernel32.NewProc("CreateFileW")
 	procCloseHandle      = modKernel32.NewProc("CloseHandle")
 	procGetOverlappedRes = modKernel32.NewProc("GetOverlappedResult")
@@ -92,6 +93,9 @@ type winusbDevice struct {
 	// stays unlocked — it needs the worker's concurrent FPGABufReload. See transport_linux.go
 	// (usbfsDevice.ioMu) for the full rationale.
 	ioMu sync.Mutex
+	// inMaxPacket is the bulk-IN pipe's max packet size (USB3 SuperSpeed ≥1024, USB2 HighSpeed 512),
+	// read at open. The readout's bandwidth budget follows it via SuperSpeed() (see camera.go).
+	inMaxPacket uint16
 }
 
 // winNode is one WinUSB device-interface path with its parsed VID/PID.
@@ -215,8 +219,39 @@ func openPath(path string) (*winusbDevice, error) {
 		procCloseHandle.Call(h)
 		return nil, fmt.Errorf("asicam: WinUsb_Initialize failed")
 	}
+	// Negotiated link speed from the bulk-IN pipe's max packet size (USB3 SuperSpeed bulk = 1024,
+	// USB2 HighSpeed = 512), so a USB3 camera on a HighSpeed link (or through a Cynthion) uses the
+	// USB2 bandwidth budget instead of overrunning the bus and shearing the frame. Mirrors the
+	// darwin (inMaxPacket) and linux (endpoint-descriptor) transports.
+	for idx := 0; idx < 16; idx++ {
+		var pi winusbPipeInfo
+		r, _, _ := procWinUsbQueryPipe.Call(d.winusb, 0, uintptr(idx), uintptr(unsafe.Pointer(&pi)))
+		if r == 0 {
+			break // no more pipes
+		}
+		if pi.PipeId == bulkEndpoint {
+			d.inMaxPacket = pi.MaximumPacketSize
+			break
+		}
+	}
 	return d, nil
 }
+
+// winusbPipeInfo is WINUSB_PIPE_INFORMATION (12 bytes incl. padding): PipeType(4), PipeId(1),
+// pad(1), MaximumPacketSize(2), Interval(1), pad(3).
+type winusbPipeInfo struct {
+	PipeType          uint32
+	PipeId            uint8
+	_                 uint8
+	MaximumPacketSize uint16
+	Interval          uint8
+	_                 [3]uint8
+}
+
+// SuperSpeed reports whether the bulk-IN pipe negotiated USB3 SuperSpeed (≥1024-byte max packet);
+// false = USB2 HighSpeed. The Camera readout's bandwidth budget follows this, not the model
+// capability (see camera.go superSpeedReporter).
+func (d *winusbDevice) SuperSpeed() bool { return d.inMaxPacket >= 1024 }
 
 // winusbSetupPacket is WINUSB_SETUP_PACKET (8 bytes, matches a USB setup packet).
 type winusbSetupPacket struct {

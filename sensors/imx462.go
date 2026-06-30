@@ -207,20 +207,32 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if target > len(buf) {
 		target = len(buf)
 	}
-	if longExp {
-		// Trigger mode (≥1 s): one gated frame is held; the windowed pump cycles EP 0x81 and flushes
-		// the final partial DMA buffer.
-		return ctl.StreamFrame(buf[:target], 500*time.Millisecond, exposure+5*time.Second)
+	// Free-run windowed read. Two things were tearing the frame:
+	//  1) Whole-frame shear — the readout ran at the USB3 line rate on a USB2 link and overran the
+	//     bus. Fixed in the transport (it now reports the negotiated link speed, so HMAX matches the
+	//     SDK). Do NOT pulse FPGABufReload to "help": a control transfer interleaving the bulk read
+	//     desyncs the 462's USB2 GPIF (unlike the DDR sensors), which makes it worse.
+	//  2) Bottom-tail tear — the FX3 holds the frame's final partial DMA buffer (<1 MiB) until more
+	//     data is requested, so stopping exactly at FrameBytes can deliver that tail desynced. Read
+	//     one extra DMA buffer so the NEXT frame's data commits this frame's held tail (the same
+	//     effect the SDK gets by reading continuously), then keep only this frame.
+	over := target + maxFX3DMABuf
+	scratch := make([]byte, over)
+	n, err := ctl.StreamFrame(scratch, 500*time.Millisecond, exposure+5*time.Second)
+	if err != nil {
+		return 0, err
 	}
-	// Free-run single-shot (<1 s): the sensor was already streaming when we armed, so the first read
-	// can begin mid-frame and wrap two frames (tearing). Free-run frames carry no DMA markers, so we
-	// can't re-sync from the data; instead discard one throwaway frame and re-flush the pipe so the
-	// kept read starts on a fresh frame boundary — the same CLEAR_HALT-before-each-read alignment the
-	// SDK uses. (buf doubles as the throwaway scratch; it's overwritten by the real read.)
-	_, _ = ctl.StreamFrame(buf[:target], 500*time.Millisecond, exposure+5*time.Second)
-	_ = ctl.ResetEndpoint()
-	return ctl.StreamFrame(buf[:target], 500*time.Millisecond, exposure+5*time.Second)
+	if n < target { // short read — hand back what we got; GetDataAfterExp re-arms and retries
+		copy(buf[:n], scratch[:n])
+		return n, nil
+	}
+	copy(buf[:target], scratch[:target])
+	return target, nil
 }
+
+// maxFX3DMABuf is the FX3's DMA commit-buffer size (1 MiB); reading one extra past the frame forces
+// the held final partial buffer to commit.
+const maxFX3DMABuf = 1 << 20
 
 // imx462InitFPGA — the FPGA-side bringup after the Sony init writes (InitCamera);
 // same as the 290.

@@ -93,6 +93,9 @@ type usbfsDevice struct {
 	// that path requires its worker's concurrent FPGABufReload, and its DDR frame buffer
 	// makes the interleave harmless.
 	ioMu sync.Mutex
+	// superSpeed is the negotiated link speed (USB3 SuperSpeed bulk maxpacket ≥1024), read from the
+	// endpoint descriptor at open. The readout's bandwidth budget follows it (see camera.go).
+	superSpeed bool
 }
 
 // usbNode is one /dev/bus/usb device node and the VID/PID read from its descriptor
@@ -163,12 +166,43 @@ func openNodeAndClaim(path string) (*usbfsDevice, uint16, uint16, error) {
 	vid := uint16(desc[8]) | uint16(desc[9])<<8
 	pid := uint16(desc[10]) | uint16(desc[11])<<8
 	d := &usbfsDevice{f: f}
+	// Negotiated link speed from the bulk-IN endpoint's max packet size: USB3 SuperSpeed bulk =
+	// 1024, USB2 HighSpeed = 512. The node read returns the device descriptor followed by the
+	// active config/interface/endpoint descriptors, which reflect the speed actually negotiated —
+	// so a USB3 camera on a HighSpeed link (e.g. through a Cynthion) correctly reads as USB2 and the
+	// readout uses the USB2 bandwidth budget. Without this the readout runs at the USB3 line rate and
+	// overruns the bus, shearing the frame.
+	var raw [1024]byte
+	if n, _ := f.ReadAt(raw[:], 0); n > 0 {
+		d.superSpeed = bulkInMaxPacket(raw[:n], bulkEndpoint) >= 1024
+	}
 	if err := d.claim(0); err != nil {
 		f.Close()
 		return nil, 0, 0, fmt.Errorf("asicam: claim interface 0 on %s: %w", path, err)
 	}
 	return d, vid, pid, nil
 }
+
+// bulkInMaxPacket walks the concatenated USB descriptors and returns the wMaxPacketSize of the
+// endpoint with address ep (0 if not found). Endpoint descriptor: bLength, bDescriptorType=0x05,
+// bEndpointAddress, bmAttributes, wMaxPacketSize(LE)...
+func bulkInMaxPacket(b []byte, ep uint8) int {
+	for i := 0; i+1 < len(b); {
+		l := int(b[i])
+		if l < 2 || i+l > len(b) {
+			break
+		}
+		if b[i+1] == 0x05 && l >= 7 && b[i+2] == ep {
+			return int(b[i+4]) | int(b[i+5])<<8
+		}
+		i += l
+	}
+	return 0
+}
+
+// SuperSpeed reports whether the bulk-IN endpoint negotiated USB3 SuperSpeed (≥1024-byte max
+// packet); false = USB2 HighSpeed. The Camera readout follows this, not the model capability.
+func (d *usbfsDevice) SuperSpeed() bool { return d.superSpeed }
 
 // OpenUSBFS finds the first device matching vid/pid under /dev/bus/usb, claims
 // interface 0, and returns a Transport. The ZWO VID is astrocam.ZWO.VID (0x03C3).
