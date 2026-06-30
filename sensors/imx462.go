@@ -136,6 +136,7 @@ var IMX462 = Sensor{
 // as the imx290 (STARVIS standby-0x3000 gate; ≥1 s uses FPGA trigger MODE/SIGNAL).
 func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
+	longExp := exposure >= imx462LongExpUs*time.Microsecond // ≥ 1 s — matches SetExposure's trigger band
 	arm := func(full bool) error {
 		if full {
 			if err := ctl.VendorCmd(0xAA); err != nil {
@@ -157,15 +158,20 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 			return err
 		}
 		time.Sleep(50 * time.Millisecond)
-		// FPGAStart: clear bit4 (readout stop) AND bit6 (WaitMode). The SDK writes reg0 = 0x21 for
-		// a normal-mode capture, clearing the WaitMode bit that SetExposure (ApplyExposure) sets;
-		// leaving bit6 set parks the FPGA in wait mode and no free-running frame arrives.
-		return SetFPGABit(rm, 0x00, 0x50, false) // FPGAStart → reg0 0x21
+		// FPGAStart. Always clear bit4 (readout-stop). In FREE-RUN (<1 s) also clear bit6 (WaitMode)
+		// so the sensor streams frames (SDK writes reg0 = 0x21). In TRIGGER mode (≥1 s) KEEP bit6
+		// SET — the FPGA must stay in wait mode for the trigger signal (reg 0x0b bit0) to gate the
+		// integration; clearing it leaves the readout un-gated and the frame never arrives. Wire-
+		// confirmed against the SDK: trigger-mode FPGAStart = reg0 0xe1 (bit6 kept), not 0xa1.
+		mask := uint16(0x50) // bit4 + bit6 (free-run)
+		if longExp {
+			mask = 0x10 // bit4 only — keep WaitMode for the trigger
+		}
+		return SetFPGABit(rm, 0x00, mask, false)
 	}
 	// EnableFPGATriggerSignal (reg 0x0b bit0): only the ≥1 s trigger band uses it. In normal mode
 	// the sensor free-runs (SHS-timed) and the FPGA just starts and reads one frame.
 	trigger := func(on bool) error { return SetFPGABit(rm, 0x0b, 0x01, on) }
-	longExp := exposure >= imx462LongExpUs*time.Microsecond // ≥ 1 s — matches SetExposure's trigger band
 
 	if err := arm(true); err != nil {
 		return 0, err
@@ -197,13 +203,22 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 			return 0, err
 		}
 	}
-	// Windowed pump (not one-shot BulkRead): the FX3 holds the frame's final partial 1-MiB DMA
-	// buffer until FPGABufReload, so a plain bulk read stops short. StreamFrame keeps cycling
-	// EP 0x81 and flushes the tail.
 	target := ctl.FrameBytes()
 	if target > len(buf) {
 		target = len(buf)
 	}
+	if longExp {
+		// Trigger mode (≥1 s): one gated frame is held; the windowed pump cycles EP 0x81 and flushes
+		// the final partial DMA buffer.
+		return ctl.StreamFrame(buf[:target], 500*time.Millisecond, exposure+5*time.Second)
+	}
+	// Free-run single-shot (<1 s): the sensor was already streaming when we armed, so the first read
+	// can begin mid-frame and wrap two frames (tearing). Free-run frames carry no DMA markers, so we
+	// can't re-sync from the data; instead discard one throwaway frame and re-flush the pipe so the
+	// kept read starts on a fresh frame boundary — the same CLEAR_HALT-before-each-read alignment the
+	// SDK uses. (buf doubles as the throwaway scratch; it's overwritten by the real read.)
+	_, _ = ctl.StreamFrame(buf[:target], 500*time.Millisecond, exposure+5*time.Second)
+	_ = ctl.ResetEndpoint()
 	return ctl.StreamFrame(buf[:target], 500*time.Millisecond, exposure+5*time.Second)
 }
 
