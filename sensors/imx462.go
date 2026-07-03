@@ -7,7 +7,7 @@
 // Op map:
 //
 //	InitCamera        (reglist 73 entries + explicit tail + FPGA bringup)
-//	SetCMOSClk        (clock 9281 kHz; HMAX floor 203, same as 290)
+//	SetCMOSClk        (clock 9281 kHz; HMAX floor 1100 = SDK REG_FRAME_LENGTH_PKG_MIN)
 //	Cam_SetResolution (mode 0x3006, window W 0x3042/0x3043 H 0x303e/0x303f, FPGA HBLK/VBLK 9/W/H)
 //	SetStartPos       (ROI X 0x3040/0x3041, Y 0x303c/0x303d; X align 4, Y align 2)
 //	SetGain           (clamp 0..600, HCG bit 0x10 in 0x3009 ABOVE gain 80, code to 0x3014)
@@ -54,9 +54,16 @@ const (
 	imx462FullWidth   = 1936 // MaxWidth (ASI462MC reports 1936×1096, same array as the 290)
 	imx462FullHeight  = 1096
 	imx462ClkKHz      = 18562 // RAW16 pixel clock (INCK/2); RAW8 would be 37124
-	imx462HMAXFloor   = 261   // 12-bit normal-mode line-time floor for clock 18562
+	// HMAX floor = the ASI SDK's REG_FRAME_LENGTH_PKG_MIN (CCameraS462MC SetFPSPerc, .data+0x10 =
+	// 0x44c = 1100). HMAX = max(bandwidth candidate, 1100)·100/FPSPercent. The candidate is
+	// link-switched — MAX_DATASIZE (.data+0) is written by SetOutput16Bits: USB3→360715,
+	// USB2→43272 — so on USB3 the candidate (~196 full-frame) is under the floor and the object
+	// writes 1100·100/pct, while on USB2 the candidate (1634 full-frame) DOMINATES: the object
+	// writes 1634·100/pct (wire-confirmed: HMAX 4085 at USB2 pct=40). astrocam's HMAX()/HMAXBW
+	// is this exact formula (bwUSB2/bwUSB3 = MAX_DATASIZE·10·100).
+	imx462HMAXFloor   = 1100  // SDK REG_FRAME_LENGTH_PKG_MIN (.data+0x10)
 	imx462ClkKHzHS    = 37124 // 10-bit high-speed pixel clock: 2× the 12-bit clock
-	imx462HMAXFloorHS = 245   // high-speed line-time floor (clock 37124) → ~136 fps full-res RAW8
+	imx462HMAXFloorHS = 1100  // high-speed uses the same SDK floor; the 2× clock halves the line time
 	imx462VBlankAdd   = 18    // VMAX = height + 0x12
 	imx462SHSOffset   = 17    // SHS  = (height + 0x11) − exposureLines
 	imx462HBLK        = 0     // SetFPGAHBLK(0)
@@ -178,61 +185,94 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	}
 	_ = ctl.ResetEndpoint()
 	if longExp {
+		// Trigger mode (≥1 s): the trigger-signal hold IS the integration, so wait the FULL
+		// exposure (not exp−200 ms — that under-integrates the exactly-1 s boundary by 200 ms).
 		if err := trigger(true); err != nil {
 			return 0, err
 		}
-	}
-	if !longExp {
-		// Free-run (<1 s): the integration is SHS/VMAX-timed; this is just a pre-wait before the
-		// blocking StreamFrame, not the integration itself.
-		if w := exposure - 200*time.Millisecond; w > 0 {
-			time.Sleep(w)
-		}
-	} else {
-		// Trigger mode (≥1 s): the trigger-signal hold IS the integration, so wait the FULL
-		// exposure (not exp−200 ms — that under-integrates the exactly-1 s boundary by 200 ms).
 		for start := time.Now(); time.Since(start) < exposure; {
 			if ctl.Aborted() {
 				return 0, errExposureAborted // StopExposure ran: bail instead of waiting out the integration
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
-	}
-	if longExp {
 		if err := trigger(false); err != nil {
 			return 0, err
 		}
 	}
+	// Free-run (<1 s): NO pre-read sleep and NO FPGABufReload. The SDK's WorkingFunc calls
+	// startAsyncXfer immediately after FPGAStart with timeout = exposure+1000 ms — the URB batch
+	// waits on the pipe through the integration, so the GPIF never streams without a reader.
+	// (Sleeping first and reading afterwards backed up the FIFO and tore/stalled on USB2; the
+	// pre-read reg 0x18 control write is also NOT in the SDK's normal path — it appears only in
+	// the trigger-retry below, gated on FPGA reg 0x23 bit2.)
 	target := ctl.FrameBytes()
 	if target > len(buf) {
 		target = len(buf)
 	}
-	// Free-run windowed read. Two things were tearing the frame:
-	//  1) Whole-frame shear — the readout ran at the USB3 line rate on a USB2 link and overran the
-	//     bus. Fixed in the transport (it now reports the negotiated link speed, so HMAX matches the
-	//     SDK). Do NOT pulse FPGABufReload to "help": a control transfer interleaving the bulk read
-	//     desyncs the 462's USB2 GPIF (unlike the DDR sensors), which makes it worse.
-	//  2) Bottom-tail tear — the FX3 holds the frame's final partial DMA buffer (<1 MiB) until more
-	//     data is requested, so stopping exactly at FrameBytes can deliver that tail desynced. Read
-	//     one extra DMA buffer so the NEXT frame's data commits this frame's held tail (the same
-	//     effect the SDK gets by reading continuously), then keep only this frame.
-	over := target + maxFX3DMABuf
-	scratch := make([]byte, over)
-	n, err := ctl.StreamFrame(scratch, 500*time.Millisecond, exposure+5*time.Second)
-	if err != nil {
-		return 0, err
+	readTotal := exposure + time.Second // SDK free-run: startAsyncXfer timeout = exp + 1000 ms
+	if longExp {
+		readTotal = time.Second // SDK trigger mode: frame already integrated; 1000 ms
 	}
-	if n < target { // short read — hand back what we got; GetDataAfterExp re-arms and retries
-		copy(buf[:n], scratch[:n])
-		return n, nil
+	// Retry ladder, mirroring the SDK WorkingFunc's failure handling:
+	//   short frame          -> ResetEndpoint, fresh full-frame read
+	//   trigger-mode short   -> if FPGA reg 0x23 bit2 says the frame is still buffered, pulse
+	//                           FPGABufReload (reg 0x18 bit0) and re-read WITHOUT re-integrating
+	//   4 consecutive zeros  -> ResetDevice + full re-arm
+	// A frame short by ≤512 bytes counts as complete (the SDK's startAsyncXfer treats
+	// completed+0x200 == frameBytes as success); the missing tail is zeroed.
+	zeros, reloads := 0, 0
+	for attempt := 0; ; attempt++ {
+		n, err := ctl.StreamFramePrequeued(buf[:target], 500*time.Millisecond, readTotal)
+		if err != nil {
+			return n, err
+		}
+		if n >= target-512 {
+			for i := n; i < target; i++ {
+				buf[i] = 0
+			}
+			return target, nil
+		}
+		if ctl.Aborted() {
+			return n, errExposureAborted
+		}
+		if attempt >= 6 { // SDK snap gives up (ASI_EXP_FAILED) rather than retry forever
+			return n, fmt.Errorf("imx462: short frame %d/%d after %d attempts", n, target, attempt+1)
+		}
+		ctl.NoteStall()
+		if n < 4096 {
+			// Empty or near-empty read. A parked GPIF shows up as a few header bytes then a
+			// stalled pipe (observed: 64 bytes with a valid 0x5A7E marker, every attempt), so
+			// tiny reads count as empty too — a plain ResetEndpoint doesn't unpark it.
+			zeros++
+			if zeros >= 4 { // SDK: 4 empty reads in a row -> ResetDevice + full re-arm
+				_ = ctl.ResetDevice()
+				time.Sleep(50 * time.Millisecond)
+				if err := arm(true); err != nil {
+					return 0, err
+				}
+				_ = ctl.ResetEndpoint()
+				zeros = 0
+				continue
+			}
+			_ = ctl.ResetEndpoint()
+			continue
+		}
+		zeros = 0
+		if longExp && reloads < 3 {
+			if v, rerr := rm.ReadFPGAReg(0x23); rerr == nil && v&0x04 != 0 {
+				// The triggered frame is still in the FPGA buffer: reload and re-read it
+				// instead of re-integrating (SDK reg 0x23 bit2 path, max 3 attempts).
+				reloads++
+				if err := SetFPGABit(rm, 0x18, 0x01, true); err != nil {
+					return 0, err
+				}
+				continue
+			}
+		}
+		_ = ctl.ResetEndpoint()
 	}
-	copy(buf[:target], scratch[:target])
-	return target, nil
 }
-
-// maxFX3DMABuf is the FX3's DMA commit-buffer size (1 MiB); reading one extra past the frame forces
-// the held final partial buffer to commit.
-const maxFX3DMABuf = 1 << 20
 
 // imx462InitFPGA — the FPGA-side bringup after the Sony init writes (InitCamera);
 // same as the 290.
@@ -326,7 +366,8 @@ var imx462Shutter = ShutterModel{
 }
 
 // imx462ClockFloor returns the pixel clock + HMAX floor for the live readout mode: the
-// 10-bit high-speed pair (37124/245) when mode.HighSpeed, else 12-bit normal (18562/261).
+// 10-bit high-speed pair (37124/1100) when mode.HighSpeed, else 12-bit normal (18562/1100).
+// The floor (1100) is the SDK's REG_FRAME_LENGTH_PKG_MIN and dominates the bandwidth candidate.
 func imx462ClockFloor(rm Regmap) (clock, floor int) {
 	if ModeOf(rm).HighSpeed {
 		return imx462ClkKHzHS, imx462HMAXFloorHS
@@ -348,15 +389,18 @@ func imx462SetExposure(rm Regmap, d time.Duration) error {
 		return err
 	}
 	// HMAX (line time) from the live ROI dimensions when set, so a sub-frame ROI gets the
-	// shorter line period it can sustain (the bandwidth throttle scales with width); falls
-	// back to full-frame. Matches the ROI HMAX that SetROI's ProgramHMAX programmed.
+	// shorter line period it can sustain (the bandwidth throttle scales with the frame size);
+	// falls back to full-frame. HMAX = max(link-bandwidth candidate, floor 1100)·100/FPSPercent —
+	// the SDK's SetFPSPerc with the link-switched MAX_DATASIZE (see the floor constants above).
+	// On USB2 the candidate dominates (1634 full-frame → sensor rate pinned to the 43.272 MB/s
+	// budget); on USB3 the 1100 floor does. Written before the SHS math so the FPGA line rate
+	// and SHS agree (lineTimeNs derives the same).
 	hw, hh := imx462FullWidth, imx462FullHeight
 	if rd := ModeOf(rm); rd.Width > 0 {
 		hw, hh = rd.Width, rd.Height
 	}
 	clk, floor := imx462ClockFloor(rm)
-	hmax := HMAX(hw, hh, clk, floor, imx462VBlankAdd, ModeOf(rm))
-	if err := WriteFPGAHMAX(rm, hmax); err != nil {
+	if err := WriteFPGAHMAX(rm, HMAX(hw, hh, clk, floor, imx462VBlankAdd, ModeOf(rm))); err != nil {
 		return err
 	}
 	return ApplyExposure(rm, imx462Shutter, imx462RegLatch, d)
@@ -428,7 +472,7 @@ func imx462SetROI(rm Regmap, x, y, w, h, bin int) error {
 	// the high-speed mode flag. Normal OR RAW16 uses the 12-bit ADBIT block (0x3005=1, OUTFMT
 	// 0x3046=0xf1, 0x3129=0, 0x317c=0, 0x31ec=0x0e) with FPGA ADC_BIT=1. High-speed AND RAW8 uses
 	// the 10-bit reformat (0x3046=0xf0, 0x3005=0, 0x3129=0x1d, 0x317c=0x12, ADC_BIT=0) — a shorter
-	// ADC ramp clocked 2× faster (imx462ClockFloor switches clock 18562→37124, floor 261→245).
+	// ADC ramp clocked 2× faster (imx462ClockFloor switches clock 18562→37124; floor stays 1100).
 	out16 := []RegVal{{Reg: 0x3046, Val: 0xf1}, {Reg: 0x3005, Val: 0x01}, {Reg: 0x3129, Val: 0x00}, {Reg: 0x317c, Val: 0x00}, {Reg: 0x31ec, Val: 0x0e}}
 	adcBit := uint16(0x01) // FPGA reg 0x0a bit0 (SetFPGAADCWidthOutputWidth's ADC_BIT): 1 = 12-bit
 	if ModeOf(rm).HighSpeed && ModeOf(rm).BytesPerPx < 2 {
@@ -447,6 +491,7 @@ func imx462SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if err := ProgramFrameGeometry(rm, w, h, imx462HBLK, imx462VBLK); err != nil {
 		return err
 	}
+	// Link-bandwidth HMAX for the new geometry (see imx462SetExposure).
 	clk, floor := imx462ClockFloor(rm)
 	return ProgramHMAX(rm, w, h, clk, floor, imx462VBlankAdd)
 }

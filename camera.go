@@ -93,9 +93,15 @@ func Open(t Transport, vid, pid uint16) (*Camera, error) {
 	if sr, ok := t.(superSpeedReporter); ok {
 		usb3 = sr.SuperSpeed()
 	}
-	// FPSPercent defaults to 100 = full speed / least throttle (the 174 runs on USB2 at 100,
-	// HMAX 1735). Independent parameter; override with SetFPSPercent.
-	mode := ReadoutMode{USB3: usb3, BytesPerPx: bpp, FPSPercent: 100}
+	// FPSPercent defaults to 100 (full speed) on a USB3 link, but a USB2 HighSpeed link can't drain
+	// the readout at full rate without the FX3 FIFO overrunning (frame tearing on the free-run
+	// STARVIS sensors), so default it to 50 there — a conservative throttle (larger HMAX). This is
+	// a default only: the user overrides either with SetFPSPercent (Alpaca "fpspercent" action).
+	fpsPercent := 100
+	if !usb3 {
+		fpsPercent = 40 // slow USB2 link: matches the SDK's USB2 default (its runtime BANDWIDTHOVERLOAD default)
+	}
+	mode := ReadoutMode{USB3: usb3, BytesPerPx: bpp, FPSPercent: fpsPercent}
 	c := &Camera{
 		t: t, model: m, sensor: m.Sensor, rm: vend.newRegmap(t, m.Sensor.Bus, mode), pid: pid,
 		roiW: m.Sensor.Info.MaxWidth, roiH: m.Sensor.Info.MaxHeight, bin: 1,

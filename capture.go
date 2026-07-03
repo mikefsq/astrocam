@@ -130,6 +130,15 @@ func (c *Camera) StreamFrame(buf []byte, idle, total time.Duration) (int, error)
 	return c.t.BulkRead(buf, total)
 }
 
+// StreamFramePrequeued reads one free-run frame with a continuously-in-flight URB ring (the SDK's
+// async-transfer model), falling back to StreamFrame on backends without it.
+func (c *Camera) StreamFramePrequeued(buf []byte, idle, total time.Duration) (int, error) {
+	if p, ok := c.t.(PrequeuedFrameStreamer); ok {
+		return p.ReadFrameStreamPrequeued(buf, idle, total)
+	}
+	return c.StreamFrame(buf, idle, total)
+}
+
 // FrameBytes is the size of one frame to read off the wire and the buffer a caller must
 // allocate: width × height × bytes-per-pixel (RAW16 → 2, RAW8 → 1) of the live OUTPUT mode.
 // Output depth is the readout mode (SetOutputDepth), not the sensor ADC depth. For RAW16

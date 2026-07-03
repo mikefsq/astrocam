@@ -41,6 +41,10 @@ var (
 	usbdevfsReset          = ioc(0, 20, 0)  // _IO('U',20)                = 0x00005514
 )
 
+// debugPreq dumps per-URB completion timing/lengths from ReadFrameStreamPrequeued (temporary
+// bring-up diagnostic; set ASICAM_DEBUG_PREQ=1).
+var debugPreq = os.Getenv("ASICAM_DEBUG_PREQ") != ""
+
 // usbURB is the 64-bit <linux/usbdevice_fs.h> struct usbdevfs_urb (56 bytes, no trailing
 // iso packet descriptors), posted and reaped by the async SUBMITURB/REAPURB path.
 type usbURB struct {
@@ -465,6 +469,151 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 		}
 	}
 	return got, nil
+}
+
+// ReadFrameStreamPrequeued reads one frame with the SDK's async-transfer model (initAsyncXfer/
+// startAsyncXfer): bulk-IN URBs covering buf EXACTLY — slot i targets buf[i·1MiB:] and the last
+// slot is sized to the frame remainder, so the batch completes at frame end without relying on
+// a short packet (a full-1MiB tail URB never completes once the FPGA stops after the snap
+// frame — that was the short-frame stall). The slots are pre-queued before the frame arrives,
+// so the pipe is armed while the sensor integrates and the GPIF never streams without a reader.
+// No slot is resubmitted: one frame, one batch — a retry is a fresh call. Data lands directly
+// at each slot's fixed offset, so completion order doesn't matter. Returns the contiguous byte
+// count from the start of buf. idle bounds a no-completion stall; total bounds the whole read.
+// Satisfies PrequeuedFrameStreamer.
+func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Duration) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
+	nslots := (len(buf) + maxBulkChunk - 1) / maxBulkChunk
+	const window = 12 // in-flight cap: usbfs bounds outstanding URB memory (16 MiB default)
+	urbs := make([]usbURB, nslots)
+	want := make([]int, nslots)
+	inflight := make([]bool, nslots)
+	for i := range urbs {
+		l := len(buf) - i*maxBulkChunk
+		if l > maxBulkChunk {
+			l = maxBulkChunk
+		}
+		want[i] = l
+	}
+	slotOf := func(p uintptr) int {
+		for i := range urbs {
+			if p == uintptr(unsafe.Pointer(&urbs[i])) {
+				return i
+			}
+		}
+		return -1
+	}
+	submit := func(i int) error {
+		urbs[i] = usbURB{typ: urbTypeBulk, endpoint: bulkEndpoint,
+			buffer: uintptr(unsafe.Pointer(&buf[i*maxBulkChunk])), bufferLength: int32(want[i])}
+		if err := d.ioctl(usbdevfsSubmitURB, unsafe.Pointer(&urbs[i])); err != nil {
+			return err
+		}
+		inflight[i] = true
+		return nil
+	}
+	// drain discards + blocking-reaps every in-flight urb so no completion lands against buf
+	// after we return. The kernel reports a discarded urb's partial length on the reap, so a
+	// stuck slot's bytes still count toward the contiguous prefix. Idempotent; also deferred
+	// as a safety net for early returns.
+	drain := func() {
+		for i := range inflight {
+			if inflight[i] {
+				_ = d.ioctl(usbdevfsDiscardURB, unsafe.Pointer(&urbs[i]))
+			}
+		}
+		for {
+			any := false
+			for i := range inflight {
+				if inflight[i] {
+					any = true
+				}
+			}
+			if !any {
+				return
+			}
+			var p uintptr
+			if err := d.ioctl(usbdevfsReapURB, unsafe.Pointer(&p)); err != nil {
+				return
+			}
+			if i := slotOf(p); i >= 0 {
+				inflight[i] = false
+			}
+		}
+	}
+	defer drain()
+	// prefix is the contiguous byte count from the start of buf: full slots plus the partial
+	// tail of the first incomplete one. Only meaningful after drain().
+	prefix := func() int {
+		got := 0
+		for i := range urbs {
+			got += int(urbs[i].actualLength)
+			if int(urbs[i].actualLength) < want[i] {
+				break
+			}
+		}
+		return got
+	}
+
+	next := 0 // next slot to submit; completions slide the window forward
+	for ; next < nslots && next < window; next++ {
+		if err := submit(next); err != nil {
+			if next == 0 {
+				return 0, fmt.Errorf("asicam: submit urb: %w", err)
+			}
+			break // window truncated (e.g. usbfs memory cap); completions extend it below
+		}
+	}
+
+	deadline := time.Now().Add(total)
+	lastData := time.Now()
+	gotFirst := false // idle gates only AFTER the first completion: the pre-frame quiet is the
+	// integration (URBs are armed before the exposure and the first slot completes only once
+	// ~1 MiB has streamed), so only `total` bounds it — matching startAsyncXfer, which has no
+	// idle cutoff at all, just the overall timeout.
+	for done := 0; done < nslots; {
+		if time.Now().After(deadline) {
+			break
+		}
+		var p uintptr
+		err := d.ioctl(usbdevfsReapURBNDelay, unsafe.Pointer(&p))
+		if err == syscall.EAGAIN {
+			if gotFirst && time.Since(lastData) >= idle {
+				break // genuine stall: no completion for the whole idle window
+			}
+			time.Sleep(200 * time.Microsecond)
+			continue
+		}
+		if err != nil {
+			drain()
+			return prefix(), err
+		}
+		i := slotOf(p)
+		if i < 0 {
+			continue
+		}
+		inflight[i] = false
+		done++
+		lastData = time.Now()
+		gotFirst = true
+		if debugPreq {
+			fmt.Printf("[preq] +%6.1fms slot %d done: %d/%d status=%d\n",
+				time.Since(deadline.Add(-total)).Seconds()*1e3, i, urbs[i].actualLength, want[i], urbs[i].status)
+		}
+		// A nonzero status (halt, babble) surfaces as a short prefix; the worker's retry
+		// ladder resets the endpoint — matching the SDK, which only counts bytes.
+		if next < nslots {
+			if submit(next) == nil {
+				next++
+			}
+		}
+	}
+	drain()
+	return prefix(), nil
 }
 
 // ResetEndpoint clears a halt/stall on the bulk-IN endpoint (USBDEVFS_CLEAR_HALT).

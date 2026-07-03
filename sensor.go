@@ -105,6 +105,11 @@ type WorkerCtl interface {
 	// the worker can re-kick the FPGA and continue into buf[n:]); total bounds the whole read.
 	// Falls back to BulkStreamer / BulkRead on backends without it.
 	StreamFrame(buf []byte, idle, total time.Duration) (int, error)
+	// StreamFramePrequeued reads one frame with a pre-queued URB batch covering it exactly (the
+	// SDK's async-transfer model): the transfers wait on the pipe before the frame arrives, so
+	// the read overlaps the sensor readout — the free-run STARVIS sensors tear on a USB2 link
+	// with the one-at-a-time StreamFrame. Falls back to StreamFrame where unavailable.
+	StreamFramePrequeued(buf []byte, idle, total time.Duration) (int, error)
 }
 
 // ExposureStatus mirrors ASI_EXPOSURE_STATUS (the int at the camera's +0x254).

@@ -509,13 +509,28 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 		}
 		return nil
 	}
-	_ = o.timeout
 	fmt.Printf("%s begin readout (read blocks until the frame arrives)\n", el())
 	// Read exactly one frame: an over-sized buffer makes the read wait for the next frame
 	// to top off the extra bytes, and in long-exposure mode frames aren't back-to-back, so
 	// a margin costs a whole extra exposure. FrameBytes ends on frame 1.
 	buf := make([]byte, cam.FrameBytes())
-	n, err := cam.GetDataAfterExp(buf)
+	// Bound the read by -timeout. On expiry, abort the exposure and bail — buf is still owned
+	// by the read goroutine, so don't touch it after a timeout.
+	type readRes struct {
+		n   int
+		err error
+	}
+	resCh := make(chan readRes, 1)
+	go func() { rn, rerr := cam.GetDataAfterExp(buf); resCh <- readRes{rn, rerr} }()
+	var n int
+	select {
+	case r := <-resCh:
+		n, err = r.n, r.err
+	case <-time.After(o.timeout):
+		_ = cam.StopExposure() // best-effort abort of the in-flight read
+		fmt.Printf("%s readout TIMEOUT after %s\n", el(), o.timeout)
+		return fmt.Errorf("readout timed out after %s", o.timeout)
+	}
 	fmt.Printf("%s readout returned %d bytes (err: %v)\n", el(), n, err)
 	if err == nil {
 		x, y, w, h := cam.ROI()

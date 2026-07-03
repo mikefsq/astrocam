@@ -65,6 +65,17 @@ type FrameStreamer interface {
 	ReadFrameStream(buf []byte, idle, total time.Duration) (int, error)
 }
 
+// PrequeuedFrameStreamer reads one frame the way the ASI SDK's capture thread does: a batch of
+// async bulk-IN transfers covering the frame exactly (initAsyncXfer/startAsyncXfer, 1 MiB slices
+// on EP 0x81, last slice = the remainder), all queued BEFORE the frame arrives so the transfer
+// overlaps the sensor read and the pipe never idles. The per-frame one-at-a-time ReadFrameStream
+// leaves a gap between transfers and doesn't overlap; on a USB2 HighSpeed link that shears the
+// frame. One frame per batch (a retry is a fresh call); the DDR mid-frame-hold path keeps using
+// ReadFrameStream.
+type PrequeuedFrameStreamer interface {
+	ReadFrameStreamPrequeued(buf []byte, idle, total time.Duration) (int, error)
+}
+
 // FrameStream is a resident streaming session (the video / planetary-burst path): the
 // windowed pump is primed once and Next pulls one frame per call, so the per-frame setup
 // cost (thread spawn, window prime, teardown) is paid once for the whole burst. Close
