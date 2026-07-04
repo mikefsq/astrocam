@@ -1,6 +1,9 @@
 package astrocam
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 // ZWO vendor request codes. Writes: OUT 0x40, wValue=reg, wIndex=val, no data stage.
 // Reads: IN 0xC0, wValue=reg, 1-byte data.
@@ -52,17 +55,28 @@ const (
 // zwoRegmap implements Regmap over a Transport using the ZWO control-transfer
 // protocol. bus picks the sensor-register request (Sony vs generic camera).
 type zwoRegmap struct {
-	t    Transport
-	bus  RegBus
-	mode ReadoutMode // live readout context (USB speed, output depth, FPS%) — set by Camera
+	t      Transport
+	bus    RegBus
+	modeMu sync.RWMutex
+	mode   ReadoutMode // live readout context (USB speed, output depth, FPS%) — set by Camera
 }
 
 // ReadoutMode implements modeReader: returns the live runtime context the Camera set.
-func (r *zwoRegmap) ReadoutMode() ReadoutMode { return r.mode }
+// Guarded: capture goroutines read it (FrameBytes, HMAX/SHS math) while camera methods
+// mutate it via updateMode.
+func (r *zwoRegmap) ReadoutMode() ReadoutMode {
+	r.modeMu.RLock()
+	defer r.modeMu.RUnlock()
+	return r.mode
+}
 
-// liveMode implements modeCarrier: lets the Camera mutate the live ReadoutMode (FPS%,
-// output depth, bin) through the interface.
-func (r *zwoRegmap) liveMode() *ReadoutMode { return &r.mode }
+// updateMode implements modeCarrier: the Camera mutates the live ReadoutMode (FPS%,
+// output depth, bin) under the mode lock.
+func (r *zwoRegmap) updateMode(f func(*ReadoutMode)) {
+	r.modeMu.Lock()
+	defer r.modeMu.Unlock()
+	f(&r.mode)
+}
 
 // VID reports the ZWO vendor id (selects the ZWO gain/offset encoding).
 func (r *zwoRegmap) VID() uint16 { return ZWO.VID }
@@ -99,8 +113,12 @@ func (r *zwoRegmap) WriteReg(reg, val uint16) error {
 
 func (r *zwoRegmap) ReadReg(reg uint16) (uint16, error) {
 	buf := make([]byte, 1) // ReadSONYREG returns 8-bit
-	if _, err := r.t.ControlIn(r.readReq(), reg, 0, buf); err != nil {
+	got, err := r.t.ControlIn(r.readReq(), reg, 0, buf)
+	if err != nil {
 		return 0, fmt.Errorf("read reg 0x%x: %w", reg, err)
+	}
+	if got < 1 {
+		return 0, fmt.Errorf("read reg 0x%x: empty control-IN", reg)
 	}
 	return uint16(buf[0]), nil
 }
@@ -124,8 +142,12 @@ func (r *zwoRegmap) WriteFPGAReg(reg, val uint16) error {
 // ReadFPGAReg reads a camera-FPGA register (request 0xBC).
 func (r *zwoRegmap) ReadFPGAReg(reg uint16) (uint16, error) {
 	buf := make([]byte, 1)
-	if _, err := r.t.ControlIn(reqReadFPGAReg, reg, 0, buf); err != nil {
+	got, err := r.t.ControlIn(reqReadFPGAReg, reg, 0, buf)
+	if err != nil {
 		return 0, fmt.Errorf("read FPGA reg 0x%x: %w", reg, err)
+	}
+	if got < 1 {
+		return 0, fmt.Errorf("read FPGA reg 0x%x: empty control-IN", reg)
 	}
 	return uint16(buf[0]), nil
 }
@@ -133,24 +155,30 @@ func (r *zwoRegmap) ReadFPGAReg(reg uint16) (uint16, error) {
 // SetVMAX programs the frame length (VMAX) into the camera FPGA: clamp to 24 bits,
 // strobe FPGA reg 1, write VMAX little-endian to regs 0x10/0x11/0x12, then release the
 // strobe. VMAX lives in the FPGA, not the sensor.
-func SetVMAX(rm Regmap, vmax uint32) error {
+func SetVMAX(rm Regmap, vmax uint32) (err error) {
 	if vmax > 0xffffff {
 		vmax = 0xffffff
 	}
-	if err := rm.WriteFPGAReg(fpgaVMAXStrobe, 1); err != nil {
+	if err = rm.WriteFPGAReg(fpgaVMAXStrobe, 1); err != nil {
 		return err
 	}
+	// Release the commit strobe (FPGA reg 1: 1 -> 0) after the VMAX bytes — on the error
+	// paths too (a held strobe gates every later FPGA group commit); the first error wins.
+	defer func() {
+		if rerr := rm.WriteFPGAReg(fpgaVMAXStrobe, 0); err == nil {
+			err = rerr
+		}
+	}()
 	for _, w := range []RegVal{
 		{Reg: fpgaVMAX0, Val: uint16(vmax) & 0xff},
 		{Reg: fpgaVMAX1, Val: uint16(vmax>>8) & 0xff},
 		{Reg: fpgaVMAX2, Val: uint16(vmax>>16) & 0xff},
 	} {
-		if err := rm.WriteFPGAReg(w.Reg, w.Val); err != nil {
+		if err = rm.WriteFPGAReg(w.Reg, w.Val); err != nil {
 			return err
 		}
 	}
-	// Release the commit strobe (FPGA reg 1: 1 -> 0) after the VMAX bytes.
-	return rm.WriteFPGAReg(fpgaVMAXStrobe, 0)
+	return nil
 }
 
 // --- camera/FPGA registers (ZWO's own, not the sensor's) ---
@@ -173,13 +201,19 @@ const FlashHPCMapAddr = 0x40000
 // ReadSPIFlash reads n bytes from the camera's SPI flash starting at addr, in 2 KiB vendor-IN
 // blocks (wIndex tracks addr>>8). SPI flash and the sensor's 32-bit GPIF data bus share FX3
 // pins, so the read is bracketed by EnableGPIF32DQ(false)/(true); the camera must be Init'd first.
-func (c *Camera) ReadSPIFlash(addr uint32, n int) ([]byte, error) {
+func (c *Camera) ReadSPIFlash(addr uint32, n int) (out []byte, err error) {
 	if err := c.t.ControlOut(cmdEnableGPIF32DQ, 0, 0, nil); err != nil {
 		return nil, err
 	}
-	defer c.t.ControlOut(cmdEnableGPIF32DQ, 1, 0, nil)
+	defer func() {
+		// The data bus MUST come back up: left disabled, the next readout is silently dead.
+		// Surface a failed re-enable (a read error from the body wins if both fail).
+		if rerr := c.t.ControlOut(cmdEnableGPIF32DQ, 1, 0, nil); err == nil && rerr != nil {
+			err = fmt.Errorf("asicam: re-enable GPIF32DQ after flash read: %w", rerr)
+		}
+	}()
 	const block = 2048
-	out := make([]byte, 0, n)
+	out = make([]byte, 0, n)
 	for len(out) < n {
 		want := n - len(out)
 		if want > block {

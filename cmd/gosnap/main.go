@@ -47,7 +47,7 @@ func main() {
 	usb2 := flag.Bool("usb2", false, "force the USB2 HighSpeed readout path (bwUSB2 bandwidth budget) regardless of the model/link — toggle the USB2 vs USB3 behavior on a fixed physical link without replugging")
 	fpsPerc := flag.Int("fps", 0, "bandwidth-overload / FPS percent 40..100 (0 = default 100 = max throughput, matching the SDK). Lower throttles the readout (larger HMAX)")
 	out := flag.String("out", "frame.fits", "frame output file (with -capture); .fits/.fit writes FITS, any other extension writes raw RAW16")
-	timeout := flag.Duration("timeout", 5*time.Second, "max wait for the frame (with -capture)")
+	timeout := flag.Duration("timeout", 5*time.Second, "max wait for the frame (with -capture); on USB2 the abort queues behind the in-flight read (ioMu), so expiry mostly bounds the wait rather than cutting the read short")
 	replay := flag.String("replay", "", "replay an SDK 'req reg val' write sequence (file) then read a frame")
 	nframes := flag.Int("n", 1, "with -capture: after one arm, read N frames back-to-back (no re-arm) and time each — the cold-start/throwaway test")
 	discard := flag.Bool("discard", false, "with -capture -n N: capture frames via the resident stream but DON'T write them — the pure-capture throughput benchmark, matching the SDK video bench (no disk I/O)")
@@ -390,8 +390,12 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 						}
 						fmt.Printf("  intervals(ms): med=%.2f p1=%.2f p99=%.2f max=%.2f | >1.5×med (likely drops)=%d/%d\n",
 							med, s[len(s)/100], s[len(s)*99/100], s[len(s)-1], gaps, len(ivs))
-						// Dump the per-frame interval (ms) of every frame to -out for plotting.
-						if o.out != "" {
+						// Dump the per-frame interval (ms) of every frame to -out for plotting —
+						// only when -out names a plausible text target. The dump is plain text, so
+						// never let a benchmark run silently clobber an image path (the default
+						// -out frame.fits, or a .ser the user meant for a real capture).
+						if o.out != "" && !strings.HasSuffix(strings.ToLower(o.out), ".fits") &&
+							!strings.HasSuffix(strings.ToLower(o.out), ".ser") {
 							var b strings.Builder
 							for _, v := range ivs {
 								fmt.Fprintf(&b, "%.3f\n", v)
@@ -399,14 +403,22 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 							if werr := os.WriteFile(o.out, []byte(b.String()), 0o644); werr == nil {
 								fmt.Printf("  wrote %d per-frame intervals -> %s\n", len(ivs), o.out)
 							}
+						} else if o.out != "" {
+							fmt.Printf("  (interval dump skipped: -out %q looks like an image path; use a .txt/.csv)\n", o.out)
 						}
 					}
 				} else if streamed {
 					// Async double-buffered writer: SER disk I/O runs on its own goroutine,
 					// overlapping the next frame's capture so the read loop runs at full rate.
+					// Each queued frame carries its capture stamp — the writer drains up to
+					// pool frames behind, so stamping at write time would skew the trailer.
 					const pool = 4
+					type serFrame struct {
+						data []byte
+						at   time.Time
+					}
 					free := make(chan []byte, pool)
-					queue := make(chan []byte, pool)
+					queue := make(chan serFrame, pool)
 					for i := 0; i < pool; i++ {
 						free <- make([]byte, fbytes)
 					}
@@ -416,9 +428,9 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 						defer close(done)
 						for fr := range queue {
 							if writeErr == nil {
-								writeErr = sw.writeFrame(fr)
+								writeErr = sw.writeFrame(fr.data, fr.at)
 							}
-							free <- fr[:cap(fr)]
+							free <- fr.data[:cap(fr.data)]
 						}
 					}()
 					t0 = time.Now() // time ONLY the steady-state loop, matching the SDK bench
@@ -430,7 +442,7 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 							free <- fb
 							break
 						}
-						queue <- fb[:cn]
+						queue <- serFrame{data: fb[:cn], at: time.Now()}
 					}
 					close(queue)
 					<-done
@@ -465,7 +477,7 @@ func run(pid uint16, capture, verbose bool, o captureOpts) error {
 					break
 				}
 				if sw != nil {
-					if werr := sw.writeFrame(buf[:cn]); werr != nil {
+					if werr := sw.writeFrame(buf[:cn], time.Now()); werr != nil {
 						sw.close()
 						return werr
 					}

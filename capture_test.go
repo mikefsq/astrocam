@@ -19,7 +19,9 @@ func (f *frameTransport) ControlOut(b uint8, wv, wi uint16, _ []byte) error {
 	f.out = append(f.out, ctrlCall{b, wv, wi})
 	return nil
 }
-func (f *frameTransport) ControlIn(uint8, uint16, uint16, []byte) (int, error) { return 0, nil }
+func (f *frameTransport) ControlIn(_ uint8, _, _ uint16, data []byte) (int, error) {
+	return len(data), nil // real transports fill the request; a 0-count read is now an error
+}
 func (f *frameTransport) BulkRead(buf []byte, _ time.Duration) (int, error) {
 	return copy(buf, f.frame), nil
 }
@@ -95,85 +97,82 @@ func TestSnapDataPlane(t *testing.T) {
 	}
 }
 
-// streamTransport implements BulkStreamer, serving a frame in bufSize chunks (the
-// last one short) — the async-pump fast path.
-type streamTransport struct {
-	out   []ctrlCall
-	frame []byte
+// dispatchTransport is a bare Transport (BulkRead only) that records which read path the
+// Camera dispatched to; the wrapper types below add FrameStreamer / PrequeuedFrameStreamer
+// so a test can lock the StreamFramePrequeued capability-dispatch order.
+type dispatchTransport struct {
+	path string
 }
 
-func (s *streamTransport) ControlOut(b uint8, wv, wi uint16, _ []byte) error {
-	s.out = append(s.out, ctrlCall{b, wv, wi})
-	return nil
+func (d *dispatchTransport) ControlOut(uint8, uint16, uint16, []byte) error       { return nil }
+func (d *dispatchTransport) ControlIn(_ uint8, _, _ uint16, data []byte) (int, error) {
+	return len(data), nil
 }
-func (s *streamTransport) ControlIn(uint8, uint16, uint16, []byte) (int, error) { return 0, nil }
-func (s *streamTransport) BulkRead([]byte, time.Duration) (int, error) {
-	return 0, errors.New("use BulkStream")
-}
-func (s *streamTransport) Close() error { return nil }
-func (s *streamTransport) BulkStream(bufSize, _ int) (Stream, error) {
-	return &sliceStream{data: s.frame, chunk: bufSize}, nil
+func (d *dispatchTransport) Close() error                                         { return nil }
+func (d *dispatchTransport) BulkRead(buf []byte, _ time.Duration) (int, error) {
+	d.path = "bulk"
+	return len(buf), nil
 }
 
-type sliceStream struct {
-	data  []byte
-	chunk int
-	off   int
+type fsDispatchTransport struct{ dispatchTransport }
+
+func (d *fsDispatchTransport) ReadFrameStream(buf []byte, _, _ time.Duration) (int, error) {
+	d.path = "stream"
+	return len(buf), nil
 }
 
-func (s *sliceStream) Next(time.Duration) ([]byte, error) {
-	if s.off >= len(s.data) {
-		return nil, errors.New("stream drained")
-	}
-	n := s.chunk
-	if rem := len(s.data) - s.off; n > rem {
-		n = rem
-	}
-	b := s.data[s.off : s.off+n]
-	s.off += n
-	return b, nil
+type pqDispatchTransport struct{ fsDispatchTransport }
+
+func (d *pqDispatchTransport) ReadFrameStreamPrequeued(buf []byte, _, _ time.Duration) (int, error) {
+	d.path = "prequeued"
+	return len(buf), nil
 }
-func (s *sliceStream) Close() error { return nil }
 
-// TestSnapStreamingReadout exercises the async-pump path: a frame reassembled from
-// multiple chunks via BulkStream, terminated by the final short packet.
-func TestSnapStreamingReadout(t *testing.T) {
-	old := bulkChunkBytes
-	bulkChunkBytes = 8 // shrink so a small frame spans several chunks
-	defer func() { bulkChunkBytes = old }()
-
-	// armSensor: 4*2*2 = 16 pixel bytes; + 4-byte magic header = 20 → 3 chunks (8,8,4).
-	frame := make([]byte, 4+16)
-	binary.LittleEndian.PutUint32(frame[:4], FrameMagic)
-	for i := 4; i < len(frame); i++ {
-		frame[i] = byte(i)
+// TestStreamFramePrequeuedDispatch locks the capability-dispatch order of the worker read
+// primitives: StreamFramePrequeued uses the pre-queued batch when the backend has it, falls
+// back to the windowed pump, then to a plain BulkRead (finding 2.4: the free-run 462 worker
+// depends on the pre-queued path whenever the backend offers it; all in-tree backends now do).
+func TestStreamFramePrequeuedDispatch(t *testing.T) {
+	buf := make([]byte, 32)
+	cases := []struct {
+		name      string
+		t         Transport
+		path      func(Transport) string
+		prequeued string // path StreamFramePrequeued must take
+		stream    string // path StreamFrame must take
+	}{
+		{"prequeued backend", &pqDispatchTransport{},
+			func(tr Transport) string { return tr.(*pqDispatchTransport).path }, "prequeued", "stream"},
+		{"windowed-pump backend", &fsDispatchTransport{},
+			func(tr Transport) string { return tr.(*fsDispatchTransport).path }, "stream", "stream"},
+		{"bulk-only backend", &dispatchTransport{},
+			func(tr Transport) string { return tr.(*dispatchTransport).path }, "bulk", "bulk"},
 	}
-	st := &streamTransport{frame: frame}
-	Register(ZWO.VID, 0x00D1, Model{Name: "Stream", Sensor: &armSensor})
-	c, err := Open(st, ZWO.VID, 0x00D1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.SetExposure(0)
-	if err := c.StartExposure(true); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 64)
-	n, err := c.GetDataAfterExp(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != len(frame) {
-		t.Errorf("streamed %d bytes, want %d", n, len(frame))
-	}
-	for i := 4; i < n; i++ {
-		if buf[i] != byte(i) {
-			t.Errorf("reassembled byte %d = %d, want %d", i, buf[i], byte(i))
-			break
+	for _, tc := range cases {
+		c := &Camera{t: tc.t}
+		if _, err := c.StreamFramePrequeued(buf, time.Second, time.Second); err != nil {
+			t.Fatalf("%s: StreamFramePrequeued: %v", tc.name, err)
+		}
+		if got := tc.path(tc.t); got != tc.prequeued {
+			t.Errorf("%s: StreamFramePrequeued took %q, want %q", tc.name, got, tc.prequeued)
+		}
+		if _, err := c.StreamFrame(buf, time.Second, time.Second); err != nil {
+			t.Fatalf("%s: StreamFrame: %v", tc.name, err)
+		}
+		if got := tc.path(tc.t); got != tc.stream {
+			t.Errorf("%s: StreamFrame took %q, want %q", tc.name, got, tc.stream)
 		}
 	}
-	if c.GetExpStatus() != ExpIdle {
-		t.Error("status should be idle after a successful streamed readout")
+}
+
+// TestStubImplementsPrequeued pins finding 2.4's fix: every in-tree backend the free-run
+// worker can land on must offer the pre-queued read (the StreamFrame fallback idles out
+// from t0 and breaks free-run exposures ≳ the idle window). Linux/darwin/windows are
+// build-tagged; the stub is assertable everywhere.
+func TestStubImplementsPrequeued(t *testing.T) {
+	var tr Transport = NewStubTransport()
+	if _, ok := tr.(PrequeuedFrameStreamer); !ok {
+		t.Error("StubTransport must implement PrequeuedFrameStreamer")
 	}
 }
 
@@ -226,19 +225,154 @@ func TestCameraConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-// TestSnapBadMagic: a frame without the header magic fails readout and marks the
-// exposure FAILED (the dropped-frame path).
-func TestSnapBadMagic(t *testing.T) {
-	f := &frameTransport{frame: []byte{0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4}}
+// TestSnapShortFrame: a short frame (fewer bytes than FrameBytes — validation is by SIZE,
+// there is no magic check on the pixel data) fails readout and marks the exposure FAILED
+// (the dropped-frame path).
+func TestSnapShortFrame(t *testing.T) {
+	f := &frameTransport{frame: []byte{0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4}} // 8 < 16-byte frame
 	c, _ := Open(f, ZWO.VID, 0x00D0)
 	c.SetExposure(0)
 	if err := c.StartExposure(true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.GetDataAfterExp(make([]byte, 64)); err == nil {
-		t.Error("expected bad-magic error")
+		t.Error("expected short-frame error")
 	}
 	if c.GetExpStatus() != ExpFailed {
 		t.Errorf("status = %s, want failed", c.GetExpStatus())
+	}
+}
+
+// TestAbortSupersede locks the exposure-generation guard: a capture aborted mid-flight and
+// superseded by a NEW StartExposure must (a) observe the abort through its WorkerCtl, and
+// (b) leave the new exposure's status untouched when it unwinds — the historical bug was the
+// stale worker seeing status==Working again ("un-aborting" itself) and then consuming or
+// failing the new exposure's state.
+func TestAbortSupersede(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var sawAbort bool
+	var mu sync.Mutex
+	wrk := Sensor{
+		Name:        "WRK",
+		Info:        CameraInfo{MaxWidth: 4, MaxHeight: 2, BitDepth: 12},
+		SetExposure: func(Regmap, time.Duration) error { return nil },
+		SetROI:      func(Regmap, int, int, int, int, int) error { return nil },
+		Worker: func(ctl WorkerCtl, buf []byte, _ time.Duration) (int, error) {
+			close(started)
+			<-release
+			if ctl.Aborted() {
+				mu.Lock()
+				sawAbort = true
+				mu.Unlock()
+				return 0, errors.New("exposure aborted")
+			}
+			return ctl.FrameBytes(), nil
+		},
+	}
+	f := &frameTransport{}
+	Register(ZWO.VID, 0x00D1, Model{Name: "Wrk", Sensor: &wrk})
+	c, err := Open(f, ZWO.VID, 0x00D1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetExposure(10 * time.Second) // long window: the derived-Success poll stays Working
+
+	if err := c.StartExposure(true); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.GetDataAfterExp(make([]byte, 64))
+		done <- err
+	}()
+	<-started // stale capture is inside its worker
+
+	if err := c.StopExposure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.StartExposure(true); err != nil { // supersede with a fresh exposure
+		t.Fatal(err)
+	}
+	close(release) // let the stale worker unwind
+
+	if err := <-done; err == nil {
+		t.Error("stale aborted capture returned success, want abort error")
+	}
+	mu.Lock()
+	if !sawAbort {
+		t.Error("stale worker did not observe the abort (Aborted() lost across the new StartExposure)")
+	}
+	mu.Unlock()
+	if s := c.GetExpStatus(); s != ExpWorking {
+		t.Errorf("new exposure status = %s, want working — the stale capture clobbered it", s)
+	}
+}
+
+// TestStatusPollDoesNotAbortWorker locks GetExpStatus purity: polling the status past the
+// host-timed window derives SUCCESS without mutating the stored status, so the worker still
+// integrating must NOT observe an abort. (The historical bug: the getter stored ExpSuccess and
+// Aborted() keyed off status != Working, so any poll in the arm-lag tail killed the exposure
+// at ~99% integrated.)
+func TestStatusPollDoesNotAbortWorker(t *testing.T) {
+	workerDone := make(chan struct{})
+	var abortedDuringRun bool
+	var mu sync.Mutex
+	wrk := Sensor{
+		Name:        "WRKPOLL",
+		Info:        CameraInfo{MaxWidth: 4, MaxHeight: 2, BitDepth: 12},
+		SetExposure: func(Regmap, time.Duration) error { return nil },
+		SetROI:      func(Regmap, int, int, int, int, int) error { return nil },
+		Worker: func(ctl WorkerCtl, buf []byte, _ time.Duration) (int, error) {
+			defer close(workerDone)
+			// Integrate PAST the host-timed window (the arm-lag tail), polling the abort
+			// signal the way real workers do.
+			for end := time.Now().Add(120 * time.Millisecond); time.Now().Before(end); {
+				if ctl.Aborted() {
+					mu.Lock()
+					abortedDuringRun = true
+					mu.Unlock()
+					return 0, errors.New("exposure aborted")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			return ctl.FrameBytes(), nil
+		},
+	}
+	f := &frameTransport{}
+	Register(ZWO.VID, 0x00D2, Model{Name: "WrkPoll", Sensor: &wrk})
+	c, err := Open(f, ZWO.VID, 0x00D2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetExposure(30 * time.Millisecond) // window elapses well before the worker finishes
+
+	if err := c.StartExposure(true); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.GetDataAfterExp(make([]byte, 64))
+		done <- err
+	}()
+	// Poll like an Alpaca ImageReady loop: after the window the DERIVED status is Success.
+	sawSuccess := false
+	for i := 0; i < 20; i++ {
+		if c.GetExpStatus() == ExpSuccess {
+			sawSuccess = true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	<-workerDone
+	if err := <-done; err != nil {
+		t.Errorf("worker exposure failed under status polling: %v", err)
+	}
+	mu.Lock()
+	if abortedDuringRun {
+		t.Error("status poll aborted the in-flight worker (GetExpStatus mutated status)")
+	}
+	mu.Unlock()
+	if !sawSuccess {
+		t.Error("GetExpStatus never derived SUCCESS after the host-timed window")
 	}
 }

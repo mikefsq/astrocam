@@ -54,7 +54,7 @@ import (
 //	SetGain            (code = 4095·(1−10^(−gain/200)) → 0x2e/0x2f mirrored 0x30/0x31)
 //	SetExp             (>=1s wait+trigger mode, VMAX≈one frame, SHS=10; <1s free-run)
 //	the FPS-percent throttle (HMAX + SetFPGAHMAX — line time is throttle-derived)
-//	the capture worker (sensor stream gate: master 0x19e = 5 stream / 0 stop)
+//	the capture worker (sensor stream gate: master 0x19e = 1 start / 5 stop)
 //	reglist_init       (36 reg/val16 entries)
 const (
 	// SetGain — analog gain code (16-bit) written low/high to 0x2e/0x2f
@@ -229,15 +229,35 @@ var IMX455 = Sensor{
 	SetOffset:   imx455SetOffset,
 	OffsetCaps:  imx455OffsetCaps,
 	SetROI:      imx455SetROI,
-	StreamStop:  func(rm Regmap) error { return rm.WriteReg(imx455RegMaster, 0) }, // 0x19e = 0
-	StreamStart: func(rm Regmap) error { return rm.WriteReg(imx455RegMaster, 5) }, // 0x19e = 5
+	// Master/stream gate per the 6200 objects (0073 MM / 0074 MC agree): 0x19e = 1 START,
+	// 5 STOP — the previous values here (stop=0 / start=5) were inverted, and 0 is a value
+	// the object never writes. StopSensorStreaming = 0x19e←5 + CamSetStandby(1) (reg0 bit0);
+	// StartSensorStreaming = 0x19e←1 + CamSetWakeup(1) (reg0 bit2) + 10 ms + CamSetStandby(0).
+	// The capture worker's inline arm always had the correct sequence; only this profile
+	// pair (used by StopExposure and the StartVideo arm) was wrong.
+	StreamStop: func(rm Regmap) error {
+		if err := rm.WriteReg(imx455RegMaster, 5); err != nil { // 0x19e = 5 (stop)
+			return err
+		}
+		return rm.WriteRegBits(0, 0, 0, 1) // CamSetStandby(1): sensor reg0 bit0 = 1
+	},
+	StreamStart: func(rm Regmap) error {
+		if err := rm.WriteReg(imx455RegMaster, 1); err != nil { // 0x19e = 1 (start)
+			return err
+		}
+		if err := rm.WriteRegBits(0, 2, 2, 1); err != nil { // CamSetWakeup(1): reg0 bit2 = 1
+			return err
+		}
+		time.Sleep(10 * time.Millisecond)  // usleep(0x2710)
+		return rm.WriteRegBits(0, 0, 0, 0) // CamSetStandby(0): reg0 bit0 = 0
+	},
 	Worker:      imx455Worker,                                                     // rich arm + windowed stream read
 
 	FX3DMAMarkers: true, // FX3 brackets each frame with 0x5A7E/0x3CF0 marker words (HW-confirmed)
 }
 
 // imx455Worker is the host-timed single-shot capture. Same skeleton as the IMX174/290,
-// but the sensor gate is the 0x19e master register (5 = stream, 0 = stop) and the settle
+// but the sensor gate is the 0x19e master register (1 = start, 5 = stop) and the settle
 // is 10 ms. For the long bands SetExp arms trigger MODE (EnableFPGATriggerMode); this
 // worker drives the trigger SIGNAL (EnableFPGATriggerSignal, FPGA reg 0x0b bit0) whose
 // 1->0 edge releases the frame.
@@ -282,7 +302,7 @@ func imx455Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := fpgaStop(); err != nil {
 		return 0, err
 	}
-	if err := rm.WriteReg(imx455RegMaster, 5); err != nil { // master stream on
+	if err := rm.WriteReg(imx455RegMaster, 5); err != nil { // master stop (StopSensorStreaming value)
 		return 0, err
 	}
 	if err := regRMW(0x01, 0); err != nil { // sensor reg0 |= 1
@@ -307,6 +327,17 @@ func imx455Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := fpgaStart(); err != nil {
 		return 0, err
 	}
+	// Halt the readout on EVERY return — the 6200 object's WorkingFunc exit:
+	// StopSensorStreaming (FPGAStop → 0x19e←5 → CamSetStandby(1), per 0074_CCameraS6200MC_Pro.o)
+	// then SendCMD(0xAA) then ResetEndPoint. A sensor left free-running with no reader backs
+	// up the FX3 GPIF. Best-effort: a failed stop must not fail a good frame.
+	defer func() {
+		_ = fpgaStop()
+		_ = rm.WriteReg(imx455RegMaster, 5) // master stop
+		_ = regRMW(0x01, 0)                 // CamSetStandby(1): sensor reg0 bit0 = 1
+		_ = ctl.VendorCmd(0xAA)
+		_ = ctl.ResetEndpoint()
+	}()
 	_ = ctl.ResetEndpoint() // ResetEndPoint(0x81)
 
 	// >= 1 s runs in FPGA wait+trigger mode (SetExposure set reg0 bit6/bit7 and held VMAX
@@ -319,7 +350,12 @@ func imx455Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		}
 		for start := time.Now(); time.Since(start) < exposure; {
 			if ctl.Aborted() {
-				return 0, errExposureAborted // StopExposure ran: bail instead of waiting out the integration
+				// StopExposure ran: bail, dropping the trigger signal on the way out —
+				// left asserted, the next triggerSignal(true) is a no-edge write and the
+				// FPGA never gates the integration. (Host-side hygiene, not object-derived:
+				// the SDK snap thread never host-aborts mid-integration.)
+				_ = triggerSignal(false)
+				return 0, errExposureAborted
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -335,8 +371,15 @@ func imx455Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	}
 	// idle must cover the wait for the first chunk (the sensor integrates then reads
 	// out, so first data can take ~one frame period); once flowing, chunks are ms apart.
+	// In the >= 1 s trigger band the integration has ALREADY completed above (host-timed
+	// trigger hold), so the read only spans the readout — exposure-scaled timeouts there
+	// made a stalled readout after a long sub block StopExposure for up to 2·exp+5 s.
 	idle := exposure + 2*time.Second
 	total := 2*exposure + 5*time.Second
+	if exposure >= imx455ExpTrigUs*time.Microsecond {
+		idle = 2 * time.Second
+		total = 15 * time.Second // full-frame readout ceiling incl. USB2 + retries
+	}
 	// The FX3 commits whole 1-MiB DMA buffers and HOLDS the frame's final partial buffer
 	// until it is filled or committed; pulse FPGABufReload throughout the read so that
 	// partial commits and the frame's tail (the bytes past the last 1-MiB boundary)

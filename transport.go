@@ -36,26 +36,6 @@ type Transport interface {
 	Close() error
 }
 
-// Stream is a high-throughput bulk-IN read: the backend keeps a pool of buffers
-// submitted and resubmitted on EP 0x81, delivering completed chunks in order. The
-// async pump reaches USB3 line rate, which a one-shot BulkRead per frame cannot.
-type Stream interface {
-	// Next returns the next completed chunk; its length may be < bufSize on the
-	// final short packet (the FX3 frame-end delimiter). The slice is valid until
-	// the following Next call.
-	Next(timeout time.Duration) ([]byte, error)
-	Close() error
-}
-
-// BulkStreamer is an optional Transport capability. A backend that implements the
-// async streaming pump (usbfs URBs / WinUSB overlapped / IOUSBHost async pipe)
-// satisfies it; the data plane uses it when present and falls back to BulkRead.
-type BulkStreamer interface {
-	// BulkStream opens a streaming read with nBuffers buffers of bufSize bytes
-	// kept cycling on the bulk-IN endpoint.
-	BulkStream(bufSize, nBuffers int) (Stream, error)
-}
-
 // FrameStreamer is an optional Transport capability: read one whole frame with a
 // window of transfers kept cycling on EP 0x81, copied contiguously so a short packet
 // at a burst boundary can't leave a gap. Needed for large USB3 frames (IMX455/571)

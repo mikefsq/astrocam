@@ -179,24 +179,44 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	// EnableFPGATriggerSignal (reg 0x0b bit0): only the ≥1 s trigger band uses it. In normal mode
 	// the sensor free-runs (SHS-timed) and the FPGA just starts and reads one frame.
 	trigger := func(on bool) error { return SetFPGABit(rm, 0x0b, 0x01, on) }
+	// integrate runs one full trigger cycle: the signal hold IS the integration, so hold for the
+	// FULL exposure (not exp−200 ms — that under-integrates the exactly-1 s boundary by 200 ms),
+	// polling the abort flag. Used on the first arm and again after a ResetDevice re-arm (the
+	// re-armed FPGA is back in wait mode; without a fresh trigger edge no frame ever comes).
+	integrate := func() error {
+		if err := trigger(true); err != nil {
+			return err
+		}
+		for start := time.Now(); time.Since(start) < exposure; {
+			if ctl.Aborted() {
+				// StopExposure ran: bail instead of waiting out the integration. Drop the
+				// trigger signal on the way out — left asserted, the next long exposure's
+				// trigger(true) is a no-edge write and the FPGA never gates it.
+				_ = trigger(false)
+				return errExposureAborted
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		return trigger(false)
+	}
 
 	if err := arm(true); err != nil {
 		return 0, err
 	}
+	// Halt the readout on EVERY return — the SDK WorkingFunc exit: StopSensorStreaming
+	// (FPGAStop + standby=1, per the 462 object) then SendCMD(0xAA) then ResetEndPoint. A
+	// sensor left free-running with no reader backs up the FX3 GPIF until the firmware
+	// crashes (the documented 174 mechanism). Best-effort: on the error paths the device
+	// may already be gone, and a failed stop must not fail a good frame.
+	defer func() {
+		_ = SetFPGABit(rm, 0x00, 0x10, true) // FPGAStop: reg0 bit4
+		_ = rm.WriteReg(imx462RegStandby, 1) // standby (sensor stop)
+		_ = ctl.VendorCmd(0xAA)
+		_ = ctl.ResetEndpoint()
+	}()
 	_ = ctl.ResetEndpoint()
 	if longExp {
-		// Trigger mode (≥1 s): the trigger-signal hold IS the integration, so wait the FULL
-		// exposure (not exp−200 ms — that under-integrates the exactly-1 s boundary by 200 ms).
-		if err := trigger(true); err != nil {
-			return 0, err
-		}
-		for start := time.Now(); time.Since(start) < exposure; {
-			if ctl.Aborted() {
-				return 0, errExposureAborted // StopExposure ran: bail instead of waiting out the integration
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		if err := trigger(false); err != nil {
+		if err := integrate(); err != nil {
 			return 0, err
 		}
 	}
@@ -227,7 +247,10 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		if err != nil {
 			return n, err
 		}
-		if n >= target-512 {
+		// Complete = exact byte count, or (SDK startAsyncXfer tolerance) EXACTLY 512 short —
+		// `n >= target-512` would let a small-ROI frame (target <= 512) accept n=0 and
+		// fabricate an all-zero "frame".
+		if n >= target || (target > 512 && n == target-512) {
 			for i := n; i < target; i++ {
 				buf[i] = 0
 			}
@@ -252,6 +275,17 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 					return 0, err
 				}
 				_ = ctl.ResetEndpoint()
+				if longExp {
+					// The re-arm put the FPGA back in wait mode (bit6 kept), so the recovery
+					// must re-run the trigger cycle — without it the reads below wait ~10 s
+					// for a frame that can never arrive. Costs a full re-integration, as the
+					// SDK's re-entered WorkingFunc does. Fresh integration ⇒ fresh buffer, so
+					// the reg 0x23 reload budget resets too.
+					if err := integrate(); err != nil {
+						return 0, err
+					}
+					reloads = 0
+				}
 				zeros = 0
 				continue
 			}
@@ -324,31 +358,27 @@ func imx462SetGain(rm Regmap, gain int) error {
 		gain = 0
 	}
 	code, hcg := SonyAnalogGain(gain, imx462GainHCGAt)
-	if err := rm.WriteReg(imx462RegLatch, 1); err != nil {
-		return err
-	}
-	mode, err := rm.ReadReg(imx462RegGainMode)
-	if err != nil {
-		return err
-	}
-	if hcg {
-		mode |= 0x10
-	} else {
-		mode &= 0x0f
-	}
-	// FRSEL (0x3009 bit0) is the pixel-clock / frame-rate select — 1 = 12-bit normal,
-	// 0 = 10-bit high-speed (doubles the sensor readout clock to 37124). The reglist leaves
-	// it 1; high-speed mode clears it (SDK high-speed ends on 0x3009=0x10 vs normal 0x11).
-	if ModeOf(rm).HighSpeed {
-		mode &^= 0x01
-	}
-	if err := rm.WriteReg(imx462RegGainMode, mode); err != nil {
-		return err
-	}
-	if err := rm.WriteReg(imx462RegGainCode, code&0xff); err != nil {
-		return err
-	}
-	return rm.WriteReg(imx462RegLatch, 0)
+	return WithLatch(rm, imx462RegLatch, func() error {
+		mode, err := rm.ReadReg(imx462RegGainMode)
+		if err != nil {
+			return err
+		}
+		if hcg {
+			mode |= 0x10
+		} else {
+			mode &= 0x0f
+		}
+		// FRSEL (0x3009 bit0) is the pixel-clock / frame-rate select — 1 = 12-bit normal,
+		// 0 = 10-bit high-speed (doubles the sensor readout clock to 37124). The reglist leaves
+		// it 1; high-speed mode clears it (SDK high-speed ends on 0x3009=0x10 vs normal 0x11).
+		if ModeOf(rm).HighSpeed {
+			mode &^= 0x01
+		}
+		if err := rm.WriteReg(imx462RegGainMode, mode); err != nil {
+			return err
+		}
+		return rm.WriteReg(imx462RegGainCode, code&0xff)
+	})
 }
 
 var imx462Shutter = ShutterModel{
@@ -396,7 +426,7 @@ func imx462SetExposure(rm Regmap, d time.Duration) error {
 	// budget); on USB3 the 1100 floor does. Written before the SHS math so the FPGA line rate
 	// and SHS agree (lineTimeNs derives the same).
 	hw, hh := imx462FullWidth, imx462FullHeight
-	if rd := ModeOf(rm); rd.Width > 0 {
+	if rd := ModeOf(rm); rd.Width > 0 && rd.Height > 0 { // both dims, or a zero Height collapses the candidate
 		hw, hh = rd.Width, rd.Height
 	}
 	clk, floor := imx462ClockFloor(rm)
@@ -441,18 +471,17 @@ func imx462SetROI(rm Regmap, x, y, w, h, bin int) error {
 		mode = 0x22
 	}
 
-	if err := rm.WriteReg(imx462RegLatch, 1); err != nil {
-		return err
-	}
-	for _, rv := range []RegVal{
-		{Reg: imx462RegStartXL, Val: ux & 0xff}, {Reg: imx462RegStartXH, Val: (ux >> 8) & 0xff},
-		{Reg: imx462RegStartYL, Val: uy & 0xff}, {Reg: imx462RegStartYH, Val: (uy >> 8) & 0xff},
-	} {
-		if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
-			return err
+	if err := WithLatch(rm, imx462RegLatch, func() error {
+		for _, rv := range []RegVal{
+			{Reg: imx462RegStartXL, Val: ux & 0xff}, {Reg: imx462RegStartXH, Val: (ux >> 8) & 0xff},
+			{Reg: imx462RegStartYL, Val: uy & 0xff}, {Reg: imx462RegStartYH, Val: (uy >> 8) & 0xff},
+		} {
+			if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
+				return err
+			}
 		}
-	}
-	if err := rm.WriteReg(imx462RegLatch, 0); err != nil {
+		return nil
+	}); err != nil {
 		return err
 	}
 

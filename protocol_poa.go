@@ -1,6 +1,9 @@
 package astrocam
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 // PlayerOne control-transfer opcodes. Same FX3 bridge as ZWO, different host dialect.
 // Argument order is the OPPOSITE of ZWO's: PlayerOne puts the VALUE in wValue and the
@@ -34,16 +37,26 @@ var poaProtectedRegs = map[uint16]bool{0x67f: true}
 type poaRegmap struct {
 	t         Transport
 	bus       RegBus // PlayerOne's Sony dies all use the ImgSen path; kept for interface parity
+	modeMu    sync.RWMutex
 	mode      ReadoutMode
 	protected map[uint16]bool
 }
 
 // ReadoutMode implements modeReader: returns the live runtime context the Camera set.
-func (r *poaRegmap) ReadoutMode() ReadoutMode { return r.mode }
+// Guarded: capture goroutines read it while camera methods mutate via updateMode.
+func (r *poaRegmap) ReadoutMode() ReadoutMode {
+	r.modeMu.RLock()
+	defer r.modeMu.RUnlock()
+	return r.mode
+}
 
-// liveMode implements modeCarrier: lets the Camera mutate the live ReadoutMode (FPS%,
-// output depth, bin).
-func (r *poaRegmap) liveMode() *ReadoutMode { return &r.mode }
+// updateMode implements modeCarrier: the Camera mutates the live ReadoutMode (FPS%,
+// output depth, bin) under the mode lock.
+func (r *poaRegmap) updateMode(f func(*ReadoutMode)) {
+	r.modeMu.Lock()
+	defer r.modeMu.Unlock()
+	f(&r.mode)
+}
 
 // VID reports the PlayerOne vendor id (selects the PlayerOne gain/offset encoding).
 func (r *poaRegmap) VID() uint16 { return POA.VID }
@@ -61,8 +74,12 @@ func (r *poaRegmap) WriteReg(reg, val uint16) error {
 // ReadReg reads a sensor register (8-bit; reg in wIndex, wValue 0).
 func (r *poaRegmap) ReadReg(reg uint16) (uint16, error) {
 	buf := make([]byte, 1)
-	if _, err := r.t.ControlIn(poaReqImgSenRead, 0, reg, buf); err != nil {
+	got, err := r.t.ControlIn(poaReqImgSenRead, 0, reg, buf)
+	if err != nil {
 		return 0, fmt.Errorf("read reg 0x%x: %w", reg, err)
+	}
+	if got < 1 {
+		return 0, fmt.Errorf("read reg 0x%x: empty control-IN", reg)
 	}
 	return uint16(buf[0]), nil
 }
@@ -79,7 +96,9 @@ func (r *poaRegmap) WriteRegBits(reg uint16, lo, hi uint8, val uint16) error {
 }
 
 // WriteFPGAReg writes a camera-FPGA register (Fx3FpgaWrite 0xC0; reg in wIndex, value in
-// wValue). Carries an 8-bit value (the low byte): FPGA regs are byte-wide.
+// wValue). val is transmitted as given — FPGA regs are byte-wide and every in-tree caller
+// pre-masks to the low byte (same convention as the ZWO dialect); what an over-byte wValue
+// does on the POA wire is unverified.
 func (r *poaRegmap) WriteFPGAReg(reg, val uint16) error {
 	return r.t.ControlOut(poaReqFpgaWrite, val, reg, nil)
 }
@@ -87,8 +106,12 @@ func (r *poaRegmap) WriteFPGAReg(reg, val uint16) error {
 // ReadFPGAReg reads a camera-FPGA register (Fx3FpgaRead 0xC2).
 func (r *poaRegmap) ReadFPGAReg(reg uint16) (uint16, error) {
 	buf := make([]byte, 1)
-	if _, err := r.t.ControlIn(poaReqFpgaRead, 0, reg, buf); err != nil {
+	got, err := r.t.ControlIn(poaReqFpgaRead, 0, reg, buf)
+	if err != nil {
 		return 0, fmt.Errorf("read FPGA reg 0x%x: %w", reg, err)
+	}
+	if got < 1 {
+		return 0, fmt.Errorf("read FPGA reg 0x%x: empty control-IN", reg)
 	}
 	return uint16(buf[0]), nil
 }

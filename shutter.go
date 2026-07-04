@@ -63,10 +63,11 @@ func (m ShutterModel) lineTimeNs(rm Regmap) uint64 {
 		return lt
 	}
 	// Use the live ROI dimensions (set by SetROI) so the SHS line time matches the ROI HMAX;
-	// fall back to the full-frame defaults.
+	// fall back to the full-frame defaults. Both dims must be set — taking a Width with a zero
+	// Height would collapse the bandwidth candidate (and ApplyExposure keys on Height alone).
 	w, h := int(m.DefaultWidth), int(m.DefaultHeight)
 	clock, floor := m.Clock, m.FloorHMAX
-	if rd := ModeOf(rm); rd.Width > 0 {
+	if rd := ModeOf(rm); rd.Width > 0 && rd.Height > 0 {
 		w, h = rd.Width, rd.Height
 	}
 	if ModeOf(rm).HighSpeed && m.HighSpeedClock != 0 { // 10-bit high-speed: faster clock + lower floor
@@ -116,13 +117,14 @@ func (m ShutterModel) Shutter(d time.Duration) (vmax, shs uint32) {
 		lt = 1
 	}
 	lines := us * 1000 / lt // exposure(ns) / lineTime(ns)
-	vmax = m.DefaultVMAX
-	if uint64(vmax) < lines+uint64(m.SHSOffset)+1 {
-		vmax = uint32(lines + uint64(m.SHSOffset) + 1)
+	v := uint64(m.DefaultVMAX)
+	if v < lines+uint64(m.SHSOffset)+1 {
+		v = lines + uint64(m.SHSOffset) + 1
 	}
-	if vmax > 0xffffff {
-		vmax = 0xffffff
+	if v > 0xffffff { // clamp BEFORE narrowing — uint32(lines+…) first would wrap, not saturate
+		v = 0xffffff
 	}
+	vmax = uint32(v)
 	s := int64(vmax) + int64(m.SHSOffset) - int64(lines)
 	if s < 1 {
 		s = 1
@@ -146,46 +148,43 @@ func ExposureLines(d time.Duration, lineTimeNs, minUs, maxUs uint64) uint64 {
 	return us * 1000 / lineTimeNs
 }
 
-// WriteRegLE writes val little-endian across regs (regs[0]=low byte) through the sensor
-// register space, optionally bracketed by latchReg (0 = no latch).
-func WriteRegLE(rm Regmap, latchReg uint16, regs []uint16, val uint32) error {
-	if latchReg != 0 {
-		if err := rm.WriteReg(latchReg, 1); err != nil {
-			return err
-		}
-	}
-	for i, r := range regs {
-		if err := rm.WriteReg(r, uint16(val>>(8*uint(i)))&0xff); err != nil {
-			return err
-		}
-	}
-	if latchReg != 0 {
-		return rm.WriteReg(latchReg, 0)
-	}
-	return nil
-}
-
-// RollingExposure is the shared body for rolling-shutter sensors whose shutter is
-// SHS = VMAX + offset - exposureLines, with VMAX (frame length) programmed into the camera
-// FPGA. shsRegs are written little-endian (low byte first), bracketed by latchReg (0 = none).
-func RollingExposure(rm Regmap, d time.Duration, lineTimeNs, defaultVMAX uint64, offset int64, minUs, maxUs uint64, latchReg uint16, shsRegs ...uint16) error {
-	lines := ExposureLines(d, lineTimeNs, minUs, maxUs)
-	o := uint64(0)
-	if offset > 0 {
-		o = uint64(offset)
-	}
-	vmax := defaultVMAX
-	if lines+o+1 > vmax {
-		vmax = lines + o + 1
-	}
-	if err := SetVMAX(rm, uint32(vmax)); err != nil {
+// WithLatch runs fn with the sensor's coupled-group latch held (latchReg=1), releasing it
+// (latchReg=0) even when fn errors — a held latch freezes every later grouped-register
+// update, so error paths must drop it too. The first error wins. The shared bracket for
+// every profile's latched register group (gain, ROI, exposure).
+func WithLatch(rm Regmap, latchReg uint16, fn func() error) (err error) {
+	if err = rm.WriteReg(latchReg, 1); err != nil {
 		return err
 	}
-	shs := int64(vmax) + offset - int64(lines)
-	if shs < 1 {
-		shs = 1
+	defer func() {
+		if rerr := rm.WriteReg(latchReg, 0); err == nil {
+			err = rerr
+		}
+	}()
+	return fn()
+}
+
+// WriteRegLE writes val little-endian across regs (regs[0]=low byte) through the sensor
+// register space, optionally bracketed by latchReg (0 = no latch). The latch is released
+// even when a data write errors (a held latch freezes every later grouped-register update);
+// the first error wins.
+func WriteRegLE(rm Regmap, latchReg uint16, regs []uint16, val uint32) (err error) {
+	if latchReg != 0 {
+		if err = rm.WriteReg(latchReg, 1); err != nil {
+			return err
+		}
+		defer func() {
+			if rerr := rm.WriteReg(latchReg, 0); err == nil {
+				err = rerr
+			}
+		}()
 	}
-	return WriteRegLE(rm, latchReg, shsRegs, uint32(shs))
+	for i, r := range regs {
+		if err = rm.WriteReg(r, uint16(val>>(8*uint(i)))&0xff); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ApplyExposure programs a requested exposure: VMAX into the FPGA (SetVMAX) then the 24-bit
@@ -213,22 +212,6 @@ func ApplyExposure(rm Regmap, m ShutterModel, latchReg uint16, d time.Duration) 
 	if err := SetVMAX(rm, vmax); err != nil {
 		return err
 	}
-	if latchReg != 0 {
-		if err := rm.WriteReg(latchReg, 1); err != nil {
-			return err
-		}
-	}
-	for _, w := range []RegVal{
-		{Reg: m.SHS0, Val: uint16(shs) & 0xff},
-		{Reg: m.SHS1, Val: uint16(shs>>8) & 0xff},
-		{Reg: m.SHS2, Val: uint16(shs>>16) & 0xff},
-	} {
-		if err := rm.WriteReg(w.Reg, w.Val); err != nil {
-			return err
-		}
-	}
-	if latchReg != 0 {
-		return rm.WriteReg(latchReg, 0)
-	}
-	return nil
+	// SHS bytes via the shared latch-bracketed writer, so an errored write still drops the latch.
+	return WriteRegLE(rm, latchReg, []uint16{m.SHS0, m.SHS1, m.SHS2}, shs)
 }

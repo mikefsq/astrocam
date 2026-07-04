@@ -94,7 +94,7 @@ type WorkerCtl interface {
 	Rm() Regmap                                              // sensor + FPGA register R/W
 	VendorCmd(cmd uint8) error                               // FX3 vendor cmd (0xAA/0xA9/0xAF)
 	ResetEndpoint() error                                    // clear the bulk-IN pipe (EP 0x81)
-	ResetDevice() error                                      // USB device reset (last-resort wedge recovery; no-op on backends without it)
+	ResetDevice() error                                      // USB device reset (last-resort wedge recovery; errors on backends without it)
 	NoteStall()                                              // record one readout stall for the soak diagnostic (Camera.StallCount)
 	Aborted() bool                                           // StopExposure was called: a host-timed integration loop should bail out
 	BulkRead(buf []byte, timeout time.Duration) (int, error) // whole-frame bulk read
@@ -103,7 +103,7 @@ type WorkerCtl interface {
 	// until len(buf) bytes are in, gap-free across short packets (what a large IMX455/IMX571 frame
 	// needs and a one-shot BulkRead can't do). idle bounds a per-completion stall (returns short so
 	// the worker can re-kick the FPGA and continue into buf[n:]); total bounds the whole read.
-	// Falls back to BulkStreamer / BulkRead on backends without it.
+	// Falls back to BulkRead on backends without it.
 	StreamFrame(buf []byte, idle, total time.Duration) (int, error)
 	// StreamFramePrequeued reads one frame with a pre-queued URB batch covering it exactly (the
 	// SDK's async-transfer model): the transfers wait on the pipe before the frame arrives, so

@@ -175,19 +175,18 @@ func imx585SetGain(rm Regmap, gain int) error {
 		eff = gain - imx585HCGSub
 	}
 	code := uint16(eff / 3)
-	if err := rm.WriteReg(imx585RegLatch, 1); err != nil {
-		return err
-	}
-	for _, rv := range []RegVal{
-		{Reg: imx585RegConvGain, Val: conv},
-		{Reg: imx585RegGainL, Val: code & 0xff},
-		{Reg: imx585RegGainH, Val: (code >> 8) & 0xff},
-	} {
-		if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
-			return err
+	return WithLatch(rm, imx585RegLatch, func() error {
+		for _, rv := range []RegVal{
+			{Reg: imx585RegConvGain, Val: conv},
+			{Reg: imx585RegGainL, Val: code & 0xff},
+			{Reg: imx585RegGainH, Val: (code >> 8) & 0xff},
+		} {
+			if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
+				return err
+			}
 		}
-	}
-	return rm.WriteReg(imx585RegLatch, 0)
+		return nil
+	})
 }
 
 // imx585SetExposure — STARVIS-2 rolling shutter: line_time = HMAX·1000/clock (HMAX baked at 192),
@@ -241,17 +240,7 @@ func imx585SetExposure(rm Regmap, d time.Duration) error {
 // imx585SetOffset — SetBrightness: offset 16-bit LE to 0x30dc (low) / 0x30dd (high), bracketed by
 // the 0x3001 latch.
 func imx585SetOffset(rm Regmap, offset int) error {
-	v := uint16(offset)
-	if err := rm.WriteReg(imx585RegLatch, 1); err != nil {
-		return err
-	}
-	if err := rm.WriteReg(imx585RegOffsetL, v&0xff); err != nil {
-		return err
-	}
-	if err := rm.WriteReg(imx585RegOffsetH, (v>>8)&0xff); err != nil {
-		return err
-	}
-	return rm.WriteReg(imx585RegLatch, 0)
+	return WriteRegLE(rm, imx585RegLatch, []uint16{imx585RegOffsetL, imx585RegOffsetH}, uint32(uint16(offset)))
 }
 
 // imx585SetROI — SetStartPos (0x3018=0x14; ROI X→0x303c/3d align 2, Y→0x3044/45 align 4) +
@@ -277,20 +266,19 @@ func imx585SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if err := rm.WriteReg(imx585RegWinMode, 0x14); err != nil {
 		return err
 	}
-	if err := rm.WriteReg(imx585RegLatch, 1); err != nil {
-		return err
-	}
-	for _, rv := range []RegVal{
-		{Reg: imx585RegStartXL, Val: ux & 0xff}, {Reg: imx585RegStartXH, Val: (ux >> 8) & 0xff},
-		{Reg: imx585RegStartYL, Val: uy & 0xff}, {Reg: imx585RegStartYH, Val: (uy >> 8) & 0xff},
-		{Reg: imx585RegWidthL, Val: uw & 0xff}, {Reg: imx585RegWidthH, Val: (uw >> 8) & 0xff},
-		{Reg: imx585RegHeightL, Val: uh & 0xff}, {Reg: imx585RegHeightH, Val: (uh >> 8) & 0xff},
-	} {
-		if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
-			return err
+	if err := WithLatch(rm, imx585RegLatch, func() error {
+		for _, rv := range []RegVal{
+			{Reg: imx585RegStartXL, Val: ux & 0xff}, {Reg: imx585RegStartXH, Val: (ux >> 8) & 0xff},
+			{Reg: imx585RegStartYL, Val: uy & 0xff}, {Reg: imx585RegStartYH, Val: (uy >> 8) & 0xff},
+			{Reg: imx585RegWidthL, Val: uw & 0xff}, {Reg: imx585RegWidthH, Val: (uw >> 8) & 0xff},
+			{Reg: imx585RegHeightL, Val: uh & 0xff}, {Reg: imx585RegHeightH, Val: (uh >> 8) & 0xff},
+		} {
+			if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
+				return err
+			}
 		}
-	}
-	if err := rm.WriteReg(imx585RegLatch, 0); err != nil {
+		return nil
+	}); err != nil {
 		return err
 	}
 
@@ -372,6 +360,17 @@ func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := SetFPGABit(rm, 0x00, 0x10, false); err != nil { // FPGAStart
 		return 0, err
 	}
+	// Halt the readout on EVERY return — the 585 object's WorkingFunc exit:
+	// StopSensorStreaming (FPGAStop + standby 0x3000=1, per 0104_CCameraS585MC.o) then
+	// SendCMD(0xAA) then ResetEndPoint. A sensor left free-running with no reader backs up
+	// the FX3 GPIF. Best-effort. VERIFY-HW: ported from the object; no 585 on the bench at
+	// port time.
+	defer func() {
+		_ = SetFPGABit(rm, 0x00, 0x10, true) // FPGAStop: reg0 bit4
+		_ = rm.WriteReg(imx585RegStandby, 1) // standby (sensor stop)
+		_ = ctl.VendorCmd(0xAA)
+		_ = ctl.ResetEndpoint()
+	}()
 	_ = ctl.ResetEndpoint()
 
 	open := func(on bool) error {
@@ -389,14 +388,23 @@ func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := open(true); err != nil {
 		return 0, err
 	}
-	if exposure <= time.Second {
+	// Band split must match imx585SetExposure's trigger threshold (>= 1 s, EXACT): at exactly
+	// 1 s the FPGA is in trigger mode and the host hold IS the integration, so it gets the
+	// full-exposure wait — `<=` here under-integrated a 1.000 s exposure by 200 ms.
+	if exposure < time.Second {
 		if w := exposure - 200*time.Millisecond; w > 0 {
 			time.Sleep(w)
 		}
 	} else {
 		for start := time.Now(); time.Since(start) < exposure; {
 			if ctl.Aborted() {
-				return 0, errExposureAborted // StopExposure ran: bail instead of waiting out the integration
+				// StopExposure ran: bail, dropping the trigger window on the way out —
+				// open(false) clears BOTH XHSStop (reg 0x0a bit4) and the trigger signal
+				// (reg 0x0b bit0); left asserted, the next open(true) is a no-edge write.
+				// (Host-side hygiene, not object-derived: the SDK snap thread never
+				// host-aborts mid-integration.)
+				_ = open(false)
+				return 0, errExposureAborted
 			}
 			time.Sleep(100 * time.Millisecond)
 		}

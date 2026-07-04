@@ -36,11 +36,6 @@ const (
 	bulkEndpoint   = 0x81 // bulk-IN endpoint
 )
 
-// bulkChunkBytes is the async-pump transfer size (1 MiB); a var only so tests can shrink it.
-var bulkChunkBytes = 1 << 20 // xferLen 0x100000
-
-const bulkBudgetBytes = 0xC800000 // 200 MB in-flight budget
-
 // pidNeedsCapBit reports whether the PID-gated FPGA reg-0x45 capture bit applies.
 func pidNeedsCapBit(pid uint16) bool { return pid == 0x461e || pid == 0x411e }
 
@@ -77,13 +72,15 @@ func (c *Camera) ResetEndpoint() error {
 	return nil
 }
 
-// ResetDevice performs a whole-device USB reset when the backend supports it (no-op otherwise);
-// the worker's last-resort recovery for a wedged readout.
+// ResetDevice performs a whole-device USB reset — the worker's last-resort recovery for a
+// wedged readout. On a backend without DeviceResetter (WinUSB exposes no device-level
+// reset) it returns an error rather than silently pretending the reset happened, so a
+// recovery ladder's last rung fails loud instead of looping on a still-wedged device.
 func (c *Camera) ResetDevice() error {
 	if r, ok := c.t.(DeviceResetter); ok {
 		return r.ResetDevice()
 	}
-	return nil
+	return fmt.Errorf("asicam: transport has no device reset (recovery rung unavailable)")
 }
 
 // BulkRead reads from the bulk-IN endpoint with the given timeout.
@@ -96,36 +93,11 @@ func (c *Camera) NoteStall() { c.stalls.Add(1) }
 func (c *Camera) StallCount() int64 { return c.stalls.Load() }
 
 // StreamFrame reads one frame via the continuous windowed pump when the backend provides it,
-// else the BulkStreamer window, else a single BulkRead. The windowed pump reliably pulls a
-// large USB3 frame without truncating at a burst boundary.
+// else a single BulkRead. The windowed pump reliably pulls a large USB3 frame without
+// truncating at a burst boundary.
 func (c *Camera) StreamFrame(buf []byte, idle, total time.Duration) (int, error) {
 	if fs, ok := c.t.(FrameStreamer); ok {
 		return fs.ReadFrameStream(buf, idle, total)
-	}
-	// BulkStreamer fallback: cycle a window of chunks, copy contiguously to buf, stop
-	// when buf is full or a chunk read stalls/ends short.
-	if s, ok := c.t.(BulkStreamer); ok {
-		n := (len(buf) + bulkChunkBytes - 1) / bulkChunkBytes
-		if max := bulkBudgetBytes / bulkChunkBytes; n > max {
-			n = max
-		}
-		st, err := s.BulkStream(bulkChunkBytes, n)
-		if err != nil {
-			return 0, fmt.Errorf("asicam: open bulk stream: %w", err)
-		}
-		defer st.Close()
-		got := 0
-		for got < len(buf) {
-			b, err := st.Next(idle)
-			if err != nil {
-				return got, nil // stall/timeout: let the worker recover and continue
-			}
-			got += copy(buf[got:], b)
-			if len(b) == 0 {
-				break
-			}
-		}
-		return got, nil
 	}
 	return c.t.BulkRead(buf, total)
 }
@@ -264,24 +236,30 @@ func (c *Camera) StartExposure(light bool) error {
 	if c.dead.Load() {
 		return ErrDeviceWedged // dead device — refuse new frames until reset+re-Open
 	}
+	// Claim the exposure atomically: the busy check and the Working transition happen in ONE
+	// critical section (check-then-act across an unlock let two StartExposure calls double-arm).
+	// Claiming also bumps the generation and clears the abort flag, superseding any stale
+	// capture still unwinding — its generation-guarded writes become no-ops.
 	c.mu.Lock()
-	busy := c.status == ExpWorking
-	c.mu.Unlock()
-	if busy {
-		return nil // already capturing
+	if c.status == ExpWorking {
+		c.mu.Unlock()
+		return nil // already capturing (documented no-op; the new light flag is NOT applied)
 	}
-	// A sensor Worker arms, host-times, and reads inside GetDataAfterExp, so the worker path seeds
-	// state only. The non-worker path arms here, unlocked. Either way the state transition is the
-	// locked tail.
+	c.status = ExpWorking
+	c.expStart = nowFunc()
+	c.expGen++
+	gen := c.expGen
+	c.expAborted = false
+	c.expLight = light
+	c.mu.Unlock()
+	// A sensor Worker arms, host-times, and reads inside GetDataAfterExp, so the worker path
+	// seeds state only. The non-worker path arms here, unlocked.
 	if c.sensor.Worker == nil {
 		if err := c.arm(light); err != nil {
+			c.setStatusIfGen(gen, ExpIdle) // release the claim (unless superseded meanwhile)
 			return err
 		}
 	}
-	c.mu.Lock()
-	c.status = ExpWorking
-	c.expStart = nowFunc()
-	c.mu.Unlock()
 	return nil
 }
 
@@ -292,14 +270,44 @@ func (c *Camera) setStatus(s ExposureStatus) {
 	c.mu.Unlock()
 }
 
-// Aborted reports that the exposure is no longer in flight (StopExposure set ExpIdle). A
-// host-timed worker polls this so an abort cuts the integration short instead of waiting out
-// the full exposure.
+// setStatusIfGen stores the exposure status only if the exposure generation is still gen —
+// a stale capture (superseded by a newer StartExposure) must not clobber the new exposure's
+// state.
+func (c *Camera) setStatusIfGen(gen uint64, s ExposureStatus) {
+	c.mu.Lock()
+	if c.expGen == gen {
+		c.status = s
+	}
+	c.mu.Unlock()
+}
+
+// abortedGen reports whether the generation-gen exposure is aborted: StopExposure ran
+// (expAborted), or a newer StartExposure superseded it. Deliberately independent of status —
+// a poll deriving SUCCESS at window end must not read as an abort mid-integration.
+func (c *Camera) abortedGen(gen uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.expAborted || c.expGen != gen
+}
+
+// Aborted reports that the current exposure was aborted (StopExposure ran). A host-timed
+// worker polls this (via its generation-bound WorkerCtl) so an abort cuts the integration
+// short instead of waiting out the full exposure.
 func (c *Camera) Aborted() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.status != ExpWorking
+	return c.expAborted
 }
+
+// workerCtl is the WorkerCtl handed to a sensor Worker: the Camera plus the exposure
+// generation the worker belongs to, so Aborted() also fires when the worker was superseded
+// by a newer StartExposure (not just on an explicit StopExposure).
+type workerCtl struct {
+	*Camera
+	gen uint64
+}
+
+func (w workerCtl) Aborted() bool { return w.abortedGen(w.gen) }
 
 // expDuration returns the last-set exposure under the lock (used to size bulk read timeouts).
 func (c *Camera) expDuration() time.Duration {
@@ -368,6 +376,9 @@ func (c *Camera) StartVideo(light bool) error {
 	c.mu.Lock()
 	c.status = ExpWorking
 	c.expStart = nowFunc()
+	c.expGen++ // supersede any stale single-shot capture still unwinding
+	c.expAborted = false
+	c.expLight = light
 	c.mu.Unlock()
 	return nil
 }
@@ -387,12 +398,14 @@ var nowFunc = time.Now
 
 // GetExpStatus reports the snap exposure status: WORKING while the exposure is in flight,
 // SUCCESS once the host-timed window has elapsed (frame ready for readout). Poll until SUCCESS,
-// then call GetDataAfterExp.
+// then call GetDataAfterExp. The SUCCESS at window end is DERIVED, not stored: a getter that
+// mutated status turned every concurrent poll into an abort signal for the worker still
+// integrating (Aborted() used to key off status), killing long exposures at ~99%.
 func (c *Camera) GetExpStatus() ExposureStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.status == ExpWorking && nowFunc().Sub(c.expStart) >= c.expDur {
-		c.status = ExpSuccess
+		return ExpSuccess
 	}
 	return c.status
 }
@@ -460,10 +473,14 @@ func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 	if c.dead.Load() {
 		return 0, ErrDeviceWedged // already dead — don't issue reads that would hang
 	}
-	// Snapshot the state the read needs, then release the lock for the duration of the
-	// (multi-second) USB read so concurrent status polls / aborts aren't blocked.
+	// Snapshot the state the read needs — INCLUDING the exposure generation — then release the
+	// lock for the duration of the (multi-second) USB read so concurrent status polls / aborts
+	// aren't blocked. Every status write below is generation-guarded: if a StopExposure +
+	// StartExposure supersedes this capture mid-read, its writes become no-ops instead of
+	// clobbering the new exposure's state.
 	c.mu.Lock()
 	st := c.status
+	gen := c.expGen
 	worker := c.sensor.Worker
 	expDur := c.expDur
 	c.mu.Unlock()
@@ -473,18 +490,23 @@ func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 	// Per-sensor worker path: host-timed single-shot capture, doing the whole
 	// arm → expose → re-arm → fire → read itself.
 	if worker != nil {
-		n, err := worker(c, buf, expDur)
+		n, err := worker(workerCtl{c, gen}, buf, expDur)
 		if err != nil {
-			// status != ExpWorking ⇒ StopExposure ran: a clean abort, not a crash — don't probe.
-			aborted := c.Aborted()
-			c.setStatus(ExpFailed)
-			if !aborted && c.checkDead() {
+			// Clean abort (StopExposure ran, or a new StartExposure superseded us): leave the
+			// status alone — StopExposure already set Idle / the new exposure owns it — and
+			// don't probe the firmware (that control transfer would interleave with the new
+			// capture's readout).
+			if c.abortedGen(gen) {
+				return n, fmt.Errorf("asicam: capture worker: %w", err)
+			}
+			c.setStatusIfGen(gen, ExpFailed)
+			if c.checkDead() {
 				return n, ErrDeviceWedged
 			}
 			return n, fmt.Errorf("asicam: capture worker: %w", err)
 		}
 		if n < c.FrameBytes() {
-			c.setStatus(ExpFailed)
+			c.setStatusIfGen(gen, ExpFailed)
 			if c.checkDead() { // FX3 firmware crash? re-read firmware; if it changed, latch dead
 				return n, ErrDeviceWedged
 			}
@@ -493,15 +515,18 @@ func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 		if RepairDMAMarkers && c.sensor.FX3DMAMarkers {
 			repairFX3DMAMarkers(buf[:n], ModeOf(c.rm).BytesPerPx)
 		}
-		n = c.binFrame(buf, n) // RAW16 host-side bin (no-op unless SoftBin>1)
-		c.setStatus(ExpIdle)   // one-shot consume
+		n = c.binFrame(buf, n)         // RAW16 host-side bin (no-op unless SoftBin>1)
+		c.setStatusIfGen(gen, ExpIdle) // one-shot consume
 		return n, nil
 	}
 	var lastErr error
 	for attempt := 0; attempt < frameReadAttempts; attempt++ {
+		if c.abortedGen(gen) {
+			return 0, fmt.Errorf("asicam: exposure aborted")
+		}
 		if attempt > 0 {
 			// Recover the pipe and re-arm so the retry has a fresh frame to read.
-			if err := c.recoverAndRearm(attempt); err != nil {
+			if err := c.recoverAndRearm(attempt, gen); err != nil {
 				lastErr = fmt.Errorf("re-arm: %w", err)
 				continue
 			}
@@ -514,12 +539,12 @@ func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 			// Validate by size: a short read is a dropped/stalled frame.
 			lastErr = fmt.Errorf("short frame (%d of %d bytes)", n, c.FrameBytes())
 		default:
-			n = c.binFrame(buf, n) // RAW16 host-side bin (no-op unless SoftBin>1)
-			c.setStatus(ExpIdle)   // one-shot consume
+			n = c.binFrame(buf, n)         // RAW16 host-side bin (no-op unless SoftBin>1)
+			c.setStatusIfGen(gen, ExpIdle) // one-shot consume
 			return n, nil
 		}
 	}
-	c.setStatus(ExpFailed)
+	c.setStatusIfGen(gen, ExpFailed)
 	// Last resort: bus-reset so a wedged device is left clean. The reset wipes init state
 	// (this run is lost), but the next Open/Init starts fresh.
 	if r, ok := c.t.(DeviceResetter); ok {
@@ -530,21 +555,31 @@ func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 
 // recoverAndRearm escalates pipe recovery, then re-arms a fresh exposure for the next read
 // attempt. It does not bus-reset (that wipes init state); the bus reset is GetDataAfterExp's
-// final give-up action only.
-func (c *Camera) recoverAndRearm(attempt int) error {
+// final give-up action only. Generation-guarded: it refuses to resurrect an aborted or
+// superseded exposure, re-arms with the exposure's OWN light/dark flag (a hardcoded light
+// re-arm silently converted retried dark frames to lights), and never drops the status to
+// Idle mid-recovery (that opened a window for a concurrent StartExposure to double-arm).
+func (c *Camera) recoverAndRearm(attempt int, gen uint64) error {
+	if c.abortedGen(gen) {
+		return fmt.Errorf("exposure aborted")
+	}
 	if r, ok := c.t.(EndpointResetter); ok {
 		_ = r.ResetEndpoint(bulkEndpoint) // clear any stall / leftover data
 	}
 	if attempt >= 2 {
 		_ = c.vendorCmd(cmdFlush) // 0xAF: flush the FX3 pipeline
 	}
-	c.setStatus(ExpIdle) // clear the StartExposure busy-guard so the re-arm proceeds
-	if err := c.arm(true); err != nil {
+	c.mu.Lock()
+	light := c.expLight
+	c.mu.Unlock()
+	if err := c.arm(light); err != nil {
 		return err
 	}
 	c.mu.Lock()
-	c.expStart = nowFunc()
-	c.status = ExpWorking
+	if c.expGen == gen {
+		c.expStart = nowFunc()
+		c.status = ExpWorking
+	}
 	c.mu.Unlock()
 	return nil
 }
@@ -565,9 +600,8 @@ func (c *Camera) ReadFrame(buf []byte, reset bool) (int, error) {
 	return c.t.BulkRead(buf, to)
 }
 
-// readFrame fills buf with one frame, using the async streaming pump when the transport
-// supports it (assembling 1 MiB chunks until the frame size is reached or a short packet ends
-// it), else a single BulkRead.
+// readFrame fills buf with one whole-frame BulkRead; the backend supplies the transfer
+// concurrency that primes the FX3 GPIF.
 func (c *Camera) readFrame(buf []byte) (int, error) {
 	// Flush the bulk pipe so the read starts at a fresh frame boundary.
 	if r, ok := c.t.(EndpointResetter); ok {
@@ -580,47 +614,17 @@ func (c *Camera) readFrame(buf []byte) (int, error) {
 	if to < 2*time.Second {
 		to = 2 * time.Second
 	}
-	s, ok := c.t.(BulkStreamer)
-	if !ok {
-		// One whole-frame read; the backend supplies the transfer concurrency that primes
-		// the FX3 GPIF.
-		return c.t.BulkRead(buf, to)
-	}
-	want := c.FrameBytes() + 4 // pixels + the 4-byte header magic
-	if want > len(buf) {
-		want = len(buf)
-	}
-	n := (want + bulkChunkBytes - 1) / bulkChunkBytes
-	if max := bulkBudgetBytes / bulkChunkBytes; n > max {
-		n = max
-	}
-	if n < 1 {
-		n = 1
-	}
-	st, err := s.BulkStream(bulkChunkBytes, n)
-	if err != nil {
-		return 0, fmt.Errorf("asicam: open bulk stream: %w", err)
-	}
-	defer st.Close()
-	total := 0
-	for total < want {
-		b, err := st.Next(2 * time.Second)
-		if err != nil {
-			return total, fmt.Errorf("asicam: bulk stream EP 0x%02x: %w", bulkEndpoint, err)
-		}
-		total += copy(buf[total:], b)
-		if len(b) < bulkChunkBytes || total >= len(buf) {
-			break // short packet = end of frame (the +512 delimiter), or buf full
-		}
-	}
-	return total, nil
+	return c.t.BulkRead(buf, to)
 }
 
 // StopExposure halts streaming and leaves the device clean: stop the sensor (master stop) and
 // the FPGA pipeline, then flush, so the next session's control writes don't hit a
 // still-streaming device.
 func (c *Camera) StopExposure() error {
-	c.setStatus(ExpIdle)
+	c.mu.Lock()
+	c.expAborted = true // the dedicated abort signal the in-flight worker polls
+	c.status = ExpIdle
+	c.mu.Unlock()
 	_ = c.vendorCmd(cmdStreamStop) // 0xAA
 	if c.sensor.StreamStop != nil {
 		_ = c.sensor.StreamStop(c.rm) // master stop (0x200=1)

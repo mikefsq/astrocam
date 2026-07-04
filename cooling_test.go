@@ -2,6 +2,7 @@ package astrocam
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -201,5 +202,66 @@ func TestCoolerRateGuard(t *testing.T) {
 	}
 	if c.Power() != pw {
 		t.Errorf("rate guard should have skipped regulation: power %.1f -> %.1f", pw, c.Power())
+	}
+}
+
+// flakyPlant wraps fakePlant, failing ReadTemp for the first failN calls (transient) or
+// forever (failN < 0). It records the last TEC power applied so the fail-safe zero is
+// observable.
+type flakyPlant struct {
+	fakePlant
+	failN int // >0: fail this many ReadTemps then recover; <0: fail forever
+	reads int
+}
+
+func (p *flakyPlant) ReadTemp() (float64, error) {
+	p.reads++
+	if p.failN < 0 || p.reads <= p.failN {
+		return 0, errTransient
+	}
+	return p.fakePlant.ReadTemp()
+}
+
+var errTransient = fmt.Errorf("transient EP0 error")
+
+// TestCoolerRunSurvivesTransientErrors: a few failed regulation ticks (an EP0 hiccup during a
+// capture-recovery reset) must not kill the loop — the historical bug returned on the FIRST
+// Step error, leaving the TEC energized with CoolerOn() still true.
+func TestCoolerRunSurvivesTransientErrors(t *testing.T) {
+	p := &flakyPlant{fakePlant: fakePlant{temp: 20, amb: 20, span: 50, tau: 5}, failN: 3}
+	cfg := DefaultCoolerConfig()
+	cfg.Tick = time.Millisecond
+	c := NewCooler(p, cfg)
+	c.SetTarget(-10)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := c.Run(ctx)
+	if err != context.DeadlineExceeded {
+		t.Fatalf("Run returned %v, want deadline (loop must survive %d transient errors)", err, p.failN)
+	}
+	if p.reads < 10 {
+		t.Errorf("loop stopped ticking after the transient errors (only %d reads)", p.reads)
+	}
+}
+
+// TestCoolerRunZeroesTECOnPersistentFailure: when the device is genuinely gone, Run must not
+// leave the TEC driving at its last power — it zeroes the drive (best-effort) and returns.
+func TestCoolerRunZeroesTECOnPersistentFailure(t *testing.T) {
+	p := &flakyPlant{fakePlant: fakePlant{temp: 20, amb: 20, span: 50, tau: 5, power: 80}, failN: -1}
+	cfg := DefaultCoolerConfig()
+	cfg.Tick = time.Millisecond
+	c := NewCooler(p, cfg)
+	c.SetTarget(-10)
+	c.SeedPower(80) // pretend we were mid-cooldown at 80%
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := c.Run(ctx)
+	if err == nil || err == context.DeadlineExceeded {
+		t.Fatalf("Run returned %v, want persistent-failure error", err)
+	}
+	if p.power != 0 {
+		t.Errorf("TEC left at %.0f%% after the loop died, want 0 (fail-safe zero)", p.power)
 	}
 }

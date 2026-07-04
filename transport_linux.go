@@ -18,8 +18,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -88,6 +90,17 @@ type usbBulkTransfer struct {
 // usbfsDevice is a usbfs-backed Transport for one open camera.
 type usbfsDevice struct {
 	f *os.File
+	// closeMu is the Close interlock: every public I/O method holds it shared for the
+	// duration of its I/O (including the URB drain), and Close takes it exclusively — so
+	// Close waits for in-flight I/O instead of yanking the fd out from under a drain
+	// (an EBADF mid-drain used to abandon kernel-held pointers into the caller's buffer).
+	// Lock order: closeMu (shared) BEFORE ioMu. All I/O is deadline-bounded, so Close is too.
+	closeMu sync.RWMutex
+	closed  bool // under closeMu
+	// broken poisons the device after an undrainable readout (see drainURBs): the kernel may
+	// still hold references into parked buffers, so no further I/O is allowed on this fd —
+	// fail fast until the camera is re-opened.
+	broken atomic.Bool
 	// ioMu serializes every USB I/O the FX3 bridge must not see interleaved: all control
 	// transfers AND a whole-frame BulkRead hold it. A control transfer (a TEC poll, or a
 	// client's CCDTemperature → 0xB3) landing on the bridge mid-readout hard-wedges the
@@ -234,11 +247,101 @@ func (d *usbfsDevice) ioctl(req uintptr, arg unsafe.Pointer) error {
 	return nil
 }
 
+var (
+	errTransportClosed = fmt.Errorf("asicam: transport closed")
+	errTransportBroken = fmt.Errorf("asicam: transport poisoned by an undrainable readout (re-open to recover)")
+)
+
+// enter gates every public I/O method: fail fast on a closed or poisoned device, and hold
+// the Close interlock (shared) for the duration of the I/O so Close cannot invalidate the fd
+// under an in-flight transfer or drain. The returned release runs when the I/O is done.
+func (d *usbfsDevice) enter() (release func(), err error) {
+	if d.broken.Load() {
+		return nil, errTransportBroken
+	}
+	d.closeMu.RLock()
+	if d.closed {
+		d.closeMu.RUnlock()
+		return nil, errTransportClosed
+	}
+	return d.closeMu.RUnlock, nil
+}
+
+// drainTimeout bounds drainURBs' wait for discarded urbs to come back. A discard completes
+// near-instantly on a live HCD; one that can't deliver within this window forfeits the
+// DEVICE (park + poison) rather than the process (an unbounded wait would hold ioMu forever).
+const drainTimeout = 5 * time.Second
+
+// leakedIO pins memory the kernel may still write to (urbs that could not be reaped): a
+// deliberate, bounded leak instead of a use-after-free when usbfs performs a late copyout.
+var (
+	leakedIOMu sync.Mutex
+	leakedIO   []interface{}
+)
+
+// drainURBs discards and reaps every pending urb so no kernel copyout can land against the
+// caller's memory after return — usbfs writes into buf and the urb structs at REAP time, so
+// returning with an unreaped urb is a future memory corruption. EINTR and EAGAIN are retried
+// (the Go runtime's SIGURG preemption interrupts ioctls routinely; the old drains treated
+// EINTR as terminal and bailed). If the urbs cannot all be reaped within drainTimeout, or the
+// reap fails outright (e.g. ENODEV after a disconnect), the buffers are parked for the
+// process lifetime and the device is poisoned — every later I/O fails fast until re-open,
+// and the eventual fd close releases the kernel's urbs without copyout.
+func (d *usbfsDevice) drainURBs(urbs []usbURB, pending []bool, buf []byte) {
+	npend := 0
+	for i := range pending {
+		if pending[i] {
+			_ = d.ioctl(usbdevfsDiscardURB, unsafe.Pointer(&urbs[i]))
+			npend++
+		}
+	}
+	if npend == 0 {
+		return
+	}
+	forfeit := func() {
+		leakedIOMu.Lock()
+		leakedIO = append(leakedIO, urbs, buf)
+		leakedIOMu.Unlock()
+		d.broken.Store(true)
+	}
+	deadline := time.Now().Add(drainTimeout)
+	for npend > 0 {
+		var p uintptr
+		err := d.ioctl(usbdevfsReapURBNDelay, unsafe.Pointer(&p))
+		switch {
+		case err == nil:
+			for i := range urbs {
+				if p == uintptr(unsafe.Pointer(&urbs[i])) {
+					if pending[i] {
+						pending[i] = false
+						npend--
+					}
+					break
+				}
+			}
+		case err == syscall.EAGAIN || err == syscall.EINTR:
+			if time.Now().After(deadline) {
+				forfeit()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		default:
+			forfeit()
+			return
+		}
+	}
+}
+
 func (d *usbfsDevice) claim(iface uint32) error {
 	return d.ioctl(usbdevfsClaimInterface, unsafe.Pointer(&iface))
 }
 
 func (d *usbfsDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, data []byte) (int, error) {
+	release, err := d.enter()
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
 	ct := usbCtrlTransfer{
@@ -249,11 +352,15 @@ func (d *usbfsDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, da
 	if len(data) > 0 {
 		ct.data = uintptr(unsafe.Pointer(&data[0]))
 	}
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.f.Fd(), usbdevfsControl, uintptr(unsafe.Pointer(&ct)))
+	// USBDEVFS_CONTROL's return value is the transferred byte count — report it, don't
+	// fabricate len(data): a short control-IN (e.g. the SPI flash read hitting the blob
+	// end) must be visible to callers that terminate on `got < want`.
+	r1, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.f.Fd(), usbdevfsControl, uintptr(unsafe.Pointer(&ct)))
+	runtime.KeepAlive(data) // ct.data holds a uintptr into data across the syscall
 	if errno != 0 {
 		return 0, errno
 	}
-	return len(data), nil
+	return int(r1), nil
 }
 
 func (d *usbfsDevice) ControlOut(bRequest uint8, wValue, wIndex uint16, data []byte) error {
@@ -271,6 +378,10 @@ func (d *usbfsDevice) ControlIn(bRequest uint8, wValue, wIndex uint16, data []by
 // 1 MiB matches the SDK/darwin xferLen.
 const maxBulkChunk = 1 << 20
 
+// urbWindow caps the async-URB paths' in-flight transfers: usbfs bounds the outstanding
+// URB buffer memory it will pin per fd (16 MiB default), so 12×1 MiB leaves headroom.
+const urbWindow = 12
+
 // bulkOne issues one USBDEVFS_BULK read of up to len(buf) bytes and returns the
 // count actually transferred (which is < len(buf) when the device ends with a short
 // packet). Used by ReadFrameStream (the synchronous windowed pump); BulkRead uses the
@@ -281,6 +392,7 @@ func (d *usbfsDevice) bulkOne(buf []byte, timeoutMs uint32) (int, error) {
 		bt.data = uintptr(unsafe.Pointer(&buf[0]))
 	}
 	r, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.f.Fd(), usbdevfsBulk, uintptr(unsafe.Pointer(&bt)))
+	runtime.KeepAlive(buf) // bt.data holds a uintptr into buf across the syscall
 	if errno != 0 {
 		return 0, errno
 	}
@@ -296,6 +408,11 @@ var bulkTrace = os.Getenv("ASTROCAM_BULK_TRACE") != ""
 // frame so no control transfer can interleave with the readout (see usbfsDevice.ioMu). This
 // is the un-buffered USB2 path; the USB3 DDR path reads through bulkOne/ReadFrameStream.
 func (d *usbfsDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
+	release, err := d.enter()
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
 	return d.readFrameURBs(buf, timeout)
@@ -330,49 +447,47 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, err
 		}
 		return -1
 	}
-	// On any exit, discard + blocking-drain every submitted-but-unreaped urb so no
-	// completion lands against buf after we return.
+	// On any exit, discard + reap every submitted-but-unreaped urb so no completion lands
+	// against buf after we return (see drainURBs: EINTR-safe, bounded, parks + poisons on
+	// failure). Assembly reads `done` before this defer runs, so the derived mask is fine.
 	defer func() {
+		pending := make([]bool, n)
 		for i := range submitted {
-			if submitted[i] && !done[i] {
-				_ = d.ioctl(usbdevfsDiscardURB, unsafe.Pointer(&urbs[i]))
-			}
+			pending[i] = submitted[i] && !done[i]
 		}
-		for {
-			pending := false
-			for i := range submitted {
-				if submitted[i] && !done[i] {
-					pending = true
-				}
-			}
-			if !pending {
-				break
-			}
-			var p uintptr
-			if err := d.ioctl(usbdevfsReapURB, unsafe.Pointer(&p)); err != nil {
-				break
-			}
-			if i := slotOf(p); i >= 0 {
-				done[i] = true
-			}
-		}
+		d.drainURBs(urbs, pending, buf)
 	}()
 
-	for i := 0; i < n; i++ {
-		off := i * maxBulkChunk
+	// Submit with at most urbWindow transfers in flight; completions slide the window forward.
+	// usbfs pins every in-flight URB's buffer in kernel memory against a per-fd cap (16 MiB
+	// default), so posting a large frame all up front fails at ~slot 16 — and the reaped
+	// prefix then came back as a silently short frame with a nil error. Frames within the
+	// window (all current BulkRead sensors) still get every transfer armed before data flows.
+	next := 0
+	noMore := false
+	submitNext := func() error {
+		off := next * maxBulkChunk
 		l := maxBulkChunk
 		if off+l > len(buf) {
 			l = len(buf) - off // last transfer: the exact remainder (see doc)
 		}
-		urbs[i] = usbURB{typ: urbTypeBulk, endpoint: bulkEndpoint,
+		urbs[next] = usbURB{typ: urbTypeBulk, endpoint: bulkEndpoint,
 			buffer: uintptr(unsafe.Pointer(&buf[off])), bufferLength: int32(l)}
-		if err := d.ioctl(usbdevfsSubmitURB, unsafe.Pointer(&urbs[i])); err != nil {
-			if i == 0 {
+		if err := d.ioctl(usbdevfsSubmitURB, unsafe.Pointer(&urbs[next])); err != nil {
+			noMore = true // submit what we could; the reaped prefix is still a valid frame
+			return err
+		}
+		submitted[next] = true
+		next++
+		return nil
+	}
+	for next < n && next < urbWindow {
+		if err := submitNext(); err != nil {
+			if next == 0 {
 				return 0, err // couldn't post a single transfer — fatal
 			}
-			break // submit what we can; the reaped prefix is still a valid frame
+			break
 		}
-		submitted[i] = true
 	}
 	if bulkTrace {
 		fmt.Fprintf(os.Stderr, "[urb] start want=%d n=%d timeout=%s\n", len(buf), n, timeout)
@@ -392,7 +507,7 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, err
 		}
 		var p uintptr
 		err := d.ioctl(usbdevfsReapURBNDelay, unsafe.Pointer(&p))
-		if err == syscall.EAGAIN {
+		if err == syscall.EAGAIN || err == syscall.EINTR { // EINTR: Go's SIGURG preemption
 			time.Sleep(200 * time.Microsecond)
 			continue
 		}
@@ -404,6 +519,9 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, err
 			if bulkTrace {
 				fmt.Fprintf(os.Stderr, "[urb] t=%.3fs slot=%d n=%d status=%d\n",
 					time.Since(start).Seconds(), i, urbs[i].actualLength, urbs[i].status)
+			}
+			if !noMore && next < n {
+				_ = submitNext() // keep the window full; a failure just truncates as before
 			}
 		}
 	}
@@ -437,6 +555,11 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, err
 // to a watermark until the frame is in, `idle` passes with no data at all (a genuine stall),
 // or the `total` deadline hits. usbfsDevice satisfies FrameStreamer.
 func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (int, error) {
+	release, err := d.enter()
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	if len(buf) == 0 {
 		return 0, nil
 	}
@@ -453,7 +576,11 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 		if ms > idle {
 			ms = idle
 		}
-		n, err := d.bulkOne(scratch, uint32(ms.Milliseconds()))
+		msec := uint32(ms.Milliseconds())
+		if msec == 0 {
+			msec = 1 // <1 ms remaining truncates to 0 = INFINITE for usbfs bulk — never block forever
+		}
+		n, err := d.bulkOne(scratch, msec)
 		if n > 0 {
 			got += copy(buf[got:], scratch[:n])
 			lastData = time.Now()
@@ -485,10 +612,15 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	release, err := d.enter()
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
 	nslots := (len(buf) + maxBulkChunk - 1) / maxBulkChunk
-	const window = 12 // in-flight cap: usbfs bounds outstanding URB memory (16 MiB default)
+	const window = urbWindow // in-flight cap: usbfs bounds outstanding URB memory (16 MiB default)
 	urbs := make([]usbURB, nslots)
 	want := make([]int, nslots)
 	inflight := make([]bool, nslots)
@@ -516,43 +648,23 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 		inflight[i] = true
 		return nil
 	}
-	// drain discards + blocking-reaps every in-flight urb so no completion lands against buf
-	// after we return. The kernel reports a discarded urb's partial length on the reap, so a
-	// stuck slot's bytes still count toward the contiguous prefix. Idempotent; also deferred
-	// as a safety net for early returns.
-	drain := func() {
-		for i := range inflight {
-			if inflight[i] {
-				_ = d.ioctl(usbdevfsDiscardURB, unsafe.Pointer(&urbs[i]))
-			}
-		}
-		for {
-			any := false
-			for i := range inflight {
-				if inflight[i] {
-					any = true
-				}
-			}
-			if !any {
-				return
-			}
-			var p uintptr
-			if err := d.ioctl(usbdevfsReapURB, unsafe.Pointer(&p)); err != nil {
-				return
-			}
-			if i := slotOf(p); i >= 0 {
-				inflight[i] = false
-			}
-		}
-	}
+	// drain discards + reaps every in-flight urb so no completion lands against buf after we
+	// return (see drainURBs: EINTR-safe, bounded, parks + poisons on failure). The kernel
+	// reports a discarded urb's partial length on the reap, so a stuck slot's bytes still
+	// count toward the contiguous prefix. Idempotent; also deferred as a safety net.
+	drain := func() { d.drainURBs(urbs, inflight, buf) }
 	defer drain()
 	// prefix is the contiguous byte count from the start of buf: full slots plus the partial
-	// tail of the first incomplete one. Only meaningful after drain().
+	// tail of the first incomplete OR errored one. A slot's actualLength counts (the kernel
+	// delivered those bytes — a discarded urb reaps -ENOENT with its partial data in place,
+	// a babbled one -EOVERFLOW with everything up to the oversized packet), but counting
+	// STOPS there: a full-length slot with a nonzero status must not let the count run past
+	// a gap. Only meaningful after drain().
 	prefix := func() int {
 		got := 0
 		for i := range urbs {
 			got += int(urbs[i].actualLength)
-			if int(urbs[i].actualLength) < want[i] {
+			if int(urbs[i].actualLength) < want[i] || urbs[i].status != 0 {
 				break
 			}
 		}
@@ -581,7 +693,7 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 		}
 		var p uintptr
 		err := d.ioctl(usbdevfsReapURBNDelay, unsafe.Pointer(&p))
-		if err == syscall.EAGAIN {
+		if err == syscall.EAGAIN || err == syscall.EINTR { // EINTR: Go's SIGURG preemption
 			if gotFirst && time.Since(lastData) >= idle {
 				break // genuine stall: no completion for the whole idle window
 			}
@@ -616,23 +728,53 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 	return prefix(), nil
 }
 
-// ResetEndpoint clears a halt/stall on the bulk-IN endpoint (USBDEVFS_CLEAR_HALT).
+// ResetEndpoint clears a halt/stall on the bulk-IN endpoint (USBDEVFS_CLEAR_HALT). CLEAR_HALT
+// is EP0 control traffic, so it takes ioMu like every other control transfer — landing it
+// mid-readout is exactly the GPIF-wedge interleave the mutex exists to prevent. All callers
+// are capture-sequential today (they reset BETWEEN reads); the lock enforces what was
+// previously convention. NOT a recovery hatch for a stuck read — that is ResetDevice, which
+// deliberately bypasses ioMu.
 func (d *usbfsDevice) ResetEndpoint(ep uint8) error {
+	release, err := d.enter()
+	if err != nil {
+		return err
+	}
+	defer release()
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
 	e := uint32(ep)
 	return d.ioctl(usbdevfsClearHalt, unsafe.Pointer(&e))
 }
 
 // ResetDevice performs a USB port reset of the whole device (USBDEVFS_RESET) — last-resort
-// recovery when the readout wedges. The reset drops the kernel's interface claim, so we
-// re-claim interface 0 afterwards; the device keeps its address (no node change).
+// recovery when the readout wedges. It deliberately does NOT take ioMu: its job includes
+// recovering while a stuck read still holds the lock, and serializing it would deadlock that
+// recovery. The reset drops the kernel's interface claim, so we re-claim interface 0
+// afterwards; the device keeps its address (no node change).
 func (d *usbfsDevice) ResetDevice() error {
+	release, err := d.enter()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := d.ioctl(usbdevfsReset, nil); err != nil {
 		return err
 	}
 	return d.claim(0) // the reset releases the interface claim — re-take it
 }
 
-func (d *usbfsDevice) Close() error { return d.f.Close() }
+// Close waits for in-flight I/O (the closeMu interlock — every I/O is deadline-bounded, so
+// this is too), then closes the fd. The fd release makes the kernel free any still-queued
+// urbs WITHOUT copyout, so nothing can land against user memory afterwards. Idempotent.
+func (d *usbfsDevice) Close() error {
+	d.closeMu.Lock()
+	defer d.closeMu.Unlock()
+	if d.closed {
+		return nil
+	}
+	d.closed = true
+	return d.f.Close()
+}
 
 // OpenHost opens the default USB backend for this platform (Linux: usbfs).
 func OpenHost(vid, pid uint16) (Transport, error) {

@@ -276,7 +276,7 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	}
 
 	// --- arm ---
-	_ = ctl.ResetDevice()                       // ResetDevice() (no-op on backends without it)
+	_ = ctl.ResetDevice()                       // ResetDevice() (errors on backends without it; the SDK arm resets unconditionally)
 	time.Sleep(50 * time.Millisecond)           // usleep(0xc350)
 	if err := ctl.VendorCmd(0xAA); err != nil { // FX3 stream stop
 		return 0, err
@@ -290,6 +290,17 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := startStreaming(); err != nil { // StartSensorStreaming
 		return 0, err
 	}
+	// Halt the readout on EVERY return — the 2600 object's WorkingFunc exit:
+	// StopSensorStreaming (FPGAStop -> 0x1ee<-5 -> CamSetStandby(1), per
+	// 0080_CCameraS2600MC_Pro.o; stopStreaming() already encodes exactly this) then
+	// SendCMD(0xAA) then ResetEndPoint. A sensor left free-running with no reader backs up
+	// the FX3 GPIF. Best-effort: a failed stop must not fail a good frame. VERIFY-HW: ported
+	// from the object (mirrors the hardware-verified 455/6200); no 571 on the bench at port time.
+	defer func() {
+		_ = stopStreaming()
+		_ = ctl.VendorCmd(0xAA)
+		_ = ctl.ResetEndpoint()
+	}()
 	_ = ctl.ResetEndpoint() // ResetEndPoint(0x81)
 
 	// >= 1 s runs in FPGA wait+trigger mode (SetExp set reg0 bit6/bit7 and held VMAX near one
@@ -301,7 +312,12 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		}
 		for start := time.Now(); time.Since(start) < exposure; {
 			if ctl.Aborted() {
-				return 0, errExposureAborted // StopExposure ran: bail instead of waiting out the integration
+				// StopExposure ran: bail, dropping the trigger signal on the way out —
+				// left asserted, the next triggerSignal(true) is a no-edge write and the
+				// FPGA never gates the integration. (Host-side hygiene, not object-derived:
+				// the SDK snap thread never host-aborts mid-integration.)
+				_ = triggerSignal(false)
+				return 0, errExposureAborted
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -315,8 +331,15 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if target > len(buf) {
 		target = len(buf)
 	}
+	// In the >= 1 s trigger band the integration has ALREADY completed above (host-timed
+	// trigger hold), so the read only spans the readout — exposure-scaled timeouts there
+	// made a stalled readout after a long sub block StopExposure for up to 2·exp+5 s.
 	idle := exposure + 2*time.Second
 	total := 2*exposure + 5*time.Second
+	if exposure >= imx571LongExpUs*time.Microsecond {
+		idle = 2 * time.Second
+		total = 15 * time.Second // full-frame readout ceiling incl. USB2 + retries
+	}
 	// Pulse FPGABufReload throughout so the frame's final partial DMA buffer (the bytes past the
 	// last 1-MiB boundary) flushes into a posted transfer; the windowed reader treats the
 	// frame-end ZLP as non-terminal and keeps cycling until the whole frame lands.
@@ -726,15 +749,6 @@ func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
 	// then the ROI. START is SENSOR pixels (= binned·bin); window mode 0x1d8 = 4 full / 0 binned;
 	// HEIGHT(0x0a) takes the raw output height +2 when binned, WIDTH(0x1dd) the ×4-aligned width +0x18.
 	mode := imx571SelectMode(bin)
-	if err := rm.WriteReg(imx571RegApply, 1); err != nil {
-		return err
-	}
-	for _, rv := range mode.table {
-		if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
-			return err
-		}
-	}
-
 	sx := x * bin
 	sy := y * bin
 	sx &^= imx571StartXAlign - 1 // align X to 16 (and 0xfffffff0)
@@ -762,25 +776,34 @@ func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
 	wAligned := (w + 3) &^ 3      // WIDTH rounded up to ×4
 	uw := uint16(wAligned + 0x18) // WIDTH -> 0x1dd/0x1de, +0x18
 
-	for _, rv := range []RegVal{
-		// ROI start (sensor pixels).
-		{Reg: imx571RegStartXEn, Val: 0x01},
-		{Reg: imx571RegStartXL, Val: (ux >> 4) & 0xff},
-		{Reg: imx571RegStartXH, Val: (ux >> 12) & 0xff},
-		{Reg: imx571RegStartYL, Val: uy & 0xff},
-		{Reg: imx571RegStartYH, Val: (uy >> 8) & 0xff},
-		// Window size (output pixels).
-		{Reg: imx571RegWinMode, Val: winMode},
-		{Reg: imx571RegHeightL, Val: uh & 0xff},
-		{Reg: imx571RegHeightH, Val: (uh >> 8) & 0xff},
-		{Reg: imx571RegWidthL, Val: uw & 0xfc},
-		{Reg: imx571RegWidthH, Val: (uw >> 8) & 0xff},
-	} {
-		if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
-			return err
+	// The whole mode table + ROI group under the reg 0x07 apply bracket (released even when a
+	// write errors — a held apply freezes every later grouped update).
+	if err := WithLatch(rm, imx571RegApply, func() error {
+		for _, rv := range mode.table {
+			if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
+				return err
+			}
 		}
-	}
-	if err := rm.WriteReg(imx571RegApply, 0); err != nil {
+		for _, rv := range []RegVal{
+			// ROI start (sensor pixels).
+			{Reg: imx571RegStartXEn, Val: 0x01},
+			{Reg: imx571RegStartXL, Val: (ux >> 4) & 0xff},
+			{Reg: imx571RegStartXH, Val: (ux >> 12) & 0xff},
+			{Reg: imx571RegStartYL, Val: uy & 0xff},
+			{Reg: imx571RegStartYH, Val: (uy >> 8) & 0xff},
+			// Window size (output pixels).
+			{Reg: imx571RegWinMode, Val: winMode},
+			{Reg: imx571RegHeightL, Val: uh & 0xff},
+			{Reg: imx571RegHeightH, Val: (uh >> 8) & 0xff},
+			{Reg: imx571RegWidthL, Val: uw & 0xfc},
+			{Reg: imx571RegWidthH, Val: (uw >> 8) & 0xff},
+		} {
+			if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	// Optical-black crop: SetFPGAVBLK = FPGA_SKIP_LINE, SetFPGAHBLK = FPGA_SKIP_CLOUMN — the

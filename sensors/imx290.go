@@ -181,6 +181,18 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := arm(true); err != nil {
 		return 0, err
 	}
+	// Halt the readout on EVERY return — the 290 object's WorkingFunc exit:
+	// StopSensorStreaming (FPGAStop + standby 0x3000=1, per 0006_CCameraS290MC.o) then
+	// SendCMD(0xAA) then ResetEndPoint. A sensor left free-running with no reader backs up
+	// the FX3 GPIF until the firmware crashes (the documented 174 mechanism). Best-effort:
+	// on the error paths the device may already be gone, and a failed stop must not fail a
+	// good frame. VERIFY-HW: ported from the object; no 290 on the bench at port time.
+	defer func() {
+		_ = SetFPGABit(rm, 0x00, 0x10, true) // FPGAStop: reg0 bit4
+		_ = rm.WriteReg(imx290RegStandby, 1) // standby (sensor stop)
+		_ = ctl.VendorCmd(0xAA)
+		_ = ctl.ResetEndpoint()
+	}()
 	_ = ctl.ResetEndpoint()
 	if err := trigger(true); err != nil {
 		return 0, err
@@ -201,7 +213,12 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		// standby-toggle here — that clears the integrated charge and yields a dark frame.
 		for start := time.Now(); time.Since(start) < exposure; {
 			if ctl.Aborted() {
-				return 0, errExposureAborted // StopExposure ran: bail
+				// StopExposure ran: bail, dropping the trigger signal on the way out —
+				// left asserted, the next trigger(true) is a no-edge write and the FPGA
+				// never gates the integration. (Host-side hygiene, not object-derived:
+				// the SDK snap thread never host-aborts mid-integration.)
+				_ = trigger(false)
+				return 0, errExposureAborted
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -282,25 +299,21 @@ func imx290SetGain(rm Regmap, gain int) error {
 		gain = 0
 	}
 	code, hcg := SonyAnalogGain(gain, imx290GainHCGAt)
-	if err := rm.WriteReg(imx290RegLatch, 1); err != nil {
-		return err
-	}
-	mode, err := rm.ReadReg(imx290RegGainMode)
-	if err != nil {
-		return err
-	}
-	if hcg {
-		mode |= 0x10 // high conversion gain
-	} else {
-		mode &= 0x0f // keep low nibble, clear HCG
-	}
-	if err := rm.WriteReg(imx290RegGainMode, mode); err != nil {
-		return err
-	}
-	if err := rm.WriteReg(imx290RegGainCode, code&0xff); err != nil {
-		return err
-	}
-	return rm.WriteReg(imx290RegLatch, 0)
+	return WithLatch(rm, imx290RegLatch, func() error {
+		mode, err := rm.ReadReg(imx290RegGainMode)
+		if err != nil {
+			return err
+		}
+		if hcg {
+			mode |= 0x10 // high conversion gain
+		} else {
+			mode &= 0x0f // keep low nibble, clear HCG
+		}
+		if err := rm.WriteReg(imx290RegGainMode, mode); err != nil {
+			return err
+		}
+		return rm.WriteReg(imx290RegGainCode, code&0xff)
+	})
 }
 
 // imx290Shutter is the populated STARVIS template (SetExp). All values are sensor-die
@@ -345,7 +358,7 @@ func imx290SetExposure(rm Regmap, d time.Duration) error {
 	// drives the line time, so a stale fast HMAX would overflow one frame and collapse to the
 	// VMAX-stretch / SHS=1 path. Use the live ROI dims when set, else full-frame.
 	hw, hh := imx290FullWidth, imx290FullHeight
-	if rd := ModeOf(rm); rd.Width > 0 {
+	if rd := ModeOf(rm); rd.Width > 0 && rd.Height > 0 { // both dims, or a zero Height collapses the candidate
 		hw, hh = rd.Width, rd.Height
 	}
 	clk, floor := imx290ClockFloor(rm)
@@ -414,18 +427,17 @@ func imx290SetROI(rm Regmap, x, y, w, h, bin int) error {
 	}
 
 	// SetStartPos: ROI offset (latched group).
-	if err := rm.WriteReg(imx290RegLatch, 1); err != nil {
-		return err
-	}
-	for _, rv := range []RegVal{
-		{Reg: imx290RegStartXL, Val: ux & 0xff}, {Reg: imx290RegStartXH, Val: (ux >> 8) & 0xff},
-		{Reg: imx290RegStartYL, Val: uy & 0xff}, {Reg: imx290RegStartYH, Val: (uy >> 8) & 0xff},
-	} {
-		if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
-			return err
+	if err := WithLatch(rm, imx290RegLatch, func() error {
+		for _, rv := range []RegVal{
+			{Reg: imx290RegStartXL, Val: ux & 0xff}, {Reg: imx290RegStartXH, Val: (ux >> 8) & 0xff},
+			{Reg: imx290RegStartYL, Val: uy & 0xff}, {Reg: imx290RegStartYH, Val: (uy >> 8) & 0xff},
+		} {
+			if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
+				return err
+			}
 		}
-	}
-	if err := rm.WriteReg(imx290RegLatch, 0); err != nil {
+		return nil
+	}); err != nil {
 		return err
 	}
 

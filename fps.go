@@ -137,18 +137,21 @@ const (
 
 // FPGAWrite16 writes a 16-bit value little-endian to an FPGA register pair, bracketed
 // by the FX3 reg-1 commit strobe (1 then 0) — the form every SetFPGA{HBLK,VBLK,Width,
-// Height,HMAX} setter takes.
-func FPGAWrite16(rm Regmap, loReg, hiReg, val uint16) error {
-	if err := rm.WriteFPGAReg(fpgaStrobe, 1); err != nil {
+// Height,HMAX} setter takes. The strobe is released even when a data write errors (a held
+// strobe gates every later FPGA group commit); the first error wins.
+func FPGAWrite16(rm Regmap, loReg, hiReg, val uint16) (err error) {
+	if err = rm.WriteFPGAReg(fpgaStrobe, 1); err != nil {
 		return err
 	}
-	if err := rm.WriteFPGAReg(loReg, val&0xff); err != nil {
+	defer func() {
+		if rerr := rm.WriteFPGAReg(fpgaStrobe, 0); err == nil {
+			err = rerr
+		}
+	}()
+	if err = rm.WriteFPGAReg(loReg, val&0xff); err != nil {
 		return err
 	}
-	if err := rm.WriteFPGAReg(hiReg, (val>>8)&0xff); err != nil {
-		return err
-	}
-	return rm.WriteFPGAReg(fpgaStrobe, 0)
+	return rm.WriteFPGAReg(hiReg, (val>>8)&0xff)
 }
 
 // SetFPGAHBLK / SetFPGAVBLK program the FX3 optical-black crop: the count of leading blank /
@@ -171,16 +174,21 @@ func SetFPGAOutputWidth(rm Regmap, raw16 bool) error {
 // FPGA regs 0x40..0x43, bracketed by the reg-1 commit strobe (1 then 0). dataWords =
 // frameBytes/4. IMX455/IMX571 program this so the FX3 frames the exact (binned / sub-frame)
 // transfer; the STARVIS 290 does not use it.
-func SetFPGABinDataLen(rm Regmap, dataWords uint32) error {
-	if err := rm.WriteFPGAReg(fpgaStrobe, 1); err != nil {
+func SetFPGABinDataLen(rm Regmap, dataWords uint32) (err error) {
+	if err = rm.WriteFPGAReg(fpgaStrobe, 1); err != nil {
 		return err
 	}
+	defer func() { // release the strobe on the error paths too; the first error wins
+		if rerr := rm.WriteFPGAReg(fpgaStrobe, 0); err == nil {
+			err = rerr
+		}
+	}()
 	for i, reg := range []uint16{0x40, 0x41, 0x42, 0x43} {
-		if err := rm.WriteFPGAReg(reg, uint16(dataWords>>(8*uint(i)))&0xff); err != nil {
+		if err = rm.WriteFPGAReg(reg, uint16(dataWords>>(8*uint(i)))&0xff); err != nil {
 			return err
 		}
 	}
-	return rm.WriteFPGAReg(fpgaStrobe, 0)
+	return nil
 }
 
 // ProgramFrameGeometry writes the FPGA frame dimensions the FX3 needs to package the bulk

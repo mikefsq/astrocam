@@ -25,15 +25,21 @@ var errEnumUnsupported = errors.New("asicam: USB enumeration not implemented on 
 // Enumerate lists attached cameras (across every known vendor VID) that map to a registered
 // camera model, without opening any of them. Devices that share a vendor id but aren't
 // cameras (e.g. EFW filter wheels) are filtered out. Location binds a result to a physical
-// port for OpenLocation.
+// port for OpenLocation. One vendor's scan failing does not hide the healthy vendors: the
+// error is returned only when NO vendor could be scanned at all.
 func Enumerate() ([]DeviceInfo, error) {
 	var raw []DeviceInfo
+	var errs []error
 	for _, vid := range KnownVIDs() {
 		devs, err := enumerateRaw(vid)
 		if err != nil {
-			return nil, err
+			errs = append(errs, fmt.Errorf("vid %04x: %w", vid, err))
+			continue
 		}
 		raw = append(raw, devs...)
+	}
+	if len(raw) == 0 && len(errs) > 0 {
+		return nil, errors.Join(errs...)
 	}
 	return filterCameras(raw), nil
 }

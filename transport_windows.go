@@ -10,15 +10,23 @@
 // Frame reads use fixed 1 MiB chunked reads assembled to a contiguous watermark (BulkRead /
 // ReadFrameStream): a whole-frame read must time-bound (default WinUSB blocks forever) and
 // read through the FX3's mid-frame short packets / ZLPs rather than stop on the first.
+// ReadFrameStreamPrequeued arms the whole frame's overlapped reads before the frame arrives
+// (the SDK's async-transfer model; what a USB2 link needs to not shear frames).
+//
+// WinUSB exposes no device-level USB reset, so this backend has no DeviceResetter;
+// Camera.ResetDevice reports that loudly rather than pretending to reset.
 //
 // Compile-checked for windows/amd64 but not run on hardware. Mirrors the Linux usbfs backend.
 
 package astrocam
 
 import (
+	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -39,10 +47,13 @@ var (
 	procWinUsbReadPipe   = modWinUSB.NewProc("WinUsb_ReadPipe")
 	procWinUsbSetPipePol = modWinUSB.NewProc("WinUsb_SetPipePolicy")
 	procWinUsbResetPipe  = modWinUSB.NewProc("WinUsb_ResetPipe")
+	procWinUsbAbortPipe  = modWinUSB.NewProc("WinUsb_AbortPipe")
 	procWinUsbQueryPipe  = modWinUSB.NewProc("WinUsb_QueryPipe")
+	procWinUsbGetOvlRes  = modWinUSB.NewProc("WinUsb_GetOverlappedResult")
 	procCreateFile       = modKernel32.NewProc("CreateFileW")
 	procCloseHandle      = modKernel32.NewProc("CloseHandle")
-	procGetOverlappedRes = modKernel32.NewProc("GetOverlappedResult")
+	procCreateEvent      = modKernel32.NewProc("CreateEventW")
+	procWaitForSingle    = modKernel32.NewProc("WaitForSingleObject")
 )
 
 // GUID_DEVINTERFACE_USB_DEVICE {A5DCBF10-6530-11D2-901F-00C04FB951ED}.
@@ -81,6 +92,29 @@ const (
 	errSemTimeout = 121  // ERROR_SEMAPHORE_TIMEOUT
 	errOpAborted  = 995  // ERROR_OPERATION_ABORTED
 	errTimeout    = 1460 // ERROR_TIMEOUT
+
+	errIOPending = 997 // ERROR_IO_PENDING: the overlapped read was queued
+
+	waitObject0 = 0 // WaitForSingleObject: the event signaled
+
+	// winPrequeuedWindow is how many overlapped reads ReadFrameStreamPrequeued keeps armed
+	// at once (12 MiB in flight, matching the usbfs batch window); winDrainTimeout bounds
+	// the post-abort wait for the kernel to release the frame buffer.
+	winPrequeuedWindow = 12
+	winDrainTimeout    = 5 * time.Second
+)
+
+// errWinTransportBroken marks a device whose aborted overlapped reads never completed: the
+// kernel may still own outstanding buffers, so all further I/O is refused (the buffers are
+// pinned in winLeakedIO). Only a device reset by the OS / process restart recovers.
+var errWinTransportBroken = errors.New("asicam: transport broken (undrainable overlapped I/O)")
+
+// winLeakedIO pins buffers (and their OVERLAPPEDs/events) that could not be drained after an
+// abort — the kernel can still DMA into them at any time, so they must never be reused or
+// collected. Deliberately package-level and never cleared.
+var (
+	winLeakedIOMu sync.Mutex
+	winLeakedIO   []any
 )
 
 // winusbDevice is a WinUSB-backed Transport for one open camera.
@@ -96,6 +130,9 @@ type winusbDevice struct {
 	// inMaxPacket is the bulk-IN pipe's max packet size (USB3 SuperSpeed ≥1024, USB2 HighSpeed 512),
 	// read at open. The readout's bandwidth budget follows it via SuperSpeed() (see camera.go).
 	inMaxPacket uint16
+	// broken latches when an aborted overlapped read could not be drained (the kernel still
+	// owns a caller buffer); every subsequent transfer fails fast with errWinTransportBroken.
+	broken atomic.Bool
 }
 
 // winNode is one WinUSB device-interface path with its parsed VID/PID.
@@ -263,6 +300,9 @@ type winusbSetupPacket struct {
 }
 
 func (d *winusbDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, data []byte) (int, error) {
+	if d.broken.Load() {
+		return 0, errWinTransportBroken
+	}
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
 	pkt := winusbSetupPacket{RequestType: reqType, Request: bRequest, Value: wValue, Index: wIndex, Length: uint16(len(data))}
@@ -297,22 +337,243 @@ func (d *winusbDevice) setPipeTimeout(timeoutMs uint32) {
 // and returns the count transferred. A timeout/cancel returns (n, nil); only a genuine pipe
 // error returns non-nil. Default WinUSB (no RAW_IO) returns on a short packet, so n may be
 // < len(buf).
+//
+// Two hard rules of the overlapped dance (finding 3.6): (a) the ReadPipe return must be
+// checked — a synchronous failure never arms the OVERLAPPED, and reading a zero OVERLAPPED
+// via GetOverlappedResult reports STATUS_SUCCESS with 0 bytes, i.e. a dead device as a clean
+// empty frame; (b) the wait must be on the transfer's OWN event — without an hEvent the wait
+// lands on the file handle, which ANY completing I/O on the device signals (a concurrent TEC
+// poll), returning while this read is still in flight against the caller's buffer.
 func (d *winusbDevice) readChunk(buf []byte, timeoutMs uint32) (int, error) {
+	if d.broken.Load() {
+		return 0, errWinTransportBroken
+	}
 	d.setPipeTimeout(timeoutMs)
-	var ov overlapped
-	procWinUsbReadPipe.Call(d.winusb, pipeIn, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0, uintptr(unsafe.Pointer(&ov)))
+	ev, _, _ := procCreateEvent.Call(0, 1, 0, 0) // manual-reset, unsignaled, unnamed
+	if ev == 0 {
+		return 0, fmt.Errorf("asicam: CreateEvent failed")
+	}
+	// Heap-allocate the OVERLAPPED: the kernel writes it asynchronously after ReadPipe
+	// returns, and a stack copy can move under a growing goroutine stack.
+	ov := &overlapped{HEvent: syscall.Handle(ev)}
+	r, _, callErr := procWinUsbReadPipe.Call(d.winusb, pipeIn, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0, uintptr(unsafe.Pointer(ov)))
+	if r == 0 {
+		if errno, ok := callErr.(syscall.Errno); !ok || errno != errIOPending {
+			procCloseHandle.Call(ev)
+			return 0, fmt.Errorf("asicam: WinUsb_ReadPipe failed: %v", callErr)
+		}
+	}
+	// bWait=1 blocks on ov.HEvent until THIS transfer completes; the pipe's transfer-timeout
+	// policy bounds it (the driver cancels and completes the op with ERROR_SEM_TIMEOUT).
 	var transferred uint32
-	r, _, callErr := procGetOverlappedRes.Call(uintptr(d.handle), uintptr(unsafe.Pointer(&ov)), uintptr(unsafe.Pointer(&transferred)), 1)
+	r, _, callErr = procWinUsbGetOvlRes.Call(d.winusb, uintptr(unsafe.Pointer(ov)), uintptr(unsafe.Pointer(&transferred)), 1)
+	runtime.KeepAlive(buf)
+	runtime.KeepAlive(ov)
+	procCloseHandle.Call(ev)
 	if r != 0 {
 		return int(transferred), nil
 	}
 	if errno, ok := callErr.(syscall.Errno); ok {
 		switch errno {
-		case 0, errSemTimeout, errOpAborted, errTimeout:
+		case errSemTimeout, errOpAborted, errTimeout:
 			return int(transferred), nil // bounded read elapsed: no (more) data this round
 		}
 	}
 	return int(transferred), fmt.Errorf("asicam: ReadPipe failed: %v", callErr)
+}
+
+// winOvSlot is one armed overlapped read of the prequeued batch: its OVERLAPPED + event and
+// the caller-frame slice the kernel DMAs into.
+type winOvSlot struct {
+	ov    *overlapped
+	ev    uintptr
+	buf   []byte
+	armed bool
+}
+
+// ReadFrameStreamPrequeued reads one frame the way the ASI SDK's capture thread does
+// (PrequeuedFrameStreamer): a batch of overlapped reads covering the frame exactly (1 MiB
+// slices, last = the remainder), armed on the pipe BEFORE the frame arrives so the transfer
+// overlaps the sensor readout and the pipe never idles — the one-chunk-at-a-time
+// ReadFrameStream leaves inter-transfer gaps that shear a USB2 HighSpeed frame. A window of
+// winPrequeuedWindow reads is kept armed; each fully-filled slot arms the next slice.
+//
+// Gates mirror the usbfs implementation: `total` bounds the whole read, and `idle` gates only
+// AFTER the first byte has arrived (a quiet integration must not trip it). Returns the
+// in-order contiguous prefix; a short slot (the FX3 frame-end short packet) or a gate expiry
+// ends the read, with everything still in flight aborted and drained before returning — on a
+// drain timeout the frame buffer is pinned forever and the transport poisoned, because the
+// kernel still owns it. Holds ioMu for the whole frame (the USB2 control-interleave wedge gate).
+func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Duration) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	if d.broken.Load() {
+		return 0, errWinTransportBroken
+	}
+	d.ioMu.Lock()
+	defer d.ioMu.Unlock()
+
+	// Exact cover: 1 MiB slices, last = remainder.
+	nslots := (len(buf) + maxBulkChunk - 1) / maxBulkChunk
+	slots := make([]winOvSlot, nslots)
+	for i := range slots {
+		lo := i * maxBulkChunk
+		hi := lo + maxBulkChunk
+		if hi > len(buf) {
+			hi = len(buf)
+		}
+		slots[i].buf = buf[lo:hi]
+	}
+
+	// The driver-side transfer timeout must outlast the host gates below — the host reaps
+	// with its own total/idle windows and aborts explicitly.
+	totalMs := total.Milliseconds()
+	if totalMs <= 0 {
+		totalMs = 1
+	}
+	d.setPipeTimeout(uint32(totalMs) + 1000)
+
+	arm := func(i int) error {
+		ev, _, _ := procCreateEvent.Call(0, 1, 0, 0)
+		if ev == 0 {
+			return fmt.Errorf("asicam: CreateEvent failed")
+		}
+		slots[i].ev = ev
+		slots[i].ov = &overlapped{HEvent: syscall.Handle(ev)}
+		r, _, callErr := procWinUsbReadPipe.Call(d.winusb, pipeIn,
+			uintptr(unsafe.Pointer(&slots[i].buf[0])), uintptr(len(slots[i].buf)),
+			0, uintptr(unsafe.Pointer(slots[i].ov)))
+		if r == 0 {
+			if errno, ok := callErr.(syscall.Errno); !ok || errno != errIOPending {
+				procCloseHandle.Call(ev)
+				slots[i].ev = 0
+				return fmt.Errorf("asicam: WinUsb_ReadPipe failed: %v", callErr)
+			}
+		}
+		slots[i].armed = true
+		return nil
+	}
+
+	// abortAndDrain cancels everything still in flight and waits for every armed slot to
+	// complete — the kernel writes the buffer and OVERLAPPED at completion time, so returning
+	// earlier hands the caller memory the kernel still owns. On a drain timeout it pins the
+	// whole batch and poisons the transport instead of returning that memory to the caller.
+	drained := true
+	abortAndDrain := func() {
+		procWinUsbAbortPipe.Call(d.winusb, pipeIn)
+		dl := time.Now().Add(winDrainTimeout)
+		for i := range slots {
+			if !slots[i].armed {
+				continue
+			}
+			ms := time.Until(dl).Milliseconds()
+			if ms < 0 {
+				ms = 0
+			}
+			if w, _, _ := procWaitForSingle.Call(slots[i].ev, uintptr(ms)); w != waitObject0 {
+				drained = false
+				break
+			}
+		}
+		if !drained {
+			d.broken.Store(true)
+			winLeakedIOMu.Lock()
+			winLeakedIO = append(winLeakedIO, buf, slots)
+			winLeakedIOMu.Unlock()
+			return // leak the events too — the kernel signals them at (eventual) completion
+		}
+		for i := range slots {
+			if slots[i].ev != 0 {
+				procCloseHandle.Call(slots[i].ev)
+				slots[i].ev = 0
+			}
+		}
+	}
+
+	window := winPrequeuedWindow
+	if window > nslots {
+		window = nslots
+	}
+	next := 0 // next slot to arm
+	for ; next < window; next++ {
+		if err := arm(next); err != nil {
+			if next == 0 {
+				return 0, err
+			}
+			break // keep what's armed; the reap below drains it
+		}
+	}
+
+	deadline := time.Now().Add(total)
+	got := 0
+	gotFirst := false
+	for i := 0; i < next; i++ {
+		// Host-side gate: total before the first byte, idle after (a quiet integration must
+		// not trip the idle gate before data starts flowing).
+		wait := time.Until(deadline)
+		if gotFirst && idle < wait {
+			wait = idle
+		}
+		if wait < time.Millisecond {
+			wait = time.Millisecond
+		}
+		if w, _, _ := procWaitForSingle.Call(slots[i].ev, uintptr(wait.Milliseconds())); w != waitObject0 {
+			abortAndDrain()
+			if !drained {
+				return got, errWinTransportBroken
+			}
+			runtime.KeepAlive(slots)
+			return got, nil // gate expired: short read, the worker recovers
+		}
+		var transferred uint32
+		r, _, callErr := procWinUsbGetOvlRes.Call(d.winusb, uintptr(unsafe.Pointer(slots[i].ov)), uintptr(unsafe.Pointer(&transferred)), 0)
+		got += int(transferred)
+		if transferred > 0 {
+			gotFirst = true
+		}
+		if r == 0 {
+			// Completed with an error: driver timeout/abort ends the contiguous prefix
+			// cleanly; anything else is a hard pipe error.
+			abortAndDrain()
+			if !drained {
+				return got, errWinTransportBroken
+			}
+			runtime.KeepAlive(slots)
+			if errno, ok := callErr.(syscall.Errno); ok {
+				switch errno {
+				case errSemTimeout, errOpAborted, errTimeout:
+					return got, nil
+				}
+			}
+			return got, fmt.Errorf("asicam: ReadPipe failed: %v", callErr)
+		}
+		if int(transferred) < len(slots[i].buf) {
+			// Short slot = the FX3 frame-end short packet: the prefix is the frame.
+			abortAndDrain()
+			if !drained {
+				return got, errWinTransportBroken
+			}
+			runtime.KeepAlive(slots)
+			return got, nil
+		}
+		// Slot fully filled — keep the window covered.
+		if next < nslots {
+			if err := arm(next); err == nil {
+				next++
+			}
+		}
+	}
+	// Every armed slot completed full: nothing in flight, just release the events.
+	for i := range slots {
+		if slots[i].ev != 0 {
+			procCloseHandle.Call(slots[i].ev)
+			slots[i].ev = 0
+		}
+	}
+	runtime.KeepAlive(buf)
+	runtime.KeepAlive(slots)
+	return got, nil
 }
 
 // BulkRead reads one frame from the bulk-IN endpoint into buf, in fixed maxBulkChunk reads
@@ -369,7 +630,11 @@ func (d *winusbDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 		if ms > idle {
 			ms = idle
 		}
-		n, err := d.readChunk(scratch, uint32(ms.Milliseconds()))
+		msec := uint32(ms.Milliseconds())
+		if msec == 0 {
+			msec = 1 // <1 ms remaining truncates to 0 = INFINITE for WinUSB PIPE_TRANSFER_TIMEOUT
+		}
+		n, err := d.readChunk(scratch, msec)
 		if n > 0 {
 			got += copy(buf[got:], scratch[:n])
 			lastData = time.Now()

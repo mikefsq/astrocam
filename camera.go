@@ -10,8 +10,9 @@ import (
 
 // modeCarrier is implemented by a vendor Regmap that holds the live ReadoutMode the Camera
 // updates (FPS%, output depth, bin), letting the Camera mutate it without asserting a concrete
-// regmap type.
-type modeCarrier interface{ liveMode() *ReadoutMode }
+// regmap type. Mutations run under the regmap's mode lock — capture goroutines read the mode
+// (ModeOf) concurrently with camera methods changing it.
+type modeCarrier interface{ updateMode(func(*ReadoutMode)) }
 
 // superSpeedReporter is the optional Transport capability that reports the negotiated USB link
 // speed (USB3 SuperSpeed vs USB2 HighSpeed). The readout mode follows the live link, not the
@@ -43,7 +44,17 @@ type Camera struct {
 	status     ExposureStatus
 	expDur     time.Duration
 	expStart   time.Time
-	subtype    int // firmware subtype byte (GetFirmwareVer); gates init branches
+	// expGen is the exposure generation: bumped by every StartExposure/StartVideo. A capture
+	// in flight snapshots it; status writes and abort checks are generation-guarded so a stale
+	// worker (aborted then superseded by a new StartExposure) can neither un-abort itself nor
+	// clobber the new exposure's state.
+	expGen uint64
+	// expAborted is the dedicated abort signal for the CURRENT generation (StopExposure sets
+	// it; StartExposure clears it). Distinct from status: a status poll deriving SUCCESS must
+	// not read as an abort to the worker still integrating.
+	expAborted bool
+	expLight   bool // light/dark flag of the current exposure (recovery re-arms with the same)
+	subtype    int  // firmware subtype byte (GetFirmwareVer); gates init branches
 
 	// stalls counts worker readout stalls (short/failed reads that triggered a re-arm) over the
 	// camera's lifetime, surfaced by StallCount(). Atomic, not mu-guarded.
@@ -119,7 +130,7 @@ func Open(t Transport, vid, pid uint16) (*Camera, error) {
 // uses; affects the next SetROI/SetExposure. 100 = fastest readout the bus allows.
 func (c *Camera) SetFPSPercent(pct int) {
 	if r, ok := c.rm.(modeCarrier); ok {
-		r.liveMode().FPSPercent = pct
+		r.updateMode(func(m *ReadoutMode) { m.FPSPercent = pct })
 	}
 }
 
@@ -129,7 +140,7 @@ func (c *Camera) SetFPSPercent(pct int) {
 // not change FPSPercent (set that with SetFPSPercent).
 func (c *Camera) SetUSB3(usb3 bool) {
 	if r, ok := c.rm.(modeCarrier); ok {
-		r.liveMode().USB3 = usb3
+		r.updateMode(func(m *ReadoutMode) { m.USB3 = usb3 })
 	}
 }
 
@@ -148,10 +159,28 @@ func (c *Camera) Color() bool { return c.model.Color }
 // ST4 reports whether the model has an ST4 guide port (CanPulseGuide).
 func (c *Camera) ST4() bool { return c.model.ST4 }
 
-// Close stops the TEC regulation goroutine (joining it cleanly) and closes the transport. Safe
-// to call once.
+// Close quiesces any in-flight capture (StopExposure: abort flag + sensor master-stop +
+// FPGA stop + flush — a sensor left free-running into a closed host is the FX3-crash
+// mechanism), stops the TEC regulation goroutine (joining it cleanly), zeroes the TEC if
+// cooling was active (a disconnecting client must not leave the cooler driving open-loop at
+// its last power — the FPGA holds the drive register), and closes the transport. The stop
+// writes queue behind a bulk read still in flight (ioMu), which is bounded by the read's
+// total gate; a blocked GetDataAfterExp is not joined — its generation-guarded writes are
+// no-ops and the transport's own Close interlock covers the I/O. DisableCooling alone still
+// leaves the TEC as-is for deliberate stop-regulation-keep-drive uses. Safe to call once.
 func (c *Camera) Close() error {
+	c.mu.Lock()
+	busy := c.status == ExpWorking
+	hadCooler := c.cooler != nil
+	thermal := c.thermal
+	c.mu.Unlock()
+	if busy {
+		_ = c.StopExposure() // best-effort; the transport is about to go away regardless
+	}
 	c.DisableCooling()
+	if hadCooler && thermal != nil {
+		_ = thermal.SetTECPower(0)
+	}
 	return c.t.Close()
 }
 
@@ -180,6 +209,8 @@ func (c *Camera) EnableCooling(thermal Thermal, target float64, cfg CoolerConfig
 		c.coolCancel = cancel
 		c.coolWg.Add(1)
 		go func() { defer c.coolWg.Done(); _ = cl.Run(ctx) }()
+	} else {
+		cl.SetConfig(cfg) // a retarget also applies the new tunables (previously ignored)
 	}
 	c.mu.Unlock()
 	cl.SetTarget(target) // reads temp (I/O) — outside c.mu; the Cooler is self-locked
@@ -392,7 +423,7 @@ func (c *Camera) SetOutputDepth(bpp int) error {
 		return err
 	}
 	if r, ok := c.rm.(modeCarrier); ok {
-		r.liveMode().BytesPerPx = bpp
+		r.updateMode(func(m *ReadoutMode) { m.BytesPerPx = bpp })
 	}
 	return nil
 }
@@ -406,7 +437,7 @@ func (c *Camera) OutputDepth() int { return ModeOf(c.rm).BytesPerPx }
 // Call before arming.
 func (c *Camera) SetHighSpeedMode(on bool) {
 	if r, ok := c.rm.(modeCarrier); ok {
-		r.liveMode().HighSpeed = on
+		r.updateMode(func(m *ReadoutMode) { m.HighSpeed = on })
 	}
 }
 
@@ -497,10 +528,11 @@ func (c *Camera) SetROI(x, y, w, h int) error {
 	// frame (for software bin, the full bin-scaled size at bin 1); SoftBin tells the read path to
 	// downsample.
 	if r, ok := c.rm.(modeCarrier); ok {
-		m := r.liveMode()
-		m.Width, m.Height = sw, sh
-		m.Bin = sbin
-		m.SoftBin = soft
+		r.updateMode(func(m *ReadoutMode) {
+			m.Width, m.Height = sw, sh
+			m.Bin = sbin
+			m.SoftBin = soft
+		})
 	}
 	c.mu.Lock()
 	c.roiX, c.roiY, c.roiW, c.roiH = x, y, w, h // client/output ROI (binned pixels)
@@ -533,7 +565,7 @@ func (c *Camera) SetBinning(bin int) error {
 	// Carry the factor on the readout mode so SetExposure (no bin arg) picks the binned mode's
 	// timing base.
 	if r, ok := c.rm.(modeCarrier); ok {
-		r.liveMode().Bin = bin
+		r.updateMode(func(m *ReadoutMode) { m.Bin = bin })
 	}
 	return nil
 }

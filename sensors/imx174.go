@@ -224,7 +224,12 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 			start := time.Now()
 			for time.Since(start) < exposure {
 				if ctl.Aborted() {
-					return errExposureAborted // StopExposure ran: bail
+					// StopExposure ran: bail, dropping the trigger signal on the way out —
+					// left asserted, the next trigger(true) is a no-edge write and the FPGA
+					// never gates the integration. (Host-side hygiene, not object-derived:
+					// the SDK snap thread never host-aborts mid-integration.)
+					_ = trigger(false)
+					return errExposureAborted
 				}
 				time.Sleep(100 * time.Millisecond)
 			}
@@ -253,6 +258,20 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	}
 	readFrame := func() (int, error) { return ctl.BulkRead(buf[:target], readTimeout) }
 
+	// Halt the readout pipeline on EVERY return — the 174 object's WorkingFunc exit:
+	// StopSensorStreaming (0x212=1 → master 0x200=1 → FPGAStop, per 0054_CCameraS174MM_Mini.o)
+	// then SendCMD(0xAA) then ResetEndPoint. A free-running sensor piles undrained frames into
+	// the FX3 GPIF/DMA until the firmware crashes (~2-5k frames). Replaces the earlier
+	// success-path-only inline halt (fpgaStop → 0x200=1 → 0xAA, no 0x212), which predated the
+	// object exit decode. Best-effort: a failed stop must not fail a good frame.
+	defer func() {
+		_ = rm.WriteReg(0x212, 1)
+		_ = rm.WriteReg(imx174RegMaster, 1) // sensor master stop
+		_ = fpgaStop()                      // FPGA reg0 bit4 = 1 (readout-stop)
+		_ = ctl.VendorCmd(0xAA)             // SendCMD stream-stop
+		_ = ctl.ResetEndpoint()
+	}()
+
 	// Integrate once, then read once. A short/failed read is returned to GetDataAfterExp, whose
 	// firmware-version check decides dead (ErrDeviceWedged) vs a transient short — an in-worker
 	// clear-pipe + re-arm retry never recovered anything in soak testing.
@@ -261,12 +280,6 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	}
 	n, err := readFrame()
 	if err == nil && n >= target {
-		// Halt the readout pipeline so the sensor doesn't free-run between captures, piling
-		// undrained frames into the FX3 GPIF/DMA (FPGAStop 0x71 + master-stop 0x200=1 +
-		// SendCMD-stop 0xAA). Best-effort: a failed stop must not fail a good frame.
-		_ = fpgaStop()                      // FPGA reg0 bit4 = 1 (readout-stop)
-		_ = rm.WriteReg(imx174RegMaster, 1) // sensor master stop
-		_ = ctl.VendorCmd(0xAA)             // SendCMD stream-stop
 		return n, nil
 	}
 	if !ctl.Aborted() {
@@ -363,16 +376,7 @@ func imx174SetGain(rm Regmap, gain int) error {
 		gain = 0
 	}
 	g := uint16(gain)
-	if err := rm.WriteReg(imx174RegLatch, 1); err != nil {
-		return err
-	}
-	if err := rm.WriteReg(imx174RegGainL, g&0xff); err != nil {
-		return err
-	}
-	if err := rm.WriteReg(imx174RegGainH, (g>>8)&0xff); err != nil {
-		return err
-	}
-	return rm.WriteReg(imx174RegLatch, 0)
+	return WriteRegLE(rm, imx174RegLatch, []uint16{imx174RegGainL, imx174RegGainH}, uint32(g))
 }
 
 const (
@@ -461,42 +465,38 @@ func imx174SetExposure(rm Regmap, d time.Duration) error {
 	if err := SetVMAX(rm, uint32(vmax)); err != nil { // modern: VMAX -> FPGA 0x10/0x11/0x12
 		return err
 	}
-	if err := rm.WriteReg(imx174RegLatch, 1); err != nil {
-		return err
-	}
-	if longFrame {
-		// Sensor long-exposure (cycle-count) mode (SetExp): FRAME = height+0x26,
-		// LINES = VMAX-0x12 (24-bit LE), each written twice (0x244-0x249 then 0x24a-0x24f).
-		frame := uint32(defaultVMAX)
-		lns := uint32(vmax - 0x12)
-		for _, regs := range [][]uint16{
-			{0x244, 0x245, 0x246}, {0x247, 0x248, 0x249},
-			{0x24a, 0x24b, 0x24c}, {0x24d, 0x24e, 0x24f},
-		} {
-			v := frame
-			if regs[0] == 0x247 || regs[0] == 0x24d {
-				v = lns
+	return WithLatch(rm, imx174RegLatch, func() error {
+		if longFrame {
+			// Sensor long-exposure (cycle-count) mode (SetExp): FRAME = height+0x26,
+			// LINES = VMAX-0x12 (24-bit LE), each written twice (0x244-0x249 then 0x24a-0x24f).
+			frame := uint32(defaultVMAX)
+			lns := uint32(vmax - 0x12)
+			for _, regs := range [][]uint16{
+				{0x244, 0x245, 0x246}, {0x247, 0x248, 0x249},
+				{0x24a, 0x24b, 0x24c}, {0x24d, 0x24e, 0x24f},
+			} {
+				v := frame
+				if regs[0] == 0x247 || regs[0] == 0x24d {
+					v = lns
+				}
+				if err := WriteRegLE(rm, 0, regs, v); err != nil {
+					return err
+				}
 			}
-			if err := WriteRegLE(rm, 0, regs, v); err != nil {
+			if err := rm.WriteReg(0x25c, 0xff); err != nil {
 				return err
 			}
 		}
-		if err := rm.WriteReg(0x25c, 0xff); err != nil {
+		// 0x22a selects sensor timing: 1 = long-exposure (cycle-count) mode, 0 = normal.
+		longBit := uint16(0)
+		if longFrame {
+			longBit = 1
+		}
+		if err := rm.WriteReg(0x22a, longBit); err != nil {
 			return err
 		}
-	}
-	// 0x22a selects sensor timing: 1 = long-exposure (cycle-count) mode, 0 = normal.
-	longBit := uint16(0)
-	if longFrame {
-		longBit = 1
-	}
-	if err := rm.WriteReg(0x22a, longBit); err != nil {
-		return err
-	}
-	if err := WriteRegLE(rm, 0, []uint16{imx174RegSHSL, imx174RegSHSH}, uint32(shs)); err != nil {
-		return err
-	}
-	return rm.WriteReg(imx174RegLatch, 0)
+		return WriteRegLE(rm, 0, []uint16{imx174RegSHSL, imx174RegSHSH}, uint32(shs))
+	})
 }
 
 // imx174SetROI — SetStartPos (X->0x301/0x302, Y->0x303/0x304; X aligned to 4, Y to 2) plus
@@ -529,21 +529,20 @@ func imx174SetROI(rm Regmap, x, y, w, h, bin int) error {
 	uw, uh := uint16(w), uint16(h)
 	vmax := uint16(h + imx174VMAXOffset) // bin 1
 
-	if err := rm.WriteReg(imx174RegLatch, 1); err != nil {
-		return err
-	}
-	for _, rv := range []RegVal{
-		{Reg: imx174RegVMAXL, Val: vmax & 0xff}, {Reg: imx174RegVMAXH, Val: (vmax >> 8) & 0xff},
-		{Reg: imx174RegStartXL, Val: ux & 0xff}, {Reg: imx174RegStartXH, Val: (ux >> 8) & 0xff},
-		{Reg: imx174RegStartYL, Val: uy & 0xff}, {Reg: imx174RegStartYH, Val: (uy >> 8) & 0xff},
-		{Reg: imx174RegWidthL, Val: uw & 0xff}, {Reg: imx174RegWidthH, Val: (uw >> 8) & 0xff},
-		{Reg: imx174RegHeightL, Val: uh & 0xff}, {Reg: imx174RegHeightH, Val: (uh >> 8) & 0xff},
-	} {
-		if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
-			return err
+	if err := WithLatch(rm, imx174RegLatch, func() error {
+		for _, rv := range []RegVal{
+			{Reg: imx174RegVMAXL, Val: vmax & 0xff}, {Reg: imx174RegVMAXH, Val: (vmax >> 8) & 0xff},
+			{Reg: imx174RegStartXL, Val: ux & 0xff}, {Reg: imx174RegStartXH, Val: (ux >> 8) & 0xff},
+			{Reg: imx174RegStartYL, Val: uy & 0xff}, {Reg: imx174RegStartYH, Val: (uy >> 8) & 0xff},
+			{Reg: imx174RegWidthL, Val: uw & 0xff}, {Reg: imx174RegWidthH, Val: (uw >> 8) & 0xff},
+			{Reg: imx174RegHeightL, Val: uh & 0xff}, {Reg: imx174RegHeightH, Val: (uh >> 8) & 0xff},
+		} {
+			if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
+				return err
+			}
 		}
-	}
-	if err := rm.WriteReg(imx174RegLatch, 0); err != nil {
+		return nil
+	}); err != nil {
 		return err
 	}
 	// FPGA frame geometry (modern path; Cam_SetResolution): HBLK=0, VBLK=0xb, Width, Height.

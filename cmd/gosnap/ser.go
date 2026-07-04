@@ -37,15 +37,26 @@ const (
 	serBayerBGGR = 11
 )
 
-// serLittleEndian: SER v3 field, 1 = little-endian data. The camera delivers RAW16
-// little-endian, written verbatim. (8-bit data is byte-order-agnostic.)
-const serLittleEndian = 1
+// serLittleEndian: SER v3 LittleEndian header field. The spec TEXT says 1 = little-endian,
+// but the de-facto convention (FireCapture, SharpCap, and the readers tuned to them) is
+// INVERTED: 0 with little-endian data. The camera delivers RAW16 little-endian, written
+// verbatim, so follow the ecosystem — a spec-literal 1 makes strict readers byte-swap.
+// (8-bit data is byte-order-agnostic.)
+const serLittleEndian = 0
 
 // netEpochTicks is the number of 100-ns ticks from the .NET epoch (0001-01-01) to the
 // Unix epoch (1970-01-01) — SER timestamps are .NET DateTime ticks.
 const netEpochTicks = 621355968000000000
 
 func netTicks(t time.Time) int64 { return netEpochTicks + t.UnixNano()/100 }
+
+// netTicksLocal renders t's LOCAL wall-clock as .NET ticks — the SER DateTime field is
+// local time (DateTimeUTC is the UTC one). UnixNano is zone-independent (netTicks(t) ==
+// netTicks(t.UTC())), so the local field needs the zone offset added explicitly.
+func netTicksLocal(t time.Time) int64 {
+	_, off := t.Zone()
+	return netTicks(t) + int64(off)*10_000_000 // offset seconds → 100 ns ticks
+}
 
 type serWriter struct {
 	f          *os.File
@@ -94,8 +105,8 @@ func newSER(path string, w, h, bpp int, colorID int32, instrument string) (*serW
 	writeFixed(hdr[82:122], instrument)
 	writeFixed(hdr[122:162], "")
 	now := time.Now()
-	le.PutUint64(hdr[162:], uint64(netTicks(now)))
-	le.PutUint64(hdr[170:], uint64(netTicks(now.UTC())))
+	le.PutUint64(hdr[162:], uint64(netTicksLocal(now)))
+	le.PutUint64(hdr[170:], uint64(netTicks(now)))
 	if _, err := f.Write(hdr); err != nil {
 		f.Close()
 		return nil, err
@@ -103,16 +114,18 @@ func newSER(path string, w, h, bpp int, colorID int32, instrument string) (*serW
 	return &serWriter{f: f, frameBytes: w * h * bpp}, nil
 }
 
-// writeFrame appends one frame's raw pixels (exactly frameBytes) and records its capture
-// time for the trailer.
-func (s *serWriter) writeFrame(data []byte) error {
+// writeFrame appends one frame's raw pixels (exactly frameBytes) and records `at` — the
+// frame's CAPTURE time — in the trailer. The caller stamps at read completion, not at
+// write time: the async writer drains a pool-deep queue, and a write-time stamp would
+// skew every trailer entry by pool×frame-time.
+func (s *serWriter) writeFrame(data []byte, at time.Time) error {
 	if len(data) != s.frameBytes {
 		return fmt.Errorf("ser: frame %d is %d bytes, want %d", s.count, len(data), s.frameBytes)
 	}
 	if _, err := s.f.Write(data); err != nil {
 		return err
 	}
-	s.stamps = append(s.stamps, netTicks(time.Now()))
+	s.stamps = append(s.stamps, netTicks(at))
 	s.count++
 	return nil
 }

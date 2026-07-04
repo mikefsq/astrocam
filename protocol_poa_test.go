@@ -110,7 +110,7 @@ func TestPOAVendorRegistered(t *testing.T) {
 	if !ok {
 		t.Fatal("poaRegmap does not implement modeCarrier")
 	}
-	mc.liveMode().Bin = 2
+	mc.updateMode(func(m *ReadoutMode) { m.Bin = 2 })
 	if got := ModeOf(rm).Bin; got != 2 {
 		t.Errorf("poaRegmap live mode Bin = %d, want 2", got)
 	}

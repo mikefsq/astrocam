@@ -9,7 +9,7 @@ package astrocam
 // and echoed back on the matching reads, the FX3 vendor commands (stop/start/flush/bank/GPIF)
 // are accepted as no-ops, ReadFirmwareVer returns a configurable version, and every bulk /
 // windowed-stream read is filled with a synthetic frame. It satisfies Transport plus
-// EndpointResetter and FrameStreamer.
+// EndpointResetter, FrameStreamer and PrequeuedFrameStreamer.
 
 import (
 	"sync"
@@ -124,6 +124,12 @@ func (t *StubTransport) BulkRead(buf []byte, timeout time.Duration) (int, error)
 
 // ReadFrameStream satisfies FrameStreamer (the large-frame USB3 windowed pump).
 func (t *StubTransport) ReadFrameStream(buf []byte, idle, total time.Duration) (int, error) {
+	return t.serve(buf)
+}
+
+// ReadFrameStreamPrequeued satisfies PrequeuedFrameStreamer (the free-run exact-cover batch),
+// so tests exercise the same dispatch the real backends take (finding 2.4).
+func (t *StubTransport) ReadFrameStreamPrequeued(buf []byte, idle, total time.Duration) (int, error) {
 	return t.serve(buf)
 }
 

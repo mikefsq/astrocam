@@ -48,19 +48,31 @@ func (c *Camera) LoadDefectMap(fullW, fullH int) (*DefectMap, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &DefectMap{W: fullW, H: fullH, Color: c.Color()}
+	return parseDefectMap(blob, length, fullW, fullH, c.Color()), nil
+}
+
+// parseDefectMap decompresses an "ASID" blob (header included) into a DefectMap — the
+// pure parsing half of LoadDefectMap, split out so it is testable without flash I/O.
+func parseDefectMap(blob []byte, length, fullW, fullH int, color bool) *DefectMap {
+	m := &DefectMap{W: fullW, H: fullH, Color: color}
 	m.bitmap = decompressASID(blob, length, fullW*fullH)
+	npix := fullW * fullH
 	for k, b := range m.bitmap {
 		if b == 0 {
 			continue
 		}
 		for bit := 0; bit < 8; bit++ {
 			if b&(1<<uint(bit)) != 0 {
-				m.Defects = append(m.Defects, k*8+bit)
+				// Tail bits of the last bitmap byte are padding, not pixels (0xFF flash fill
+				// would otherwise flag p ≥ W·H and ApplyRAW16's setpx would write past the
+				// frame end).
+				if p := k*8 + bit; p < npix {
+					m.Defects = append(m.Defects, p)
+				}
 			}
 		}
 	}
-	return m, nil
+	return m
 }
 
 // decompressASID expands the "ASID" sparse-RLE payload into the packed 1-bit-per-pixel defect
@@ -71,7 +83,9 @@ func (c *Camera) LoadDefectMap(fullW, fullH int) (*DefectMap, error) {
 func decompressASID(blob []byte, length, npix int) []byte {
 	bitmap := make([]byte, (npix+7)/8)
 	base := 0
-	for x9 := 0; x9+8 < length && x9+9 < len(blob); x9 += 2 {
+	// Both bytes of an entry must sit inside the declared payload: x9+9 < length, not
+	// x9+8 — the latter admitted a 2-byte entry straddling an odd payload end.
+	for x9 := 0; x9+9 < length && x9+9 < len(blob); x9 += 2 {
 		b0, b1 := blob[x9+8], blob[x9+9]
 		if b0 == 0 && b1 == 0 {
 			base += 256

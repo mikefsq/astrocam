@@ -17,6 +17,7 @@ package astrocam
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -115,8 +116,8 @@ type Cooler struct {
 	on       bool
 }
 
-// NewCooler builds a cooler. A zero-value config field falls back to the default.
-func NewCooler(io Thermal, cfg CoolerConfig) *Cooler {
+// normalizeCoolerConfig fills zero-value gains/Tick/MaxPower with the defaults.
+func normalizeCoolerConfig(cfg CoolerConfig) CoolerConfig {
 	d := DefaultCoolerConfig()
 	if cfg.Kp == 0 && cfg.Ki == 0 && cfg.Kd == 0 {
 		cfg.Kp, cfg.Ki, cfg.Kd = d.Kp, d.Ki, d.Kd
@@ -127,7 +128,22 @@ func NewCooler(io Thermal, cfg CoolerConfig) *Cooler {
 	if cfg.MaxPower == 0 {
 		cfg.MaxPower = d.MaxPower
 	}
-	return &Cooler{io: io, cfg: cfg, prevErr: prevErrSentinel, prevErr2: prevErrSentinel}
+	return cfg
+}
+
+// NewCooler builds a cooler. A zero-value config field falls back to the default.
+func NewCooler(io Thermal, cfg CoolerConfig) *Cooler {
+	return &Cooler{io: io, cfg: normalizeCoolerConfig(cfg), prevErr: prevErrSentinel, prevErr2: prevErrSentinel}
+}
+
+// SetConfig applies new tunables to a running cooler (gains, limits, ramp, guard), with
+// the same zero-value normalization as NewCooler. Run reads Tick once at start, so a
+// Tick change takes effect only on a future Run. Safe to call while Run is regulating.
+func (c *Cooler) SetConfig(cfg CoolerConfig) {
+	cfg = normalizeCoolerConfig(cfg)
+	c.mu.Lock()
+	c.cfg = cfg
+	c.mu.Unlock()
 }
 
 // SetTarget arms cooling toward target °C: seeds the effective target at the current
@@ -167,10 +183,13 @@ func (c *Cooler) Power() float64 { c.mu.Lock(); defer c.mu.Unlock(); return c.po
 // scaled to this tick's elapsed dt (a time-based anti-shock ramp). RampRate 0 = jump
 // straight to the target.
 func (c *Cooler) rampTarget(dt time.Duration) {
+	if c.cfg.RampRate <= 0 {
+		c.effTgt = c.target // no ramp configured: go straight to the target
+		return
+	}
 	step := c.cfg.RampRate / 60 * dt.Seconds() // °C of setpoint movement this tick
 	if step <= 0 {
-		c.effTgt = c.target
-		return
+		return // dt ≤ 0 (clock stall / degenerate tick): hold — never collapse the anti-shock ramp
 	}
 	if d := c.target - c.effTgt; math.Abs(d) <= step {
 		c.effTgt = c.target
@@ -262,19 +281,38 @@ func (c *Cooler) Step(dt time.Duration) (float64, error) {
 	return temp, nil
 }
 
+// runMaxConsecFails is how many consecutive Step failures Run tolerates before it gives up.
+// One transient EP0 error (a timeout during a capture-recovery bus reset, say) must not kill
+// regulation with the TEC still energized; ~30 s of solid failures means the device is gone.
+const runMaxConsecFails = 15
+
 // Run drives Step on the configured Tick until ctx is canceled. Call it in its own
-// goroutine.
+// goroutine. Transient Step errors are tolerated (the loop keeps ticking and re-tries);
+// after runMaxConsecFails consecutive failures it drives the TEC to zero (best-effort —
+// never leave an unregulated TEC at its last power) and returns the last error.
 func (c *Cooler) Run(ctx context.Context) error {
 	t := time.NewTicker(c.cfg.Tick)
 	defer t.Stop()
 	last := time.Now()
+	fails := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case now := <-t.C:
+		case <-t.C:
+			// dt from the wall clock, not the tick timestamp: a Step blocked behind a long
+			// readout (ioMu) leaves a stale tick in the channel, and its old timestamp would
+			// understate dt — the rate guard then reads a slow real drift as a fast swing
+			// (Δtemp over 30 s divided by 200 ms) and skips regulation.
+			now := time.Now()
 			if _, err := c.Step(now.Sub(last)); err != nil {
-				return err
+				fails++
+				if fails >= runMaxConsecFails {
+					_ = c.io.SetTECPower(0)
+					return fmt.Errorf("cooler: %d consecutive step failures, TEC zeroed: %w", fails, err)
+				}
+			} else {
+				fails = 0
 			}
 			last = now
 		}

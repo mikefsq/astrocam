@@ -174,18 +174,37 @@ func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := arm(true); err != nil {
 		return 0, err
 	}
+	// Halt the readout on EVERY return — the 178 object's WorkingFunc exit:
+	// StopSensorStreaming (= FPGAStop ONLY, per 0131_CCameraS178MM.o — no sensor register,
+	// unlike the STARVIS dies) then SendCMD(0xAA) then ResetEndPoint. A sensor left
+	// free-running with no reader backs up the FX3 GPIF. Best-effort. VERIFY-HW: ported
+	// from the object; no 178 on the bench at port time.
+	defer func() {
+		_ = SetFPGABit(rm, 0x00, 0x10, true) // FPGAStop: reg0 bit4
+		_ = ctl.VendorCmd(0xAA)
+		_ = ctl.ResetEndpoint()
+	}()
 	_ = ctl.ResetEndpoint()
 	if err := trigger(true); err != nil {
 		return 0, err
 	}
-	if exposure <= time.Second {
+	// Band split must match imx178SetExposure's trigger threshold (>= 1 s, EXACT): at exactly
+	// 1 s the FPGA is in trigger mode and the host hold IS the integration, so it gets the
+	// full-exposure wait — `<=` here under-integrated a 1.000 s exposure by 200 ms.
+	if exposure < time.Second {
 		if w := exposure - 200*time.Millisecond; w > 0 {
 			time.Sleep(w)
 		}
 	} else {
 		for start := time.Now(); time.Since(start) < exposure; {
 			if ctl.Aborted() {
-				return 0, errExposureAborted // StopExposure ran: bail instead of waiting out the integration
+				// StopExposure ran: bail, dropping the trigger window on the way out —
+				// trigger(false) clears BOTH the trigger signal (reg 0x0b bit0) and
+				// XHSStop (reg 0x0a bit4); left asserted, the next trigger(true) is a
+				// no-edge write. (Host-side hygiene, not object-derived: the SDK snap
+				// thread never host-aborts mid-integration.)
+				_ = trigger(false)
+				return 0, errExposureAborted
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -242,24 +261,23 @@ func imx178SetGain(rm Regmap, gain int) error {
 	if gain < 0 {
 		gain = 0
 	}
-	if err := rm.WriteReg(imx178RegLatch, 1); err != nil {
-		return err
-	}
 	conv := uint16(0)
 	if gain > imx178GainHCGAt {
 		conv = 0x1e
 	}
 	g := uint16(gain)
-	for _, rv := range []RegVal{
-		{Reg: imx178RegConvGain, Val: conv},
-		{Reg: imx178RegGainL, Val: g & 0xff},
-		{Reg: imx178RegGainH, Val: (g >> 8) & 0xff},
-	} {
-		if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
-			return err
+	return WithLatch(rm, imx178RegLatch, func() error {
+		for _, rv := range []RegVal{
+			{Reg: imx178RegConvGain, Val: conv},
+			{Reg: imx178RegGainL, Val: g & 0xff},
+			{Reg: imx178RegGainH, Val: (g >> 8) & 0xff},
+		} {
+			if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
+				return err
+			}
 		}
-	}
-	return rm.WriteReg(imx178RegLatch, 0)
+		return nil
+	})
 }
 
 var imx178Shutter = ShutterModel{
@@ -310,18 +328,17 @@ func imx178SetROI(rm Regmap, x, y, w, h, bin int) error {
 	uy := uint16(y &^ 1) // align Y to 2
 	uw, uh := uint16(w), uint16(h)
 
-	if err := rm.WriteReg(imx178RegLatch, 1); err != nil {
-		return err
-	}
-	for _, rv := range []RegVal{
-		{Reg: imx178RegStartXL, Val: ux & 0xff}, {Reg: imx178RegStartXH, Val: (ux >> 8) & 0xff},
-		{Reg: imx178RegStartYL, Val: uy & 0xff}, {Reg: imx178RegStartYH, Val: (uy >> 8) & 0xff},
-	} {
-		if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
-			return err
+	if err := WithLatch(rm, imx178RegLatch, func() error {
+		for _, rv := range []RegVal{
+			{Reg: imx178RegStartXL, Val: ux & 0xff}, {Reg: imx178RegStartXH, Val: (ux >> 8) & 0xff},
+			{Reg: imx178RegStartYL, Val: uy & 0xff}, {Reg: imx178RegStartYH, Val: (uy >> 8) & 0xff},
+		} {
+			if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
+				return err
+			}
 		}
-	}
-	if err := rm.WriteReg(imx178RegLatch, 0); err != nil {
+		return nil
+	}); err != nil {
 		return err
 	}
 
