@@ -1,0 +1,155 @@
+package astrocam
+
+import (
+	"os"
+	"testing"
+	"time"
+)
+
+// newFakeUsbfs returns a usbfsDevice over /dev/null: every ioctl fails instantly (ENOTTY),
+// so the only observable behavior is the LOCK DISCIPLINE — which is exactly what these
+// tests pin down. The ioMu serialization is the single most safety-critical property of the
+// transport (a control transfer interleaving a USB2 bulk readout parks the FX3 GPIF), and
+// before these tests it was locked only by convention.
+func newFakeUsbfs(t *testing.T) *usbfsDevice {
+	t.Helper()
+	f, err := os.OpenFile("/dev/null", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return &usbfsDevice{f: f}
+}
+
+// runsWhileLocked reports whether op completes while d.ioMu is held by the test. wait is how
+// long to give the op: guarded ops use a short window (they are blocked on the held lock, so
+// a longer wait only slows the test); exempt ops need a generous one so scheduler jitter
+// under -race can't make a lock-free op look blocked (a flake, not a finding).
+func runsWhileLocked(t *testing.T, d *usbfsDevice, wait time.Duration, op func()) bool {
+	t.Helper()
+	d.ioMu.Lock()
+	done := make(chan struct{})
+	go func() { op(); close(done) }()
+	var completed bool
+	select {
+	case <-done:
+		completed = true
+	case <-time.After(wait):
+		completed = false
+	}
+	d.ioMu.Unlock()
+	if !completed {
+		select {
+		case <-done: // released by the unlock — the op was honoring ioMu
+		case <-time.After(2 * time.Second):
+			t.Fatal("op never completed even after ioMu was released")
+		}
+	}
+	return completed
+}
+
+// TestIoMuDiscipline pins which transport operations serialize on ioMu. Guarded ops must
+// block while another I/O holds the lock; the two deliberate exceptions must not.
+func TestIoMuDiscipline(t *testing.T) {
+	buf := make([]byte, 4096)
+	guarded := []struct {
+		name string
+		op   func(d *usbfsDevice)
+	}{
+		{"ControlIn", func(d *usbfsDevice) { _, _ = d.ControlIn(0xB3, 0, 0, buf[:2]) }},
+		{"ControlOut", func(d *usbfsDevice) { _ = d.ControlOut(0xB6, 0, 0, nil) }},
+		{"BulkRead", func(d *usbfsDevice) { _, _ = d.BulkRead(buf, time.Second) }},
+		{"ReadFrameStreamPrequeued", func(d *usbfsDevice) {
+			_, _ = d.ReadFrameStreamPrequeued(buf, 100*time.Millisecond, time.Second)
+		}},
+		// CLEAR_HALT is EP0 traffic: it must not land mid-readout any more than a
+		// register read may (REVIEW 3.1).
+		{"ResetEndpoint", func(d *usbfsDevice) { _ = d.ResetEndpoint(bulkEndpoint) }},
+	}
+	for _, g := range guarded {
+		t.Run(g.name, func(t *testing.T) {
+			d := newFakeUsbfs(t)
+			if runsWhileLocked(t, d, 100*time.Millisecond, func() { g.op(d) }) {
+				t.Errorf("%s ran while ioMu was held — EP0/bulk interleave is the GPIF-wedge mechanism", g.name)
+			}
+		})
+	}
+
+	exempt := []struct {
+		name string
+		why  string
+		op   func(d *usbfsDevice)
+	}{
+		// ReadFrameStream (bulkOne) is the USB3/DDR path that REQUIRES a concurrent
+		// FPGABufReload; its DDR buffering makes the interleave harmless (see ioMu doc).
+		{"ReadFrameStream", "DDR path needs concurrent FPGABufReload", func(d *usbfsDevice) {
+			_, _ = d.ReadFrameStream(buf, 50*time.Millisecond, 200*time.Millisecond)
+		}},
+		// ResetDevice is the last-resort unwedger: it must work WHILE a stuck read holds
+		// ioMu — serializing it would deadlock the recovery.
+		{"ResetDevice", "must recover a wedged read that holds ioMu", func(d *usbfsDevice) {
+			_ = d.ResetDevice()
+		}},
+	}
+	for _, e := range exempt {
+		t.Run(e.name, func(t *testing.T) {
+			d := newFakeUsbfs(t)
+			if !runsWhileLocked(t, d, time.Second, func() { e.op(d) }) {
+				t.Errorf("%s blocked on ioMu — it is a deliberate exception (%s)", e.name, e.why)
+			}
+		})
+	}
+}
+
+// TestClosedTransportFailsFast: post-Close I/O returns errTransportClosed instead of EBADF
+// (or worse, racing the fd); Close is idempotent; Close waits for in-flight I/O.
+func TestClosedTransportFailsFast(t *testing.T) {
+	d := newFakeUsbfs(t)
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ControlIn(0xB3, 0, 0, make([]byte, 2)); err != errTransportClosed {
+		t.Errorf("ControlIn after Close = %v, want errTransportClosed", err)
+	}
+	if _, err := d.BulkRead(make([]byte, 16), time.Second); err != errTransportClosed {
+		t.Errorf("BulkRead after Close = %v, want errTransportClosed", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Errorf("second Close = %v, want nil (idempotent)", err)
+	}
+}
+
+// TestCloseWaitsForInflightIO: Close must block until in-flight I/O releases the interlock —
+// closing the fd under a live URB drain abandons kernel-held pointers into the caller's buf.
+func TestCloseWaitsForInflightIO(t *testing.T) {
+	d := newFakeUsbfs(t)
+	release, err := d.enter() // simulate an in-flight read holding the interlock
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { _ = d.Close(); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("Close completed while I/O was in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close never completed after the I/O released")
+	}
+}
+
+// TestBrokenTransportFailsFast: a poisoned device (undrainable readout) refuses further I/O.
+func TestBrokenTransportFailsFast(t *testing.T) {
+	d := newFakeUsbfs(t)
+	d.broken.Store(true)
+	if _, err := d.BulkRead(make([]byte, 16), time.Second); err != errTransportBroken {
+		t.Errorf("BulkRead on poisoned device = %v, want errTransportBroken", err)
+	}
+	if err := d.ResetEndpoint(bulkEndpoint); err != errTransportBroken {
+		t.Errorf("ResetEndpoint on poisoned device = %v, want errTransportBroken", err)
+	}
+}
