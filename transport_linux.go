@@ -663,15 +663,17 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 		if d.readAborted.Load() {
 			break // StopExposure broke the wait (AbortRead); return the short prefix
 		}
-		// Slice each synchronous transfer to ≤500 ms so an AbortRead lands within one
-		// slice instead of a whole idle window; the idle-stall gate below is wall-clock
-		// (time since last data), so slicing does not change the stall semantics.
+		// Do NOT slice this transfer's timeout below the idle window: a USBDEVFS_BULK
+		// timeout CANCELS the in-flight URB, and a cancel racing an arriving DDR burst
+		// (the worker's 20 ms FPGABufReload cadence keeps them coming) drops the bytes in
+		// flight — every later byte then lands earlier in the frame, a horizontal shear.
+		// Observed on the 6200/IMX455 when this was briefly sliced to 500 ms for abort
+		// promptness: every few frames displaced sideways. Cancels must stay confined to
+		// the idle boundary, where the stream has been silent for the whole window. The
+		// AbortRead check above still bounds an abort to ≤ one idle window on this path.
 		ms := rem
 		if ms > idle {
 			ms = idle
-		}
-		if ms > 500*time.Millisecond {
-			ms = 500 * time.Millisecond
 		}
 		msec := uint32(ms.Milliseconds())
 		if msec == 0 {
