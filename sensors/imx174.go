@@ -252,11 +252,20 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	}
 	// readTimeout: the trigger band already integrated in expose(), so the read is just the
 	// readout; the ≤4 s bands are sensor-timed DURING the read, so it must cover the exposure.
+	// In those sensor-timed bands the first ~exposure of the read is pure integration, so it
+	// is declared as the BulkReadQuiet quiet window: the transfers stay armed (the GPIF must
+	// never stream without a reader) but the control-transfer gate engages only near the end
+	// of the exposure — TEC polls, telemetry and ST4 pulses flow instead of blocking for the
+	// whole sub. 500 ms undershoot so the gate is in place before data can arrive.
 	readTimeout := 3 * time.Second
+	quiet := time.Duration(0)
 	if !triggerBand {
 		readTimeout = exposure + 3*time.Second
+		if q := exposure - 500*time.Millisecond; q > 0 {
+			quiet = q
+		}
 	}
-	readFrame := func() (int, error) { return ctl.BulkRead(buf[:target], readTimeout) }
+	readFrame := func() (int, error) { return ctl.BulkReadQuiet(buf[:target], quiet, readTimeout) }
 
 	// Halt the readout pipeline on EVERY return — the 174 object's WorkingFunc exit:
 	// StopSensorStreaming (0x212=1 → master 0x200=1 → FPGAStop, per 0054_CCameraS174MM_Mini.o)
@@ -282,9 +291,12 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err == nil && n >= target {
 		return n, nil
 	}
-	if !ctl.Aborted() {
-		ctl.NoteStall() // short/failed read (not an abort) — for the soak StallCount diagnostic
+	if ctl.Aborted() {
+		// StopExposure broke the read (AbortRead): a clean abort, not a stall — surface it
+		// as one so GetDataAfterExp doesn't mislabel the status or probe the firmware.
+		return n, errExposureAborted
 	}
+	ctl.NoteStall() // short/failed read (not an abort) — for the soak StallCount diagnostic
 	return n, err
 }
 

@@ -98,6 +98,12 @@ type WorkerCtl interface {
 	NoteStall()                                              // record one readout stall for the soak diagnostic (Camera.StallCount)
 	Aborted() bool                                           // StopExposure was called: a host-timed integration loop should bail out
 	BulkRead(buf []byte, timeout time.Duration) (int, error) // whole-frame bulk read
+	// BulkReadQuiet is BulkRead whose first `quiet` is a SENSOR-TIMED integration the read
+	// spans (cycle-count / free-run bands): transfers armed up front, but the control-transfer
+	// gate engages only at quiet-elapsed or first data — so the exposure doesn't blind EP0.
+	// Pass quiet undershooting the real integration (leave ≥500 ms margin); quiet 0 = BulkRead.
+	// Falls back to a fully-gated BulkRead on backends without it.
+	BulkReadQuiet(buf []byte, quiet, timeout time.Duration) (int, error)
 	FrameBytes() int                                         // bytes to read off the wire (W*H*bpp; ×SoftBin² for RAW16 software bin)
 	// StreamFrame reads one frame with the continuous windowed pump: transfers cycle on EP 0x81
 	// until len(buf) bytes are in, gap-free across short packets (what a large IMX455/IMX571 frame

@@ -95,7 +95,7 @@ func HMAXBW(w, h, clock, floor, vblankAdd int, bw2, bw3 float64, m ReadoutMode) 
 // The ASI SDK's SetFPSPerc computes exactly HMAXBW: candidate from the link-switched bandwidth
 // (MAX_DATASIZE global, written by SetOutput16Bits: USB3→360715, USB2→43272 — ×10×100 = the
 // bw3/bw2 constants here), clamped up to REG_FRAME_LENGTH_PKG_MIN, then derated ×100/FPSPercent.
-// On USB3 the floor usually dominates (462 full-frame candidate ≈196 < 1100); on USB2 the
+// On USB3 the floor usually dominates (462 full-frame candidate ≈196 < its 261 floor); on USB2 the
 // candidate dominates (462 full-frame 1634 → wire-confirmed HMAX 4085 at pct=40) and pins the
 // sensor line rate to the link budget so the FX3 GPIF never outruns the pipe.
 

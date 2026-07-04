@@ -48,7 +48,14 @@ typedef struct {
     IOUSBDeviceInterface**    dev;
     IOUSBInterfaceInterface** intf;
     UInt8 inPipe;
+    // read_abort is the ReadAborter latch (level-triggered, set/cleared from Go): the frame-
+    // read reap loops poll it each slice and abort the pipe, so a StopExposure breaks a
+    // blocked read within ~100 ms instead of waiting out its gates.
+    volatile int read_abort;
 } asicam_dev;
+
+static void asi_set_read_abort(asicam_dev* d, int v) { __sync_lock_test_and_set(&d->read_abort, v); }
+#define ASI_READ_ABORT(d) __sync_fetch_and_add(&(d)->read_abort, 0)
 
 static IOUSBDeviceInterface** device_interface(io_service_t svc) {
     IOCFPlugInInterface** plugin = NULL; SInt32 score;
@@ -375,17 +382,25 @@ static int asi_read_frame_async(asicam_dev* d, void* buf, uint32_t bufSize,
     }
 
     // Drain every outstanding completion before tearing down: count completions down one by
-    // one; on the overall timeout AbortPipe (which completes the rest as aborted) and keep
-    // draining. Only once inflight hits 0 do we stop the runloop and join, so no callback can
-    // outlive rd. (Mirrors asi_read_frame_stream's teardown.)
-    int64_t waitNs = (int64_t)timeoutMs * 1000000LL + 500000000LL;
+    // one in 100 ms slices so the read_abort latch (StopExposure) is seen promptly; on the
+    // overall deadline or an abort request, AbortPipe (which completes the rest as aborted)
+    // and keep draining with a 2 s per-completion grace. Only once inflight hits 0 do we stop
+    // the runloop and join, so no callback can outlive rd. (Mirrors asi_read_frame_stream.)
+    int64_t deadline = asi_now_ms() + (int64_t)timeoutMs + 500;
     int aborted = 0;
     while (inflight > 0) {
-        if (dispatch_semaphore_wait(rd->comp, dispatch_time(DISPATCH_TIME_NOW, waitNs)) != 0) {
-            if (!aborted) { (*d->intf)->AbortPipe(d->intf, d->inPipe); aborted = 1; waitNs = 2000000000LL; continue; }
-            break; // a transfer is genuinely wedged even after the abort
+        if (dispatch_semaphore_wait(rd->comp, dispatch_time(DISPATCH_TIME_NOW, 100000000LL)) == 0) {
+            inflight--;
+            if (aborted) deadline = asi_now_ms() + 2000; // fresh grace per drained completion
+            continue;
         }
-        inflight--;
+        if (!aborted && (ASI_READ_ABORT(d) || asi_now_ms() > deadline)) {
+            (*d->intf)->AbortPipe(d->intf, d->inPipe);
+            aborted = 1;
+            deadline = asi_now_ms() + 2000;
+            continue;
+        }
+        if (aborted && asi_now_ms() > deadline) break; // genuinely wedged even after the abort
     }
     CFRunLoopStop(rd->rl);
     pthread_join(th, NULL);
@@ -500,7 +515,7 @@ static int asi_read_frame_prequeued(asicam_dev* d, void* buf, uint32_t bufSize, 
             int64_t nowv = asi_now_ms();
             int stall = gotFirst ? (nowv - lastData > (int64_t)idleMs)
                                  : (nowv - start   > (int64_t)totalMs);
-            if (stall) { (*d->intf)->AbortPipe(d->intf, d->inPipe); aborted = 1; abortAt = nowv; }
+            if (ASI_READ_ABORT(d) || stall) { (*d->intf)->AbortPipe(d->intf, d->inPipe); aborted = 1; abortAt = nowv; }
         }
     }
     CFRunLoopStop(rd->rl);
@@ -642,6 +657,7 @@ static int asi_read_frame_stream(asicam_dev* d, void* buf, uint32_t bufSize, uin
     if (sliceNs > 100000000LL) sliceNs = 100000000LL; // wake at least every 100 ms to re-check
     int64_t lastReal = asi_now_ms();
     while (received < bufSize && inflight > 0) {
+        if (ASI_READ_ABORT(d)) break; // StopExposure broke the read; the teardown below drains
         if (dispatch_semaphore_wait(sd->comp, dispatch_time(DISPATCH_TIME_NOW, sliceNs)) != 0) {
             if (asi_now_ms() - lastReal > (int64_t)idleMs) break; // no real data for the idle window
             continue;
@@ -953,6 +969,11 @@ type darwinDevice struct {
 	// handle instead of releasing an interface with I/O in flight.
 	broken atomic.Bool
 
+	// readAborted mirrors the C-side read_abort latch (ReadAborter) for the Go-side entry
+	// fail-fast: while set, new frame reads return (0, nil) without arming anything; the
+	// C reap loops poll the C flag to break a read already blocked in cgo.
+	readAborted atomic.Bool
+
 	// streamMu guards the open resident-session registry (locked after closeMu). Close stops
 	// leftover sessions before releasing the interface their pump threads reference.
 	streamMu sync.Mutex
@@ -1095,6 +1116,27 @@ func (t *darwinDevice) ControlIn(bRequest uint8, wValue, wIndex uint16, data []b
 	return t.control(0xC0, bRequest, wValue, wIndex, data)
 }
 
+// AbortRead / ArmRead implement ReadAborter (see transport.go): the Go latch handles the
+// entry fail-fast, and the C-side read_abort flag breaks a read already blocked inside a
+// cgo call — its reap loops poll the flag every ≤100 ms and abort the pipe.
+func (t *darwinDevice) AbortRead() {
+	t.readAborted.Store(true)
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+	if !t.closed {
+		C.asi_set_read_abort(t.d, 1)
+	}
+}
+
+func (t *darwinDevice) ArmRead() {
+	t.readAborted.Store(false)
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+	if !t.closed {
+		C.asi_set_read_abort(t.d, 0)
+	}
+}
+
 func (t *darwinDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
@@ -1106,6 +1148,9 @@ func (t *darwinDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) 
 	}
 	if t.broken.Load() {
 		return 0, errTransportBroken
+	}
+	if t.readAborted.Load() {
+		return 0, nil // read-abort latched (StopExposure): fail fast, don't take ioMu
 	}
 	t.ioMu.Lock() // hold for the whole frame so no control transfer interleaves (USB2 wedge gate)
 	defer t.ioMu.Unlock()
@@ -1127,6 +1172,9 @@ func (t *darwinDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) 
 		return 0, fmt.Errorf("asicam: async bulk read setup failed (rc %d)", int(rc))
 	}
 	if n == 0 {
+		if t.readAborted.Load() {
+			return 0, nil // aborted mid-read: a clean short prefix, not a timeout failure
+		}
 		return 0, fmt.Errorf("asicam: async bulk read got no data (timeout)")
 	}
 	return int(n), nil
@@ -1150,6 +1198,9 @@ func (t *darwinDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 	}
 	if t.broken.Load() {
 		return 0, errTransportBroken
+	}
+	if t.readAborted.Load() {
+		return 0, nil // read-abort latched (StopExposure): fail fast
 	}
 	idleMs := idle.Milliseconds()
 	if idleMs <= 0 {
@@ -1192,6 +1243,9 @@ func (t *darwinDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 	}
 	if t.broken.Load() {
 		return 0, errTransportBroken
+	}
+	if t.readAborted.Load() {
+		return 0, nil // read-abort latched (StopExposure): fail fast, don't take ioMu
 	}
 	t.ioMu.Lock()
 	defer t.ioMu.Unlock()

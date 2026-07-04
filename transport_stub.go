@@ -9,7 +9,7 @@ package astrocam
 // and echoed back on the matching reads, the FX3 vendor commands (stop/start/flush/bank/GPIF)
 // are accepted as no-ops, ReadFirmwareVer returns a configurable version, and every bulk /
 // windowed-stream read is filled with a synthetic frame. It satisfies Transport plus
-// EndpointResetter, FrameStreamer and PrequeuedFrameStreamer.
+// EndpointResetter, FrameStreamer, PrequeuedFrameStreamer, QuietBulkReader and ReadAborter.
 
 import (
 	"sync"
@@ -44,6 +44,9 @@ type StubTransport struct {
 	Log []StubXfer
 	// Reads counts the bulk/stream frame reads served.
 	Reads int
+	// aborted is the ReadAborter latch (AbortRead/ArmRead): while set, frame reads
+	// return (0, nil) fast, mirroring the hardware backends.
+	aborted bool
 }
 
 // NewStubTransport returns a ready stub camera transport.
@@ -122,6 +125,17 @@ func (t *StubTransport) ControlIn(bRequest uint8, wValue, wIndex uint16, data []
 // BulkRead serves one synthetic frame (the small-frame / USB2 path).
 func (t *StubTransport) BulkRead(buf []byte, timeout time.Duration) (int, error) { return t.serve(buf) }
 
+// BulkReadQuiet satisfies QuietBulkReader (the stub has no gate; quiet is irrelevant).
+func (t *StubTransport) BulkReadQuiet(buf []byte, quiet, timeout time.Duration) (int, error) {
+	return t.serve(buf)
+}
+
+// AbortRead / ArmRead satisfy ReadAborter with the real level-triggered semantics: while
+// aborted, frame reads return (0, nil) fast — so Camera-level abort tests run against the
+// same contract the hardware backends implement.
+func (t *StubTransport) AbortRead() { t.mu.Lock(); t.aborted = true; t.mu.Unlock() }
+func (t *StubTransport) ArmRead()  { t.mu.Lock(); t.aborted = false; t.mu.Unlock() }
+
 // ReadFrameStream satisfies FrameStreamer (the large-frame USB3 windowed pump).
 func (t *StubTransport) ReadFrameStream(buf []byte, idle, total time.Duration) (int, error) {
 	return t.serve(buf)
@@ -135,6 +149,10 @@ func (t *StubTransport) ReadFrameStreamPrequeued(buf []byte, idle, total time.Du
 
 func (t *StubTransport) serve(buf []byte) (int, error) {
 	t.mu.Lock()
+	if t.aborted {
+		t.mu.Unlock()
+		return 0, nil // read-abort latched (see ReadAborter): fail fast, short prefix
+	}
 	t.Reads++
 	frame := t.Frame
 	t.mu.Unlock()
@@ -142,6 +160,11 @@ func (t *StubTransport) serve(buf []byte) (int, error) {
 		frame(buf)
 	}
 	return len(buf), nil
+}
+
+// ControlOutUngated satisfies UngatedControlSender (ST4 pulses); logged like any OUT.
+func (t *StubTransport) ControlOutUngated(bRequest uint8, wValue, wIndex uint16) error {
+	return t.ControlOut(bRequest, wValue, wIndex, nil)
 }
 
 // ResetEndpoint satisfies EndpointResetter (the stub pipe never stalls).

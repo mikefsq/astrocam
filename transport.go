@@ -80,6 +80,44 @@ type FrameStreamZC interface {
 	Release()
 }
 
+// ReadAborter is the optional Transport capability StopExposure uses to make an abort
+// PROMPT: a whole-frame read (BulkRead / ReadFrameStream / ReadFrameStreamPrequeued) can
+// block for seconds — holding ioMu on the gated paths, so even the master-stop control
+// writes queue behind it. AbortRead is LEVEL-triggered: it breaks a read already in
+// flight (drains its transfers and returns the short prefix within ~one poll interval)
+// AND fails any frame read started afterwards fast, until ArmRead clears the state —
+// so a stale worker that issues its read just after the abort cannot re-block the bus.
+// The camera calls ArmRead when a new exposure is claimed (StartExposure / StartVideo).
+// Control transfers, ResetEndpoint and stream sessions are unaffected.
+type ReadAborter interface {
+	AbortRead()
+	ArmRead()
+}
+
+// QuietBulkReader is the optional Transport capability for a whole-frame read whose first
+// `quiet` duration is a HOST-TIMED integration: the sensor is exposing, so no data can
+// arrive yet, but the transfers must already be armed (the GPIF must never stream without
+// a reader). During the quiet window the control-transfer gate (ioMu) is RELEASED — TEC
+// polls, telemetry and ST4 pulses flow — and it is taken when the quiet window elapses or
+// the first transfer completes, whichever comes first, then held through the readout as
+// usual. quiet 0 is exactly BulkRead. Callers must undershoot the real integration
+// (leave a safety margin) so the gate is normally in place BEFORE data flows.
+type QuietBulkReader interface {
+	BulkReadQuiet(buf []byte, quiet, timeout time.Duration) (int, error)
+}
+
+// UngatedControlSender is the optional Transport capability for the ST4 guide-pulse
+// commands (0xB0 on / 0xB1 off) ONLY: a vendor OUT issued WITHOUT the ioMu wedge gate, so
+// a pulse edge is never queued behind a whole-frame read — a pulse-off landing behind a
+// held ioMu stretches a 100 ms guide correction into the rest of the readout (REVIEW 4.3).
+// This mirrors the SDK exactly: its API layer serializes pulses only against other API
+// calls (per-camera mutex), never against the capture thread's bulk stream — ST4 pulses
+// land mid-readout on every PHD2+ASI rig in the field. Do NOT use this for any other
+// request: EP0 READS mid-readout are the proven GPIF-wedge mechanism (gosnap -wedge).
+type UngatedControlSender interface {
+	ControlOutUngated(bRequest uint8, wValue, wIndex uint16) error
+}
+
 // EndpointResetter is an optional Transport capability: clear a stalled bulk endpoint
 // (per-platform clear-halt) to drop stale data before a capture — ResetEndpoint(0x81),
 // issued before each session.

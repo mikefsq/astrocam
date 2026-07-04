@@ -213,7 +213,18 @@ func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		return 0, err
 	}
 	_ = ctl.ResetEndpoint()
-	return ctl.BulkRead(buf, exposure+3*time.Second)
+	// Read EXACTLY the frame bytes, like the object's WorkingFunc (0131_CCameraS178MM.o:
+	// startAsyncXfer's size argument is the image-size slot) — an oversized read runs into
+	// the next free-run frame or times out short (REVIEW 2.11).
+	want := ctl.FrameBytes()
+	if want > len(buf) {
+		want = len(buf)
+	}
+	n, err := ctl.BulkRead(buf[:want], exposure+3*time.Second)
+	if err == nil && n < want && ctl.Aborted() {
+		return n, errExposureAborted // StopExposure broke the read (AbortRead): clean abort, not a stall
+	}
+	return n, err
 }
 
 // imx178InitFPGA — the FPGA-side bringup after the Sony init (InitCamera); same FX3 sequence

@@ -807,3 +807,54 @@ func TestIMX178Gain(t *testing.T) {
 		t.Errorf("gain 300: 0x301b=%#x code=%#x/%#x, want 0x1e / 0x2c / 0x01", v[0x301b], v[0x301f], v[0x3020])
 	}
 }
+
+// modeRegmap is a fakeRegmap that carries a live ReadoutMode (so profiles see HighSpeed /
+// geometry) and serves canned read-back values (so read-modify-write paths are steerable).
+type modeRegmap struct {
+	fakeRegmap
+	mode    ReadoutMode
+	regVals map[uint16]uint16
+}
+
+func (m *modeRegmap) ReadoutMode() ReadoutMode { return m.mode }
+func (m *modeRegmap) ReadReg(reg uint16) (uint16, error) {
+	return m.regVals[reg], nil
+}
+
+// clockSelCase runs one profile op and asserts the FINAL 0x3009 value — the clock/FRSEL
+// select the tail SetCMOSClk write (REVIEW 2.6) must leave: FRSEL 0x01 for the 12-bit
+// normal clock, 0x00 for 10-bit high-speed, preserving the conversion-gain bit 0x10.
+func clockSelCase(t *testing.T, name string, highSpeed bool, hcgIn uint16, want uint16, op func(rm Regmap) error) {
+	t.Helper()
+	rm := &modeRegmap{mode: ReadoutMode{HighSpeed: highSpeed, BytesPerPx: 2}, regVals: map[uint16]uint16{0x3009: hcgIn}}
+	if err := op(rm); err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	if got := lastVals(rm.writes)[0x3009]; got != want {
+		t.Errorf("%s: final 0x3009 = 0x%02x, want 0x%02x", name, got, want)
+	}
+}
+
+// TestIMX462ClockSelect: SetExposure and SetROI end with the object's SetCMOSClk write —
+// normal restores FRSEL 1 (closing the one-way high-speed clear), high-speed runs FRSEL 0,
+// and the HCG bit rides along untouched.
+func TestIMX462ClockSelect(t *testing.T) {
+	exp := func(rm Regmap) error { return imx462SetExposure(rm, 10*time.Millisecond) }
+	roi := func(rm Regmap) error { return imx462SetROI(rm, 0, 0, 1936, 1096, 1) }
+	clockSelCase(t, "SetExposure normal", false, 0x00, 0x01, exp)
+	clockSelCase(t, "SetExposure normal+HCG", false, 0x10, 0x11, exp)
+	clockSelCase(t, "SetExposure highspeed+HCG", true, 0x10, 0x10, exp)
+	clockSelCase(t, "SetROI normal", false, 0x00, 0x01, roi)
+	clockSelCase(t, "SetROI highspeed", true, 0x00, 0x00, roi)
+}
+
+// TestIMX290ClockSelect: same contract from the 290's own object (0003_CCameraS290MM_Mini.o).
+func TestIMX290ClockSelect(t *testing.T) {
+	exp := func(rm Regmap) error { return imx290SetExposure(rm, 10*time.Millisecond) }
+	roi := func(rm Regmap) error { return imx290SetROI(rm, 0, 0, 1936, 1096, 1) }
+	clockSelCase(t, "SetExposure normal", false, 0x00, 0x01, exp)
+	clockSelCase(t, "SetExposure normal+HCG", false, 0x10, 0x11, exp)
+	clockSelCase(t, "SetExposure highspeed+HCG", true, 0x10, 0x10, exp)
+	clockSelCase(t, "SetROI normal", false, 0x00, 0x01, roi)
+	clockSelCase(t, "SetROI highspeed", true, 0x00, 0x00, roi)
+}

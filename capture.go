@@ -86,6 +86,17 @@ func (c *Camera) ResetDevice() error {
 // BulkRead reads from the bulk-IN endpoint with the given timeout.
 func (c *Camera) BulkRead(buf []byte, to time.Duration) (int, error) { return c.t.BulkRead(buf, to) }
 
+// BulkReadQuiet is BulkRead with the first `quiet` declared as host-timed integration: the
+// transfers are armed immediately but the control-transfer gate engages only when quiet
+// elapses or data arrives (see QuietBulkReader), so a sensor-timed exposure doesn't blind
+// EP0 (TEC, telemetry, ST4). Falls back to a fully-gated BulkRead on backends without it.
+func (c *Camera) BulkReadQuiet(buf []byte, quiet, to time.Duration) (int, error) {
+	if q, ok := c.t.(QuietBulkReader); ok {
+		return q.BulkReadQuiet(buf, quiet, to)
+	}
+	return c.t.BulkRead(buf, to)
+}
+
 // NoteStall records one readout stall (a short/failed bulk read that triggered a re-arm).
 func (c *Camera) NoteStall() { c.stalls.Add(1) }
 
@@ -252,6 +263,12 @@ func (c *Camera) StartExposure(light bool) error {
 	c.expAborted = false
 	c.expLight = light
 	c.mu.Unlock()
+	// Re-enable frame reads: a prior StopExposure left the transport's read-abort latched
+	// (level-triggered — see ReadAborter) so stale reads fail fast; this exposure owns the
+	// bus again.
+	if ra, ok := c.t.(ReadAborter); ok {
+		ra.ArmRead()
+	}
 	// A sensor Worker arms, host-times, and reads inside GetDataAfterExp, so the worker path
 	// seeds state only. The non-worker path arms here, unlocked.
 	if c.sensor.Worker == nil {
@@ -380,6 +397,9 @@ func (c *Camera) StartVideo(light bool) error {
 	c.expAborted = false
 	c.expLight = light
 	c.mu.Unlock()
+	if ra, ok := c.t.(ReadAborter); ok {
+		ra.ArmRead() // clear a prior StopExposure's read-abort latch (see StartExposure)
+	}
 	return nil
 }
 
@@ -625,6 +645,14 @@ func (c *Camera) StopExposure() error {
 	c.expAborted = true // the dedicated abort signal the in-flight worker polls
 	c.status = ExpIdle
 	c.mu.Unlock()
+	// Break any frame read blocked in the transport BEFORE issuing the stop writes: a
+	// whole-frame read holds ioMu for seconds, and the master-stop control transfers below
+	// would queue behind it — the classic "AbortExposure hangs" (finding 1.5). AbortRead is
+	// level-triggered, so a stale worker's follow-up read also fails fast instead of
+	// re-taking the bus; the next StartExposure/StartVideo re-arms reads.
+	if ra, ok := c.t.(ReadAborter); ok {
+		ra.AbortRead()
+	}
 	_ = c.vendorCmd(cmdStreamStop) // 0xAA
 	if c.sensor.StreamStop != nil {
 		_ = c.sensor.StreamStop(c.rm) // master stop (0x200=1)

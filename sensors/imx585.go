@@ -418,5 +418,9 @@ func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if target > len(buf) {
 		target = len(buf)
 	}
-	return ctl.StreamFrame(buf[:target], 500*time.Millisecond, exposure+5*time.Second)
+	n, err := ctl.StreamFrame(buf[:target], 500*time.Millisecond, exposure+5*time.Second)
+	if err == nil && n < target && ctl.Aborted() {
+		return n, errExposureAborted // StopExposure broke the read (AbortRead): clean abort, not a stall
+	}
+	return n, err
 }

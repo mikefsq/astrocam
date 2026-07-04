@@ -110,10 +110,22 @@ type usbfsDevice struct {
 	// that path requires its worker's concurrent FPGABufReload, and its DDR frame buffer
 	// makes the interleave harmless.
 	ioMu sync.Mutex
+	// readAborted is the ReadAborter state (level-triggered): while set, in-flight frame
+	// reads drain and return their short prefix within ~one poll interval, and new frame
+	// reads fail fast — so StopExposure's master-stop writes are never stuck behind a
+	// blocked read holding ioMu. Set by AbortRead (StopExposure), cleared by ArmRead
+	// (StartExposure/StartVideo). Control transfers and ResetEndpoint are unaffected.
+	readAborted atomic.Bool
 	// superSpeed is the negotiated link speed (USB3 SuperSpeed bulk maxpacket ≥1024), read from the
 	// endpoint descriptor at open. The readout's bandwidth budget follows it (see camera.go).
 	superSpeed bool
 }
+
+// AbortRead / ArmRead implement ReadAborter (see transport.go). Level-triggered by design:
+// a read issued by a stale worker just AFTER the abort must also fail fast, or it re-takes
+// ioMu for a full read window against a sensor the abort already master-stopped.
+func (d *usbfsDevice) AbortRead() { d.readAborted.Store(true) }
+func (d *usbfsDevice) ArmRead()   { d.readAborted.Store(false) }
 
 // usbNode is one /dev/bus/usb device node and the VID/PID read from its descriptor
 // head — the identity a scan reads without claiming the device.
@@ -368,6 +380,29 @@ func (d *usbfsDevice) ControlOut(bRequest uint8, wValue, wIndex uint16, data []b
 	return err
 }
 
+// ControlOutUngated implements UngatedControlSender (ST4 guide pulses ONLY — see
+// transport.go): the vendor OUT is issued WITHOUT taking ioMu, so a pulse edge cannot
+// queue behind a whole-frame read. The SDK does exactly this (its capture thread never
+// holds the API mutex); usbfs control ioctls are independently safe per call. The Close
+// interlock and broken poison still apply.
+func (d *usbfsDevice) ControlOutUngated(bRequest uint8, wValue, wIndex uint16) error {
+	release, err := d.enter()
+	if err != nil {
+		return err
+	}
+	defer release()
+	ct := usbCtrlTransfer{
+		bRequestType: 0x40, bRequest: bRequest,
+		wValue: wValue, wIndex: wIndex,
+		timeout: 500,
+	}
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.f.Fd(), usbdevfsControl, uintptr(unsafe.Pointer(&ct)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 func (d *usbfsDevice) ControlIn(bRequest uint8, wValue, wIndex uint16, data []byte) (int, error) {
 	return d.control(0xC0, bRequest, wValue, wIndex, data)
 }
@@ -413,9 +448,21 @@ func (d *usbfsDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
 		return 0, err
 	}
 	defer release()
-	d.ioMu.Lock()
-	defer d.ioMu.Unlock()
-	return d.readFrameURBs(buf, timeout)
+	return d.readFrameURBs(buf, timeout, 0)
+}
+
+// BulkReadQuiet implements QuietBulkReader: like BulkRead, but the first `quiet` of the
+// read is a host-timed integration window during which ioMu stays RELEASED (the sensor is
+// exposing — no data can arrive — but the transfers are already armed so the GPIF never
+// streams without a reader). The gate engages at quiet-elapsed or first data, whichever
+// comes first. timeout still bounds the WHOLE call, quiet included.
+func (d *usbfsDevice) BulkReadQuiet(buf []byte, quiet, timeout time.Duration) (int, error) {
+	release, err := d.enter()
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	return d.readFrameURBs(buf, timeout, quiet)
 }
 
 // readFrameURBs reads one whole frame through the usbfs async urb API. It submits
@@ -429,12 +476,34 @@ func (d *usbfsDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
 // a full 1 MiB it cannot fill, it keeps holding. Requesting exactly the pending tail bytes
 // makes it deliver. usbfs reports a short bulk-IN as status 0 with actual_length <
 // buffer_length (no error), so a short transfer marks the frame end.
-func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, error) {
+//
+// It owns the ioMu gate: with quiet 0 the gate is held from before the first submit to
+// after the drain (the classic whole-read wedge gate). With quiet > 0 the first `quiet`
+// is a host-declared integration window — transfers armed, gate RELEASED so EP0 traffic
+// (TEC, telemetry, ST4) flows — and the gate engages at quiet-elapsed or first completion,
+// whichever comes first, then stays held through drain. An AbortRead (StopExposure) breaks
+// the reap loop within ~one poll interval; the drained short prefix is returned with a nil
+// error and the worker's Aborted() check maps it to the abort outcome.
+func (d *usbfsDevice) readFrameURBs(buf []byte, timeout, quiet time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if d.readAborted.Load() {
+		return 0, nil // aborted before we armed anything — don't take ioMu at all
+	}
 	start := time.Now()
 	deadline := start.Add(timeout)
+	quietEnd := start.Add(quiet)
+	gated := false
+	gate := func() {
+		if !gated {
+			d.ioMu.Lock()
+			gated = true
+		}
+	}
+	if quiet <= 0 {
+		gate()
+	}
 	n := (len(buf) + maxBulkChunk - 1) / maxBulkChunk
 	urbs := make([]usbURB, n)
 	submitted := make([]bool, n)
@@ -449,13 +518,17 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, err
 	}
 	// On any exit, discard + reap every submitted-but-unreaped urb so no completion lands
 	// against buf after we return (see drainURBs: EINTR-safe, bounded, parks + poisons on
-	// failure). Assembly reads `done` before this defer runs, so the derived mask is fine.
+	// failure). The drain runs under the gate — an abort/deadline can strike mid-stream, and
+	// the discard/reap window is readout as far as the FX3 is concerned. Assembly reads
+	// `done` before this defer runs, so the derived mask is fine.
 	defer func() {
+		gate()
 		pending := make([]bool, n)
 		for i := range submitted {
 			pending[i] = submitted[i] && !done[i]
 		}
 		d.drainURBs(urbs, pending, buf)
+		d.ioMu.Unlock()
 	}()
 
 	// Submit with at most urbWindow transfers in flight; completions slide the window forward.
@@ -494,7 +567,8 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, err
 	}
 
 	// Reap in completion order (== submission order on a single pipe) until every submitted
-	// transfer is in or the deadline hits.
+	// transfer is in, the deadline hits, or an AbortRead breaks the wait.
+	gotAny := false
 	for {
 		pending := false
 		for i := range submitted {
@@ -502,13 +576,23 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, err
 				pending = true
 			}
 		}
-		if !pending || time.Now().After(deadline) {
+		if !pending || time.Now().After(deadline) || d.readAborted.Load() {
 			break
+		}
+		if !gated && (gotAny || !time.Now().Before(quietEnd)) {
+			gate() // quiet window over (or data arrived early): wedge gate for the readout
 		}
 		var p uintptr
 		err := d.ioctl(usbdevfsReapURBNDelay, unsafe.Pointer(&p))
 		if err == syscall.EAGAIN || err == syscall.EINTR { // EINTR: Go's SIGURG preemption
-			time.Sleep(200 * time.Microsecond)
+			// Adaptive wait: tight (200 µs) around an active readout, coarse (2 ms) once the
+			// pre-data wait has clearly become an integration — 500 wakeups/s instead of 5000
+			// for a multi-second exposure, without adding reap latency while data streams.
+			s := 200 * time.Microsecond
+			if !gotAny && time.Since(start) > 100*time.Millisecond {
+				s = 2 * time.Millisecond
+			}
+			time.Sleep(s)
 			continue
 		}
 		if err != nil {
@@ -516,6 +600,7 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout time.Duration) (int, err
 		}
 		if i := slotOf(p); i >= 0 {
 			done[i] = true
+			gotAny = true
 			if bulkTrace {
 				fmt.Fprintf(os.Stderr, "[urb] t=%.3fs slot=%d n=%d status=%d\n",
 					time.Since(start).Seconds(), i, urbs[i].actualLength, urbs[i].status)
@@ -563,6 +648,9 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if d.readAborted.Load() {
+		return 0, nil // aborted before the first transfer
+	}
 	deadline := time.Now().Add(total)
 	scratch := make([]byte, maxBulkChunk)
 	got := 0
@@ -572,9 +660,18 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 		if rem <= 0 {
 			break // overall deadline
 		}
+		if d.readAborted.Load() {
+			break // StopExposure broke the wait (AbortRead); return the short prefix
+		}
+		// Slice each synchronous transfer to ≤500 ms so an AbortRead lands within one
+		// slice instead of a whole idle window; the idle-stall gate below is wall-clock
+		// (time since last data), so slicing does not change the stall semantics.
 		ms := rem
 		if ms > idle {
 			ms = idle
+		}
+		if ms > 500*time.Millisecond {
+			ms = 500 * time.Millisecond
 		}
 		msec := uint32(ms.Milliseconds())
 		if msec == 0 {
@@ -617,6 +714,9 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 		return 0, err
 	}
 	defer release()
+	if d.readAborted.Load() {
+		return 0, nil // aborted before arming — don't take ioMu at all
+	}
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
 	nslots := (len(buf) + maxBulkChunk - 1) / maxBulkChunk
@@ -688,8 +788,8 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 	// ~1 MiB has streamed), so only `total` bounds it — matching startAsyncXfer, which has no
 	// idle cutoff at all, just the overall timeout.
 	for done := 0; done < nslots; {
-		if time.Now().After(deadline) {
-			break
+		if time.Now().After(deadline) || d.readAborted.Load() {
+			break // deadline, or StopExposure broke the wait (AbortRead)
 		}
 		var p uintptr
 		err := d.ioctl(usbdevfsReapURBNDelay, unsafe.Pointer(&p))
@@ -697,7 +797,13 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 			if gotFirst && time.Since(lastData) >= idle {
 				break // genuine stall: no completion for the whole idle window
 			}
-			time.Sleep(200 * time.Microsecond)
+			// Adaptive wait: tight around an active readout, coarse (2 ms) once the pre-data
+			// wait is clearly the integration (see readFrameURBs).
+			s := 200 * time.Microsecond
+			if !gotFirst && time.Since(deadline.Add(-total)) > 100*time.Millisecond {
+				s = 2 * time.Millisecond
+			}
+			time.Sleep(s)
 			continue
 		}
 		if err != nil {

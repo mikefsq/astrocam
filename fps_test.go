@@ -17,20 +17,21 @@ func (plainRegmap) VID() uint16                                           { retu
 
 // TestHMAX462USB2WireConfirmed pins the USB2 case to the wire-confirmed SDK value: the
 // IMX462 full frame (1936×1096 RAW16) at FPSPercent 40 on a USB2 link computes candidate
-// 1634 (which dominates the 1100 floor there) → HMAX 4085, exactly what asicap programs.
+// 1634 (which dominates the 261 floor there) → HMAX 4085, exactly what asicap programs.
 func TestHMAX462USB2WireConfirmed(t *testing.T) {
 	m := ReadoutMode{USB3: false, BytesPerPx: 2, FPSPercent: 40}
-	if got := HMAX(1936, 1096, 18562, 1100, 18, m); got != 4085 {
+	if got := HMAX(1936, 1096, 18562, 261, 18, m); got != 4085 {
 		t.Fatalf("HMAX = %d, want 4085 (wire-confirmed SDK USB2 value)", got)
 	}
 }
 
-// TestHMAX462USB3FloorDominates: on USB3 the bandwidth candidate (~196) is far below the
-// sensor floor, so HMAX pins to REG_FRAME_LENGTH_PKG_MIN (1100) at FPSPercent 100.
+// TestHMAX462USB3FloorDominates: on USB3 the bandwidth candidate (~196) is below the
+// sensor's per-clock floor, so HMAX pins to REG_FRAME_LENGTH_PKG_MIN — 261 for the 462's
+// 18562 clock, as its SetCMOSClk installs (the .data 1100 initializer is dead after init).
 func TestHMAX462USB3FloorDominates(t *testing.T) {
 	m := ReadoutMode{USB3: true, BytesPerPx: 2, FPSPercent: 100}
-	if got := HMAX(1936, 1096, 18562, 1100, 18, m); got != 1100 {
-		t.Fatalf("HMAX = %d, want 1100 (the floor)", got)
+	if got := HMAX(1936, 1096, 18562, 261, 18, m); got != 261 {
+		t.Fatalf("HMAX = %d, want 261 (the SetCMOSClk floor)", got)
 	}
 }
 

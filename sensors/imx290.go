@@ -67,10 +67,16 @@ const (
 	// 9281. RAW16 imaging runs Bin=1/SoftBin, so only normal/high-speed are modelled (bin-2 9281
 	// isn't hit). Normal clock 18562: at 0.2 s HMAX = 0x0662. HMAX floor and high-speed pair not
 	// yet exercised.
-	imx290ClkKHz      = 18562 // normal RAW16 pixel clock
-	imx290HMAXFloor   = 261   // line-time floor for 18562 (UNVERIFIED — not exercised at full-frame)
-	imx290ClkKHzHS    = 37124 // 10-bit high-speed pixel clock — used only when ModeOf(rm).HighSpeed (UNVERIFIED)
-	imx290HMAXFloorHS = 245   // high-speed line-time floor for 37124 (UNVERIFIED)
+	imx290ClkKHz = 18562 // normal RAW16 pixel clock (0x4882 in the object's SetCMOSClk switch)
+	// REG_FRAME_LENGTH_PKG_MIN is DYNAMIC in the SDK: SetCMOSClk writes it per clock
+	// (0003_CCameraS290MM_Mini.o .text+0x1af0 → .data+0x10). Per-clock floors from the
+	// 290's OWN object: 18562→203 (0xcb), 37124→196 (0xc4), 9281→145 (0x91). The old
+	// in-tree 261/245 were the 462's object values (cross-sensor contamination, flagged
+	// UNVERIFIED at the time); full-frame USB2 never exercised them (candidate dominates).
+	// VERIFY-HW: floor-dominated (USB3 / small-ROI) readout not yet exercised on a bench 290.
+	imx290HMAXFloor   = 203   // SetCMOSClk(18562) → REG_FRAME_LENGTH_PKG_MIN
+	imx290ClkKHzHS    = 37124 // 10-bit high-speed pixel clock (0x9104 in the object's SetCMOSClk switch)
+	imx290HMAXFloorHS = 196   // SetCMOSClk(37124) → REG_FRAME_LENGTH_PKG_MIN
 	imx290VBlankAdd   = 18    // VMAX = height + 18 (0x12) (SetExp)
 	imx290SHSOffset   = 17    // SHS = (height + 17 (0x11)) - exposureLines (SetExp)
 	imx290HBLK        = 0     // SetFPGAHBLK(0)  (Cam_SetResolution)
@@ -226,7 +232,79 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := trigger(false); err != nil {
 		return 0, err
 	}
-	return ctl.BulkRead(buf, exposure+3*time.Second)
+	// Read with the retry ladder from the 290 object's WorkingFunc (0003_CCameraS290MM_Mini.o
+	// .text+0xf80) — the fix for the tiny-ROI intermittent short read (REVIEW 2.13):
+	//
+	//   trigger-mode short   -> checked FIRST (before the retry counter, like the object): if
+	//                           FPGA reg 0x23 bit2 says the triggered frame is still buffered,
+	//                           pulse FPGABufReload (reg 0x18 bit0) and re-read WITHOUT
+	//                           re-integrating; max 3 reloads (the object stops at >2)
+	//   zero read            -> counted separately with NO pipe reset between attempts; the
+	//                           4th escalates to ResetDevice + the object's full re-arm
+	//                           (ResetDevice, 50 ms, StopSensorStreaming = FPGAStop+standby 1,
+	//                           0xAA, 10 ms, 0xA9, StartSensorStreaming = standby 0 + 50 ms +
+	//                           FPGAStart), zero and retry counters reset
+	//   short frame          -> retry counter (the object's r14, which zero reads also bump);
+	//                           snap mode gives up past 2 (EXP_FAILED), else ResetEndPoint(0x81)
+	//                           and a fresh full read
+	//
+	// The object's 20 s wall-clock retry window and ~1 s per-band read timeouts are subsumed
+	// by our bounded exposure+3 s per read × the attempt cap (a verified safe superset).
+	want := ctl.FrameBytes()
+	if want > len(buf) {
+		want = len(buf)
+	}
+	trigMode := exposure >= imx290LongExpUs*time.Microsecond // reg0 bit7 armed by SetExp
+	zeros, reloads, retries := 0, 0, 0
+	for {
+		n, err := ctl.BulkRead(buf[:want], exposure+3*time.Second)
+		if err != nil {
+			return n, err
+		}
+		if n >= want {
+			return n, nil
+		}
+		if ctl.Aborted() {
+			return n, errExposureAborted // StopExposure broke the read (AbortRead): clean abort, not a stall
+		}
+		ctl.NoteStall()
+		if trigMode && n > 0 && reloads < 3 {
+			if v, rerr := rm.ReadFPGAReg(0x23); rerr == nil && v&0x04 != 0 {
+				// The triggered frame is still in the FPGA buffer: reload and re-read it
+				// instead of re-integrating (the object's reg 0x23 bit2 path; does not
+				// consume a retry).
+				reloads++
+				if err := SetFPGABit(rm, 0x18, 0x01, true); err != nil {
+					return 0, err
+				}
+				continue
+			}
+		}
+		retries++
+		if n == 0 {
+			zeros++
+			if zeros < 4 {
+				continue // the object re-reads zero returns without touching the pipe
+			}
+			_ = ctl.ResetDevice()
+			time.Sleep(50 * time.Millisecond)
+			_ = SetFPGABit(rm, 0x00, 0x10, true) // StopSensorStreaming: FPGAStop (reg0 bit4)
+			_ = rm.WriteReg(imx290RegStandby, 1) //   + standby (sensor stop)
+			_ = ctl.VendorCmd(0xAA)
+			time.Sleep(10 * time.Millisecond)
+			_ = ctl.VendorCmd(0xA9)
+			_ = rm.WriteReg(imx290RegStandby, 0) // StartSensorStreaming: standby off
+			time.Sleep(50 * time.Millisecond)
+			_ = SetFPGABit(rm, 0x00, 0x10, false) //   + FPGAStart
+			zeros, retries = 0, 0
+			continue
+		}
+		zeros = 0
+		if retries > 2 { // the object's snap-mode give-up (r14 > 2)
+			return n, fmt.Errorf("imx290: short frame %d/%d after %d attempts", n, want, retries)
+		}
+		_ = ctl.ResetEndpoint()
+	}
 }
 
 // imx290InitFPGA is the FPGA-side bringup InitCamera performs after the Sony init writes,
@@ -245,8 +323,8 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 // InitCamera passes outputWidth = 0 (8-bit); the SDK raises reg0xa bit4 to 1 later for RAW16.
 // Set here from the live ReadoutMode: with bit4 = 0 the ASI290 streams a complete half-size
 // RAW8 frame (1936×1096×1 = 2121856 B) and the RAW16 read reports a short frame; bit4 = 1 gives
-// full RAW16. SetCMOSClk()'s sensor 0x3009 clock-select write is a remaining seam (SetGain sets
-// 0x3009).
+// full RAW16. SetCMOSClk()'s sensor 0x3009 clock-select write is imx290WriteClockSel, issued at
+// the tail of SetExposure/SetROI like the object (REVIEW 2.6).
 func imx290InitFPGA(rm Regmap, subtype int) error {
 	_ = subtype                                           // 290MM_Mini has no <0x12 / >=0x12 split in this path
 	if err := FPGAClearBits(rm, 0x00, 0x01); err != nil { // FPGAReset
@@ -369,7 +447,42 @@ func imx290SetExposure(rm Regmap, d time.Duration) error {
 	// trigger signal (reg0b bit0) high for the exposure, then read the triggered frame directly
 	// — no standby toggle (that clears the integrated charge → dark frame). Below 1 s the worker
 	// free-runs the next frame instead.
-	return ApplyExposure(rm, imx290Shutter, imx290RegLatch, d)
+	if err := ApplyExposure(rm, imx290Shutter, imx290RegLatch, d); err != nil {
+		return err
+	}
+	// SetCMOSClk at the tail, as the object's SetExp does (the call sits after the WaitMode/
+	// TriggerMode writes at its end): the sensor clock select must track the live mode or the
+	// HMAX/SHS math above runs at the wrong physical rate.
+	return imx290WriteClockSel(rm)
+}
+
+// imx290WriteClockSel is the object's SetCMOSClk (0003_CCameraS290MM_Mini.o, .text+0x1af0):
+// program the 0x3009 clock / FRSEL select for the live readout mode, keeping the
+// conversion-gain bit (the object computes gain>60 ? 0x10 : 0 and ORs the FRSEL field; the
+// read-modify here preserves the same bit SetGain maintains). Decoded values:
+//
+//	18562 kHz (12-bit normal)     -> FRSEL 0x01
+//	37124 kHz (10-bit high-speed) -> FRSEL 0x00
+//	 9281 kHz (hardware bin 2)    -> FRSEL 0x00   (gated on the object's hard-bin flag;
+//	                                 NOT wired — the bin-2 clock/floor swap is unverified
+//	                                 on the wire, bin 2 runs the normal clock today)
+//	other                         -> FRSEL 0x02   (unused)
+//
+// The object calls it from SetExp, SetResolution, InitCamera and SetHighSpeedMode; the
+// driver mirrors the first two (init writes 0x3009=0x01 in the reglist, and a HighSpeed
+// toggle takes effect at the next SetExposure/SetROI by design). This closes the "no code
+// writes the 290's clock-select register" seam (REVIEW 2.6): the host math switched clocks
+// (imx290ClockFloor) while the sensor stayed on its init clock.
+func imx290WriteClockSel(rm Regmap) error {
+	cur, err := rm.ReadReg(imx290RegGainMode)
+	if err != nil {
+		return err
+	}
+	v := cur & 0x10 // preserve HCG; rewrite the FRSEL field below it
+	if !ModeOf(rm).HighSpeed {
+		v |= 0x01 // 12-bit normal clock (18562); high-speed (37124) runs FRSEL 0
+	}
+	return rm.WriteReg(imx290RegGainMode, v)
 }
 
 // imx290SetROI programs the readout window: SetStartPos (ROI start X -> 0x3040/0x3041,
@@ -462,5 +575,9 @@ func imx290SetROI(rm Regmap, x, y, w, h, bin int) error {
 		return err
 	}
 	clk, floor := imx290ClockFloor(rm)
-	return ProgramHMAX(rm, w, h, clk, floor, imx290VBlankAdd)
+	if err := ProgramHMAX(rm, w, h, clk, floor, imx290VBlankAdd); err != nil {
+		return err
+	}
+	// SetCMOSClk at the tail, as the object's SetResolution does.
+	return imx290WriteClockSel(rm)
 }

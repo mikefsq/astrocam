@@ -133,7 +133,16 @@ type winusbDevice struct {
 	// broken latches when an aborted overlapped read could not be drained (the kernel still
 	// owns a caller buffer); every subsequent transfer fails fast with errWinTransportBroken.
 	broken atomic.Bool
+	// readAborted is the ReadAborter latch (level-triggered): while set, in-flight frame
+	// reads abort their pipe I/O and return the short prefix, and new frame reads fail fast
+	// — so StopExposure's master-stop writes are never stuck behind a read holding ioMu.
+	// Set by AbortRead (StopExposure), cleared by ArmRead (StartExposure/StartVideo).
+	readAborted atomic.Bool
 }
+
+// AbortRead / ArmRead implement ReadAborter (see transport.go).
+func (d *winusbDevice) AbortRead() { d.readAborted.Store(true) }
+func (d *winusbDevice) ArmRead()   { d.readAborted.Store(false) }
 
 // winNode is one WinUSB device-interface path with its parsed VID/PID.
 type winNode struct {
@@ -348,6 +357,9 @@ func (d *winusbDevice) readChunk(buf []byte, timeoutMs uint32) (int, error) {
 	if d.broken.Load() {
 		return 0, errWinTransportBroken
 	}
+	if d.readAborted.Load() {
+		return 0, nil // read-abort latched (StopExposure): don't arm a new transfer
+	}
 	d.setPipeTimeout(timeoutMs)
 	ev, _, _ := procCreateEvent.Call(0, 1, 0, 0) // manual-reset, unsignaled, unnamed
 	if ev == 0 {
@@ -363,10 +375,29 @@ func (d *winusbDevice) readChunk(buf []byte, timeoutMs uint32) (int, error) {
 			return 0, fmt.Errorf("asicam: WinUsb_ReadPipe failed: %v", callErr)
 		}
 	}
-	// bWait=1 blocks on ov.HEvent until THIS transfer completes; the pipe's transfer-timeout
-	// policy bounds it (the driver cancels and completes the op with ERROR_SEM_TIMEOUT).
+	// Wait on THIS transfer's event in ≤500 ms slices so an AbortRead (StopExposure) can
+	// break the wait; the pipe's transfer-timeout policy bounds the transfer itself (the
+	// driver cancels and completes the op with ERROR_SEM_TIMEOUT). On abort, cancel via
+	// WinUsb_AbortPipe and still wait for the completion — the kernel owns buf/ov until
+	// then; an undrainable abort pins them and poisons the transport (leak-don't-free).
+	for {
+		if w, _, _ := procWaitForSingle.Call(ev, 500); w == waitObject0 {
+			break
+		}
+		if d.readAborted.Load() {
+			procWinUsbAbortPipe.Call(d.winusb, pipeIn)
+			if w, _, _ := procWaitForSingle.Call(ev, uintptr(winDrainTimeout.Milliseconds())); w != waitObject0 {
+				d.broken.Store(true)
+				winLeakedIOMu.Lock()
+				winLeakedIO = append(winLeakedIO, buf, ov)
+				winLeakedIOMu.Unlock()
+				return 0, errWinTransportBroken // event leaked too — signaled at (eventual) completion
+			}
+			break
+		}
+	}
 	var transferred uint32
-	r, _, callErr = procWinUsbGetOvlRes.Call(d.winusb, uintptr(unsafe.Pointer(ov)), uintptr(unsafe.Pointer(&transferred)), 1)
+	r, _, callErr = procWinUsbGetOvlRes.Call(d.winusb, uintptr(unsafe.Pointer(ov)), uintptr(unsafe.Pointer(&transferred)), 0)
 	runtime.KeepAlive(buf)
 	runtime.KeepAlive(ov)
 	procCloseHandle.Call(ev)
@@ -410,6 +441,9 @@ func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 	}
 	if d.broken.Load() {
 		return 0, errWinTransportBroken
+	}
+	if d.readAborted.Load() {
+		return 0, nil // aborted before arming — don't take ioMu at all
 	}
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
@@ -510,21 +544,40 @@ func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 	gotFirst := false
 	for i := 0; i < next; i++ {
 		// Host-side gate: total before the first byte, idle after (a quiet integration must
-		// not trip the idle gate before data starts flowing).
-		wait := time.Until(deadline)
-		if gotFirst && idle < wait {
-			wait = idle
+		// not trip the idle gate before data starts flowing). The wait runs in ≤500 ms
+		// slices so an AbortRead (StopExposure) breaks it promptly.
+		gateEnd := deadline
+		if gotFirst {
+			if ie := time.Now().Add(idle); ie.Before(gateEnd) {
+				gateEnd = ie
+			}
 		}
-		if wait < time.Millisecond {
-			wait = time.Millisecond
+		signaled := false
+		for !signaled {
+			if d.readAborted.Load() {
+				break // StopExposure broke the wait: abort + drain below, short prefix out
+			}
+			wait := time.Until(gateEnd)
+			if wait <= 0 {
+				break
+			}
+			if wait > 500*time.Millisecond {
+				wait = 500 * time.Millisecond
+			}
+			if wait < time.Millisecond {
+				wait = time.Millisecond
+			}
+			if w, _, _ := procWaitForSingle.Call(slots[i].ev, uintptr(wait.Milliseconds())); w == waitObject0 {
+				signaled = true
+			}
 		}
-		if w, _, _ := procWaitForSingle.Call(slots[i].ev, uintptr(wait.Milliseconds())); w != waitObject0 {
+		if !signaled {
 			abortAndDrain()
 			if !drained {
 				return got, errWinTransportBroken
 			}
 			runtime.KeepAlive(slots)
-			return got, nil // gate expired: short read, the worker recovers
+			return got, nil // gate expired or aborted: short read, the worker recovers
 		}
 		var transferred uint32
 		r, _, callErr := procWinUsbGetOvlRes.Call(d.winusb, uintptr(unsafe.Pointer(slots[i].ov)), uintptr(unsafe.Pointer(&transferred)), 0)
@@ -584,12 +637,18 @@ func (d *winusbDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) 
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if d.readAborted.Load() {
+		return 0, nil // aborted before arming — don't take ioMu at all
+	}
 	d.ioMu.Lock() // hold for the whole frame so no control transfer interleaves (USB2 wedge gate)
 	defer d.ioMu.Unlock()
 	deadline := time.Now().Add(timeout)
 	scratch := make([]byte, maxBulkChunk)
 	total := 0
 	for total < len(buf) {
+		if d.readAborted.Load() {
+			break // StopExposure broke the read (AbortRead); return the short prefix
+		}
 		ms := time.Until(deadline).Milliseconds()
 		if ms <= 0 {
 			break
@@ -617,6 +676,9 @@ func (d *winusbDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if d.readAborted.Load() {
+		return 0, nil // aborted before the first transfer
+	}
 	deadline := time.Now().Add(total)
 	scratch := make([]byte, maxBulkChunk)
 	got := 0
@@ -625,6 +687,9 @@ func (d *winusbDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 		rem := time.Until(deadline)
 		if rem <= 0 {
 			break
+		}
+		if d.readAborted.Load() {
+			break // StopExposure broke the read (AbortRead); return the short prefix
 		}
 		ms := rem
 		if ms > idle {

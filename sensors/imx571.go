@@ -362,6 +362,9 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	close(stop)
 	<-done // JOIN: wait for the ticker's last bufReload before returning, so no control transfer
 	// outlives the worker to race the next operation / the TEC loop.
+	if err == nil && n < target && ctl.Aborted() {
+		return n, errExposureAborted // StopExposure broke the read (AbortRead): clean abort, not a stall
+	}
 	return n, err
 }
 

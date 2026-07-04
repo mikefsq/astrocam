@@ -7,7 +7,7 @@
 // Op map:
 //
 //	InitCamera        (reglist 73 entries + explicit tail + FPGA bringup)
-//	SetCMOSClk        (clock 9281 kHz; HMAX floor 1100 = SDK REG_FRAME_LENGTH_PKG_MIN)
+//	SetCMOSClk        (0x3009 FRSEL select + per-clock REG_FRAME_LENGTH_PKG_MIN; see imx462WriteClockSel)
 //	Cam_SetResolution (mode 0x3006, window W 0x3042/0x3043 H 0x303e/0x303f, FPGA HBLK/VBLK 9/W/H)
 //	SetStartPos       (ROI X 0x3040/0x3041, Y 0x303c/0x303d; X align 4, Y align 2)
 //	SetGain           (clamp 0..600, HCG bit 0x10 in 0x3009 ABOVE gain 80, code to 0x3014)
@@ -54,16 +54,24 @@ const (
 	imx462FullWidth   = 1936 // MaxWidth (ASI462MC reports 1936×1096, same array as the 290)
 	imx462FullHeight  = 1096
 	imx462ClkKHz      = 18562 // RAW16 pixel clock (INCK/2); RAW8 would be 37124
-	// HMAX floor = the ASI SDK's REG_FRAME_LENGTH_PKG_MIN (CCameraS462MC SetFPSPerc, .data+0x10 =
-	// 0x44c = 1100). HMAX = max(bandwidth candidate, 1100)·100/FPSPercent. The candidate is
+	// HMAX floor = the ASI SDK's REG_FRAME_LENGTH_PKG_MIN (CCameraS462MC SetFPSPerc reads
+	// .data+0x10). HMAX = max(bandwidth candidate, floor)·100/FPSPercent. The candidate is
 	// link-switched — MAX_DATASIZE (.data+0) is written by SetOutput16Bits: USB3→360715,
-	// USB2→43272 — so on USB3 the candidate (~196 full-frame) is under the floor and the object
-	// writes 1100·100/pct, while on USB2 the candidate (1634 full-frame) DOMINATES: the object
+	// USB2→43272 — so on USB3 the candidate (~196 full-frame) is under the floor and the
+	// floor pins HMAX, while on USB2 the candidate (1634 full-frame) DOMINATES: the object
 	// writes 1634·100/pct (wire-confirmed: HMAX 4085 at USB2 pct=40). astrocam's HMAX()/HMAXBW
 	// is this exact formula (bwUSB2/bwUSB3 = MAX_DATASIZE·10·100).
-	imx462HMAXFloor   = 1100  // SDK REG_FRAME_LENGTH_PKG_MIN (.data+0x10)
+	// REG_FRAME_LENGTH_PKG_MIN is DYNAMIC in the SDK: SetCMOSClk writes it per clock
+	// (0071_CCameraS462MC.o .text+0x1d50 → .data+0x10; the 1100 static initializer is dead
+	// after InitCamera's first SetCMOSClk call). Per-clock floors from the object:
+	// 18562→261 (0x105), 37124→245 (0xf5), 9281→145 (0x91). The old in-tree 1100 (read
+	// statically from .data) over-floored USB3 HMAX ~4× (261 ≈ 64 fps full-frame RAW16,
+	// matching the published spec; 1100 ≈ 13.6 fps). USB2 is unaffected (the bandwidth
+	// candidate 1634 dominates either floor — the wire-confirmed 4085 stands).
+	// VERIFY-HW: USB3 readout at the 261 floor not yet exercised on a bench 462.
+	imx462HMAXFloor   = 261   // SetCMOSClk(18562) → REG_FRAME_LENGTH_PKG_MIN
 	imx462ClkKHzHS    = 37124 // 10-bit high-speed pixel clock: 2× the 12-bit clock
-	imx462HMAXFloorHS = 1100  // high-speed uses the same SDK floor; the 2× clock halves the line time
+	imx462HMAXFloorHS = 245   // SetCMOSClk(37124) → REG_FRAME_LENGTH_PKG_MIN
 	imx462VBlankAdd   = 18    // VMAX = height + 0x12
 	imx462SHSOffset   = 17    // SHS  = (height + 0x11) − exposureLines
 	imx462HBLK        = 0     // SetFPGAHBLK(0)
@@ -368,17 +376,41 @@ func imx462SetGain(rm Regmap, gain int) error {
 		} else {
 			mode &= 0x0f
 		}
-		// FRSEL (0x3009 bit0) is the pixel-clock / frame-rate select — 1 = 12-bit normal,
-		// 0 = 10-bit high-speed (doubles the sensor readout clock to 37124). The reglist leaves
-		// it 1; high-speed mode clears it (SDK high-speed ends on 0x3009=0x10 vs normal 0x11).
-		if ModeOf(rm).HighSpeed {
-			mode &^= 0x01
-		}
+		// The FRSEL low bits are left as-is: the clock select is owned by imx462WriteClockSel
+		// (the object's SetCMOSClk), rewritten at the end of every SetExp/SetResolution.
 		if err := rm.WriteReg(imx462RegGainMode, mode); err != nil {
 			return err
 		}
 		return rm.WriteReg(imx462RegGainCode, code&0xff)
 	})
+}
+
+// imx462WriteClockSel is the object's SetCMOSClk (0071_CCameraS462MC.o, .text+0x1d50):
+// program the 0x3009 clock / FRSEL select for the live readout mode, keeping the
+// conversion-gain bit (the object computes gain>80 ? 0x10 : 0 and ORs the FRSEL field;
+// the read-modify here preserves the same bit SetGain maintains). Decoded values:
+//
+//	18562 kHz (12-bit normal)     -> FRSEL 0x01
+//	37124 kHz (10-bit high-speed) -> FRSEL 0x00
+//	 9281 kHz (hardware bin 2)    -> FRSEL 0x00   (gated on the object's hard-bin flag;
+//	                                 NOT wired — the bin-2 clock/floor swap is unverified
+//	                                 on the wire, bin 2 runs the normal clock today)
+//	other                         -> FRSEL 0x02   (unused)
+//
+// The object calls it from SetExp, SetResolution, InitCamera and SetHighSpeedMode; the
+// driver mirrors the first two (init writes 0x3009=0x01 in the reglist, and a HighSpeed
+// toggle takes effect at the next SetExposure/SetROI by design). This closes the one-way
+// FRSEL clear (REVIEW 2.6): normal captures after a high-speed session get bit0 back.
+func imx462WriteClockSel(rm Regmap) error {
+	cur, err := rm.ReadReg(imx462RegGainMode)
+	if err != nil {
+		return err
+	}
+	v := cur & 0x10 // preserve HCG; rewrite the FRSEL field below it
+	if !ModeOf(rm).HighSpeed {
+		v |= 0x01 // 12-bit normal clock (18562); high-speed (37124) runs FRSEL 0
+	}
+	return rm.WriteReg(imx462RegGainMode, v)
 }
 
 var imx462Shutter = ShutterModel{
@@ -396,8 +428,8 @@ var imx462Shutter = ShutterModel{
 }
 
 // imx462ClockFloor returns the pixel clock + HMAX floor for the live readout mode: the
-// 10-bit high-speed pair (37124/1100) when mode.HighSpeed, else 12-bit normal (18562/1100).
-// The floor (1100) is the SDK's REG_FRAME_LENGTH_PKG_MIN and dominates the bandwidth candidate.
+// 10-bit high-speed pair (37124/245) when mode.HighSpeed, else 12-bit normal (18562/261) —
+// the per-clock REG_FRAME_LENGTH_PKG_MIN values SetCMOSClk installs (see the constants).
 func imx462ClockFloor(rm Regmap) (clock, floor int) {
 	if ModeOf(rm).HighSpeed {
 		return imx462ClkKHzHS, imx462HMAXFloorHS
@@ -420,11 +452,11 @@ func imx462SetExposure(rm Regmap, d time.Duration) error {
 	}
 	// HMAX (line time) from the live ROI dimensions when set, so a sub-frame ROI gets the
 	// shorter line period it can sustain (the bandwidth throttle scales with the frame size);
-	// falls back to full-frame. HMAX = max(link-bandwidth candidate, floor 1100)·100/FPSPercent —
+	// falls back to full-frame. HMAX = max(link-bandwidth candidate, floor)·100/FPSPercent —
 	// the SDK's SetFPSPerc with the link-switched MAX_DATASIZE (see the floor constants above).
 	// On USB2 the candidate dominates (1634 full-frame → sensor rate pinned to the 43.272 MB/s
-	// budget); on USB3 the 1100 floor does. Written before the SHS math so the FPGA line rate
-	// and SHS agree (lineTimeNs derives the same).
+	// budget); on USB3 the per-clock floor (261 normal / 245 high-speed) does. Written before
+	// the SHS math so the FPGA line rate and SHS agree (lineTimeNs derives the same).
 	hw, hh := imx462FullWidth, imx462FullHeight
 	if rd := ModeOf(rm); rd.Width > 0 && rd.Height > 0 { // both dims, or a zero Height collapses the candidate
 		hw, hh = rd.Width, rd.Height
@@ -433,7 +465,12 @@ func imx462SetExposure(rm Regmap, d time.Duration) error {
 	if err := WriteFPGAHMAX(rm, HMAX(hw, hh, clk, floor, imx462VBlankAdd, ModeOf(rm))); err != nil {
 		return err
 	}
-	return ApplyExposure(rm, imx462Shutter, imx462RegLatch, d)
+	if err := ApplyExposure(rm, imx462Shutter, imx462RegLatch, d); err != nil {
+		return err
+	}
+	// SetCMOSClk at the tail, as the object's SetExp does: the sensor clock select must
+	// track the live mode or the HMAX/SHS math above runs at the wrong physical rate.
+	return imx462WriteClockSel(rm)
 }
 
 // imx462SetOffset — SetBrightness: offset 16-bit LE to 0x300a/0x300b, no scaling.
@@ -501,7 +538,7 @@ func imx462SetROI(rm Regmap, x, y, w, h, bin int) error {
 	// the high-speed mode flag. Normal OR RAW16 uses the 12-bit ADBIT block (0x3005=1, OUTFMT
 	// 0x3046=0xf1, 0x3129=0, 0x317c=0, 0x31ec=0x0e) with FPGA ADC_BIT=1. High-speed AND RAW8 uses
 	// the 10-bit reformat (0x3046=0xf0, 0x3005=0, 0x3129=0x1d, 0x317c=0x12, ADC_BIT=0) — a shorter
-	// ADC ramp clocked 2× faster (imx462ClockFloor switches clock 18562→37124; floor stays 1100).
+	// ADC ramp clocked 2× faster (imx462ClockFloor switches clock 18562→37124, floor 261→245).
 	out16 := []RegVal{{Reg: 0x3046, Val: 0xf1}, {Reg: 0x3005, Val: 0x01}, {Reg: 0x3129, Val: 0x00}, {Reg: 0x317c, Val: 0x00}, {Reg: 0x31ec, Val: 0x0e}}
 	adcBit := uint16(0x01) // FPGA reg 0x0a bit0 (SetFPGAADCWidthOutputWidth's ADC_BIT): 1 = 12-bit
 	if ModeOf(rm).HighSpeed && ModeOf(rm).BytesPerPx < 2 {
@@ -522,5 +559,9 @@ func imx462SetROI(rm Regmap, x, y, w, h, bin int) error {
 	}
 	// Link-bandwidth HMAX for the new geometry (see imx462SetExposure).
 	clk, floor := imx462ClockFloor(rm)
-	return ProgramHMAX(rm, w, h, clk, floor, imx462VBlankAdd)
+	if err := ProgramHMAX(rm, w, h, clk, floor, imx462VBlankAdd); err != nil {
+		return err
+	}
+	// SetCMOSClk at the tail, as the object's SetResolution does.
+	return imx462WriteClockSel(rm)
 }

@@ -90,6 +90,11 @@ func TestIoMuDiscipline(t *testing.T) {
 		{"ResetDevice", "must recover a wedged read that holds ioMu", func(d *usbfsDevice) {
 			_ = d.ResetDevice()
 		}},
+		// ST4 pulse edges must land mid-readout (the SDK issues them concurrently with its
+		// capture thread); a gated pulse-off stretches a guide correction (REVIEW 4.3).
+		{"ControlOutUngated", "ST4 pulse edges must not queue behind a frame read", func(d *usbfsDevice) {
+			_ = d.ControlOutUngated(0xB0, 0, 0)
+		}},
 	}
 	for _, e := range exempt {
 		t.Run(e.name, func(t *testing.T) {
@@ -151,5 +156,55 @@ func TestBrokenTransportFailsFast(t *testing.T) {
 	}
 	if err := d.ResetEndpoint(bulkEndpoint); err != errTransportBroken {
 		t.Errorf("ResetEndpoint on poisoned device = %v, want errTransportBroken", err)
+	}
+}
+
+// Compile-time capability assertions: the linux transport implements the abort/quiet seams
+// the Camera wires StopExposure and the sensor workers to.
+var (
+	_ ReadAborter     = (*usbfsDevice)(nil)
+	_ QuietBulkReader = (*usbfsDevice)(nil)
+)
+
+// TestReadAbortFailsFast: with the read-abort latched (StopExposure), every frame read
+// returns (0, nil) immediately — even while ioMu is held, since queueing behind the lock is
+// exactly what the latch exists to prevent — and ArmRead restores the guarded behavior.
+func TestReadAbortFailsFast(t *testing.T) {
+	buf := make([]byte, 4096)
+	reads := []struct {
+		name string
+		op   func(d *usbfsDevice) (int, error)
+	}{
+		{"BulkRead", func(d *usbfsDevice) (int, error) { return d.BulkRead(buf, time.Second) }},
+		{"BulkReadQuiet", func(d *usbfsDevice) (int, error) {
+			return d.BulkReadQuiet(buf, 200*time.Millisecond, time.Second)
+		}},
+		{"ReadFrameStreamPrequeued", func(d *usbfsDevice) (int, error) {
+			return d.ReadFrameStreamPrequeued(buf, 100*time.Millisecond, time.Second)
+		}},
+		{"ReadFrameStream", func(d *usbfsDevice) (int, error) {
+			return d.ReadFrameStream(buf, 100*time.Millisecond, time.Second)
+		}},
+	}
+	for _, r := range reads {
+		t.Run(r.name, func(t *testing.T) {
+			d := newFakeUsbfs(t)
+			d.AbortRead()
+			var n int
+			var err error
+			if !runsWhileLocked(t, d, time.Second, func() { n, err = r.op(d) }) {
+				t.Fatalf("%s queued behind ioMu despite the read-abort latch", r.name)
+			}
+			if n != 0 || err != nil {
+				t.Errorf("%s aborted = (%d, %v), want (0, nil)", r.name, n, err)
+			}
+		})
+	}
+	// ArmRead restores the wedge gate: BulkRead must block on ioMu again.
+	d := newFakeUsbfs(t)
+	d.AbortRead()
+	d.ArmRead()
+	if runsWhileLocked(t, d, 100*time.Millisecond, func() { _, _ = d.BulkRead(buf, time.Second) }) {
+		t.Error("BulkRead ran while ioMu was held after ArmRead — the latch failed to clear")
 	}
 }

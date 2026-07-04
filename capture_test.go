@@ -3,6 +3,7 @@ package astrocam
 import (
 	"encoding/binary"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -104,11 +105,11 @@ type dispatchTransport struct {
 	path string
 }
 
-func (d *dispatchTransport) ControlOut(uint8, uint16, uint16, []byte) error       { return nil }
+func (d *dispatchTransport) ControlOut(uint8, uint16, uint16, []byte) error { return nil }
 func (d *dispatchTransport) ControlIn(_ uint8, _, _ uint16, data []byte) (int, error) {
 	return len(data), nil
 }
-func (d *dispatchTransport) Close() error                                         { return nil }
+func (d *dispatchTransport) Close() error { return nil }
 func (d *dispatchTransport) BulkRead(buf []byte, _ time.Duration) (int, error) {
 	d.path = "bulk"
 	return len(buf), nil
@@ -374,5 +375,151 @@ func TestStatusPollDoesNotAbortWorker(t *testing.T) {
 	mu.Unlock()
 	if !sawSuccess {
 		t.Error("GetExpStatus never derived SUCCESS after the host-timed window")
+	}
+}
+
+// quietDispatchTransport adds QuietBulkReader on top of the bare dispatcher.
+type quietDispatchTransport struct{ dispatchTransport }
+
+func (d *quietDispatchTransport) BulkReadQuiet(buf []byte, _, _ time.Duration) (int, error) {
+	d.path = "quiet"
+	return len(buf), nil
+}
+
+// TestBulkReadQuietDispatch: the worker primitive routes to the transport's quiet-gated
+// read when offered and falls back to the fully-gated BulkRead otherwise (finding 3.5).
+func TestBulkReadQuietDispatch(t *testing.T) {
+	buf := make([]byte, 32)
+	q := &quietDispatchTransport{}
+	c := &Camera{t: q}
+	if _, err := c.BulkReadQuiet(buf, time.Second, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if q.path != "quiet" {
+		t.Errorf("quiet backend took %q, want \"quiet\"", q.path)
+	}
+	b := &dispatchTransport{}
+	c = &Camera{t: b}
+	if _, err := c.BulkReadQuiet(buf, time.Second, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if b.path != "bulk" {
+		t.Errorf("bulk-only backend took %q, want \"bulk\" (fallback)", b.path)
+	}
+}
+
+// abortableTransport blocks BulkRead until AbortRead (or the read timeout) and counts the
+// ReadAborter calls — the seam for the StopExposure-promptness contract test.
+type abortableTransport struct {
+	mu         sync.Mutex
+	aborted    chan struct{}
+	abortCalls int
+	armCalls   int
+}
+
+func newAbortableTransport() *abortableTransport {
+	return &abortableTransport{aborted: make(chan struct{})}
+}
+func (a *abortableTransport) ControlOut(uint8, uint16, uint16, []byte) error { return nil }
+func (a *abortableTransport) ControlIn(_ uint8, _, _ uint16, data []byte) (int, error) {
+	return len(data), nil
+}
+func (a *abortableTransport) Close() error { return nil }
+func (a *abortableTransport) BulkRead(buf []byte, to time.Duration) (int, error) {
+	a.mu.Lock()
+	ch := a.aborted
+	a.mu.Unlock()
+	select {
+	case <-ch:
+		return 0, nil // aborted: short prefix, like the real backends
+	case <-time.After(to):
+		return len(buf), nil
+	}
+}
+func (a *abortableTransport) AbortRead() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.abortCalls++
+	select {
+	case <-a.aborted:
+	default:
+		close(a.aborted)
+	}
+}
+func (a *abortableTransport) ArmRead() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.armCalls++
+	select {
+	case <-a.aborted:
+		a.aborted = make(chan struct{})
+	default:
+	}
+}
+
+// TestStopExposureBreaksBlockedRead pins the finding-1.5 contract at the Camera level:
+// a GetDataAfterExp blocked in a multi-second transport read must return within moments of
+// StopExposure (via ReadAborter), reporting an abort — not run out its read timeout. Also
+// asserts the ArmRead/AbortRead lifecycle: StartExposure re-arms, StopExposure aborts.
+func TestStopExposureBreaksBlockedRead(t *testing.T) {
+	at := newAbortableTransport()
+	Register(ZWO.VID, 0x00D1, Model{Name: "Abort", Sensor: &armSensor})
+	c, err := Open(at, ZWO.VID, 0x00D1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetExposure(10 * time.Millisecond)
+	if err := c.StartExposure(true); err != nil {
+		t.Fatal(err)
+	}
+	if at.armCalls != 1 {
+		t.Errorf("StartExposure made %d ArmRead calls, want 1", at.armCalls)
+	}
+	done := make(chan error, 1)
+	go func() {
+		// The generic read path's timeout is 2·exp+3 s ≈ 3 s per attempt: without the
+		// abort break this read sits for seconds.
+		_, err := c.GetDataAfterExp(make([]byte, c.FrameBytes()))
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // let the read block in the transport
+	t0 := time.Now()
+	if err := c.StopExposure(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "abort") {
+			t.Errorf("GetDataAfterExp = %v, want an abort error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetDataAfterExp still blocked 2 s after StopExposure — abort was not prompt")
+	}
+	if el := time.Since(t0); el > time.Second {
+		t.Errorf("read released %v after StopExposure, want ~immediate", el)
+	}
+	if at.abortCalls != 1 {
+		t.Errorf("StopExposure made %d AbortRead calls, want 1", at.abortCalls)
+	}
+}
+
+// TestStubImplementsAbortAndQuiet: StubTransport keeps capability parity with the hardware
+// backends so camera-level tests exercise the same dispatch.
+func TestStubImplementsAbortAndQuiet(t *testing.T) {
+	var tr Transport = NewStubTransport()
+	if _, ok := tr.(ReadAborter); !ok {
+		t.Error("StubTransport does not implement ReadAborter")
+	}
+	if _, ok := tr.(QuietBulkReader); !ok {
+		t.Error("StubTransport does not implement QuietBulkReader")
+	}
+	st := tr.(*StubTransport)
+	st.AbortRead()
+	if n, err := st.BulkRead(make([]byte, 8), time.Second); n != 0 || err != nil {
+		t.Errorf("aborted stub BulkRead = (%d, %v), want (0, nil)", n, err)
+	}
+	st.ArmRead()
+	if n, _ := st.BulkRead(make([]byte, 8), time.Second); n != 8 {
+		t.Errorf("re-armed stub BulkRead = %d bytes, want 8", n)
 	}
 }

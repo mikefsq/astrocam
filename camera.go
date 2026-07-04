@@ -56,6 +56,12 @@ type Camera struct {
 	expLight   bool // light/dark flag of the current exposure (recovery re-arms with the same)
 	subtype    int  // firmware subtype byte (GetFirmwareVer); gates init branches
 
+	// ST4 pulse state (guide.go), under mu: st4Lines is the bitmask of asserted guide
+	// lines (bit = GuideDir), st4Pulses counts host-timed PulseGuide calls in flight.
+	// Together they back IsPulseGuiding (ASCOM).
+	st4Lines  uint8
+	st4Pulses int
+
 	// stalls counts worker readout stalls (short/failed reads that triggered a re-arm) over the
 	// camera's lifetime, surfaced by StallCount(). Atomic, not mu-guarded.
 	stalls atomic.Int64

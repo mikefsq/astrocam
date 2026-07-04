@@ -50,3 +50,67 @@ func TestPulseGuideOutOfRange(t *testing.T) {
 		t.Errorf("out-of-range dir produced transfers: %+v", f.out)
 	}
 }
+
+// pulseRecorder is a StubTransport variant that records whether the ST4 commands took the
+// ungated path.
+type pulseRecorder struct {
+	StubTransport
+	ungated []uint8
+}
+
+func (p *pulseRecorder) ControlOutUngated(bRequest uint8, wValue, wIndex uint16) error {
+	p.ungated = append(p.ungated, bRequest)
+	return p.ControlOut(bRequest, wValue, wIndex, nil)
+}
+
+// TestPulseGuideUngatedDispatch: the ST4 commands route through UngatedControlSender when
+// the transport offers it (REVIEW 4.3 — a pulse edge must not queue behind ioMu).
+func TestPulseGuideUngatedDispatch(t *testing.T) {
+	p := &pulseRecorder{}
+	c := &Camera{t: p}
+	if err := c.PulseGuide(GuideNorth, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.ungated) != 2 || p.ungated[0] != cmdST4N || p.ungated[1] != cmdST4F {
+		t.Fatalf("ungated ST4 sequence = %#v, want [0xB0 0xB1]", p.ungated)
+	}
+}
+
+// TestIsPulseGuiding: line-state and in-flight-pulse tracking back ASCOM IsPulseGuiding.
+func TestIsPulseGuiding(t *testing.T) {
+	c := &Camera{t: NewStubTransport()}
+	if c.IsPulseGuiding() {
+		t.Fatal("idle camera reports pulse guiding")
+	}
+	if err := c.PulseGuideOn(GuideWest); err != nil {
+		t.Fatal(err)
+	}
+	if !c.IsPulseGuiding() {
+		t.Fatal("asserted line not reflected in IsPulseGuiding")
+	}
+	if err := c.PulseGuideOn(GuideNorth); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PulseGuideOff(GuideWest); err != nil {
+		t.Fatal(err)
+	}
+	if !c.IsPulseGuiding() {
+		t.Fatal("North still asserted but IsPulseGuiding is false (overlapping pulses)")
+	}
+	if err := c.PulseGuideOff(GuideNorth); err != nil {
+		t.Fatal(err)
+	}
+	if c.IsPulseGuiding() {
+		t.Fatal("all lines released but IsPulseGuiding is true")
+	}
+	done := make(chan struct{})
+	go func() { _ = c.PulseGuide(GuideEast, 100*time.Millisecond); close(done) }()
+	time.Sleep(30 * time.Millisecond)
+	if !c.IsPulseGuiding() {
+		t.Fatal("host-timed pulse in flight but IsPulseGuiding is false")
+	}
+	<-done
+	if c.IsPulseGuiding() {
+		t.Fatal("pulse completed but IsPulseGuiding is true")
+	}
+}
