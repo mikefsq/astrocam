@@ -33,6 +33,10 @@ package astrocam
 #include <pthread.h>
 #include <dispatch/dispatch.h>
 
+// Forward-declared: asi_now_ms is defined further down but called by the read pumps above it.
+// Modern clang treats a call to an undeclared function as an error (C99+), so declare it up front.
+static int64_t asi_now_ms(void);
+
 // asicam_diag carries where-did-it-fail info out of asi_open so the Go side can
 // turn the otherwise-opaque failure into a precise message.
 typedef struct {

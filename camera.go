@@ -140,6 +140,10 @@ func (c *Camera) SetFPSPercent(pct int) {
 	}
 }
 
+// FPSPercent reports the live effective FPS-percent throttle — the user-set value, or the
+// link-dependent default when none was set (100 on USB3, 40 on a USB2 HighSpeed link).
+func (c *Camera) FPSPercent() int { return ModeOf(c.rm).FPSPercent }
+
 // SetUSB3 forces the readout mode's link-speed assumption (the bandwidth budget the HMAX/
 // line-time math uses): true = USB3 SuperSpeed (bwUSB3), false = USB2 HighSpeed (bwUSB2).
 // Normally taken from the model; forcing it exercises the USB2 vs USB3 path on a fixed link. Does
