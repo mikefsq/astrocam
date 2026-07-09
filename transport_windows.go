@@ -4,8 +4,11 @@
 // via WinUsb_ControlTransfer and bulk-IN frame reads via overlapped WinUsb_ReadPipe, bounded
 // by the pipe's transfer-timeout policy.
 //
-// The camera must be bound to WinUSB/libusbK (the ZWO installer or Zadig). The device is
-// matched by VID/PID in its device-interface path under the generic USB device interface GUID.
+// The camera must be bound to the generic WinUSB (or libusbK) kernel driver — rebind with
+// Zadig. ZWO's own installer binds their proprietary ASICAMUSB3.sys, which the WinUSB API
+// cannot open; the bind is exclusive, so ZWO's native software won't see the camera until
+// reverted in Device Manager. The device is matched by VID/PID in its device-interface path
+// under the generic USB device interface GUID.
 //
 // Frame reads use fixed 1 MiB chunked reads assembled to a contiguous watermark (BulkRead /
 // ReadFrameStream): a whole-frame read must time-bound (default WinUSB blocks forever) and
