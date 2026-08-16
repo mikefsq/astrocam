@@ -7,10 +7,10 @@
 // buffer per transfer (so a multi-MB read fails with ENOMEM), and the FX3's mid-frame
 // short packets / ZLPs must be read through rather than taken as the frame end. Two read
 // paths: BulkRead uses the async-URB API (SUBMITURB/REAPURB), posting all of a frame's
-// transfers up front with the last sized to the exact remainder — the only way the FX3
+// transfers up front with the last sized to the exact remainder, the only way the FX3
 // releases its held final partial DMA buffer (the >4 s single-shot TRIGGER tail);
 // ReadFrameStream uses the synchronous windowed-read loop with a FPGABufReload tail-flush
-// for the USB3 DDR parts. Needs a udev rule granting access to the ZWO VID 0x03C3 (see deploy/).
+// for the USB3 DDR parts. Needs a udev rule granting access to the camera's USB VID (ZWO 0x03C3).
 
 package astrocam
 
@@ -36,16 +36,15 @@ var (
 	usbdevfsBulk           = ioc(3, 2, 24)  // _IOWR('U',2,usbdevfs_bulktransfer)
 	usbdevfsSubmitURB      = ioc(2, 10, 56) // _IOR('U',10,usbdevfs_urb)  = 0x8038550a (64-bit)
 	usbdevfsDiscardURB     = ioc(0, 11, 0)  // _IO('U',11)                = 0x0000550b
-	usbdevfsReapURB        = ioc(1, 12, 8)  // _IOW('U',12,void*)         = 0x4008550c (blocking)
 	usbdevfsReapURBNDelay  = ioc(1, 13, 8)  // _IOW('U',13,void*)         = 0x4008550d (non-blocking)
 	usbdevfsClaimInterface = ioc(2, 15, 4)  // _IOR('U',15,uint)
 	usbdevfsClearHalt      = ioc(2, 21, 4)  // _IOR('U',21,uint)
 	usbdevfsReset          = ioc(0, 20, 0)  // _IO('U',20)                = 0x00005514
 )
 
-// debugPreq dumps per-URB completion timing/lengths from ReadFrameStreamPrequeued (temporary
-// bring-up diagnostic; set ASICAM_DEBUG_PREQ=1).
-var debugPreq = os.Getenv("ASICAM_DEBUG_PREQ") != ""
+// debugPreq dumps per-URB completion timing/lengths from ReadFrameStreamPrequeued to stderr
+// (bring-up diagnostic; set ASTROCAM_DEBUG_PREQ=1).
+var debugPreq = os.Getenv("ASTROCAM_DEBUG_PREQ") != ""
 
 // usbURB is the 64-bit <linux/usbdevice_fs.h> struct usbdevfs_urb (56 bytes, no trailing
 // iso packet descriptors), posted and reaped by the async SUBMITURB/REAPURB path.
@@ -91,28 +90,28 @@ type usbBulkTransfer struct {
 type usbfsDevice struct {
 	f *os.File
 	// closeMu is the Close interlock: every public I/O method holds it shared for the
-	// duration of its I/O (including the URB drain), and Close takes it exclusively — so
+	// duration of its I/O (including the URB drain), and Close takes it exclusively, so
 	// Close waits for in-flight I/O instead of yanking the fd out from under a drain
-	// (an EBADF mid-drain used to abandon kernel-held pointers into the caller's buffer).
+	// (an EBADF mid-drain would abandon kernel-held pointers into the caller's buffer).
 	// Lock order: closeMu (shared) BEFORE ioMu. All I/O is deadline-bounded, so Close is too.
 	closeMu sync.RWMutex
 	closed  bool // under closeMu
 	// broken poisons the device after an undrainable readout (see drainURBs): the kernel may
-	// still hold references into parked buffers, so no further I/O is allowed on this fd —
+	// still hold references into parked buffers, so no further I/O is allowed on this fd:
 	// fail fast until the camera is re-opened.
 	broken atomic.Bool
 	// ioMu serializes every USB I/O the FX3 bridge must not see interleaved: all control
 	// transfers AND a whole-frame BulkRead hold it. A control transfer (a TEC poll, or a
 	// client's CCDTemperature → 0xB3) landing on the bridge mid-readout hard-wedges the
-	// un-buffered USB2 path (ASI174) — it parks the GPIF and takes the control plane down
+	// un-buffered USB2 path (ASI174): it parks the GPIF and takes the control plane down
 	// with it (EP0 then times out, -110), recoverable only by a device reset + re-Init.
-	// bulkOne (ReadFrameStream — the USB3/6200 DDR path) deliberately does NOT take ioMu:
+	// bulkOne (ReadFrameStream, the USB3/6200 DDR path) does NOT take ioMu:
 	// that path requires its worker's concurrent FPGABufReload, and its DDR frame buffer
 	// makes the interleave harmless.
 	ioMu sync.Mutex
 	// readAborted is the ReadAborter state (level-triggered): while set, in-flight frame
 	// reads drain and return their short prefix within ~one poll interval, and new frame
-	// reads fail fast — so StopExposure's master-stop writes are never stuck behind a
+	// reads fail fast, so StopExposure's master-stop writes are never stuck behind a
 	// blocked read holding ioMu. Set by AbortRead (StopExposure), cleared by ArmRead
 	// (StartExposure/StartVideo). Control transfers and ResetEndpoint are unaffected.
 	readAborted atomic.Bool
@@ -128,7 +127,7 @@ func (d *usbfsDevice) AbortRead() { d.readAborted.Store(true) }
 func (d *usbfsDevice) ArmRead()   { d.readAborted.Store(false) }
 
 // usbNode is one /dev/bus/usb device node and the VID/PID read from its descriptor
-// head — the identity a scan reads without claiming the device.
+// head, the identity a scan reads without claiming the device.
 type usbNode struct {
 	path     string
 	bus, dev int
@@ -150,7 +149,7 @@ func busDevFromPath(p string) (bus, dev int, err error) {
 }
 
 // scanUSB lists every /dev/bus/usb node whose device-descriptor VID matches vid (and
-// PID, when pid != 0), reading the 18-byte descriptor head read-only — no claim, so it
+// PID, when pid != 0), reading the 18-byte descriptor head read-only (no claim), so it
 // is safe against a camera another process has open. Unreadable nodes are skipped.
 func scanUSB(vid, pid uint16) []usbNode {
 	nodes, _ := filepath.Glob("/dev/bus/usb/*/*")
@@ -158,7 +157,7 @@ func scanUSB(vid, pid uint16) []usbNode {
 	for _, p := range nodes {
 		f, err := os.OpenFile(p, os.O_RDONLY, 0)
 		if err != nil {
-			continue // permission / busy — skip
+			continue // permission / busy: skip
 		}
 		var desc [18]byte // device descriptor is the head of the node
 		_, err = f.ReadAt(desc[:], 0)
@@ -185,7 +184,7 @@ func scanUSB(vid, pid uint16) []usbNode {
 func openNodeAndClaim(path string) (*usbfsDevice, uint16, uint16, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("asicam: open %s: %w (check udev permissions for the ZWO VID)", path, err)
+		return nil, 0, 0, fmt.Errorf("astrocam: open %s: %w (check udev permissions for the ZWO VID)", path, err)
 	}
 	var desc [18]byte // device descriptor is the head of the node
 	if _, err := f.ReadAt(desc[:], 0); err != nil {
@@ -197,7 +196,7 @@ func openNodeAndClaim(path string) (*usbfsDevice, uint16, uint16, error) {
 	d := &usbfsDevice{f: f}
 	// Negotiated link speed from the bulk-IN endpoint's max packet size: USB3 SuperSpeed bulk =
 	// 1024, USB2 HighSpeed = 512. The node read returns the device descriptor followed by the
-	// active config/interface/endpoint descriptors, which reflect the speed actually negotiated —
+	// active config/interface/endpoint descriptors, which reflect the speed actually negotiated,
 	// so a USB3 camera on a HighSpeed link (e.g. through a Cynthion) correctly reads as USB2 and the
 	// readout uses the USB2 bandwidth budget. Without this the readout runs at the USB3 line rate and
 	// overruns the bus, shearing the frame.
@@ -207,7 +206,7 @@ func openNodeAndClaim(path string) (*usbfsDevice, uint16, uint16, error) {
 	}
 	if err := d.claim(0); err != nil {
 		f.Close()
-		return nil, 0, 0, fmt.Errorf("asicam: claim interface 0 on %s: %w", path, err)
+		return nil, 0, 0, fmt.Errorf("astrocam: claim interface 0 on %s: %w", path, err)
 	}
 	return d, vid, pid, nil
 }
@@ -233,14 +232,14 @@ func bulkInMaxPacket(b []byte, ep uint8) int {
 // packet); false = USB2 HighSpeed. The Camera readout follows this, not the model capability.
 func (d *usbfsDevice) SuperSpeed() bool { return d.superSpeed }
 
-// OpenUSBFS finds the first device matching vid/pid under /dev/bus/usb, claims
-// interface 0, and returns a Transport. The ZWO VID is astrocam.ZWO.VID (0x03C3).
-func OpenUSBFS(vid, pid uint16) (*usbfsDevice, error) {
+// openUSBFS finds the first device matching vid/pid under /dev/bus/usb, claims
+// interface 0, and returns the transport (OpenHost is the public entry).
+func openUSBFS(vid, pid uint16) (*usbfsDevice, error) {
 	var lastErr error
 	for _, n := range scanUSB(vid, pid) {
 		d, _, _, err := openNodeAndClaim(n.path)
 		if err != nil {
-			lastErr = err // device is there but couldn't be opened/claimed — surface why
+			lastErr = err // device is there but couldn't be opened/claimed: surface why
 			continue
 		}
 		return d, nil
@@ -248,7 +247,7 @@ func OpenUSBFS(vid, pid uint16) (*usbfsDevice, error) {
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, fmt.Errorf("asicam: no usbfs device for %04x:%04x (check udev permissions)", vid, pid)
+	return nil, fmt.Errorf("astrocam: no usbfs device for %04x:%04x (check udev permissions)", vid, pid)
 }
 
 func (d *usbfsDevice) ioctl(req uintptr, arg unsafe.Pointer) error {
@@ -260,8 +259,8 @@ func (d *usbfsDevice) ioctl(req uintptr, arg unsafe.Pointer) error {
 }
 
 var (
-	errTransportClosed = fmt.Errorf("asicam: transport closed")
-	errTransportBroken = fmt.Errorf("asicam: transport poisoned by an undrainable readout (re-open to recover)")
+	errTransportClosed = fmt.Errorf("astrocam: transport closed")
+	errTransportBroken = fmt.Errorf("astrocam: transport poisoned by an undrainable readout (re-open to recover)")
 )
 
 // enter gates every public I/O method: fail fast on a closed or poisoned device, and hold
@@ -292,12 +291,11 @@ var (
 )
 
 // drainURBs discards and reaps every pending urb so no kernel copyout can land against the
-// caller's memory after return — usbfs writes into buf and the urb structs at REAP time, so
+// caller's memory after return: usbfs writes into buf and the urb structs at REAP time, so
 // returning with an unreaped urb is a future memory corruption. EINTR and EAGAIN are retried
-// (the Go runtime's SIGURG preemption interrupts ioctls routinely; the old drains treated
-// EINTR as terminal and bailed). If the urbs cannot all be reaped within drainTimeout, or the
+// (the Go runtime's SIGURG preemption interrupts ioctls routinely). If the urbs cannot all be reaped within drainTimeout, or the
 // reap fails outright (e.g. ENODEV after a disconnect), the buffers are parked for the
-// process lifetime and the device is poisoned — every later I/O fails fast until re-open,
+// process lifetime and the device is poisoned: every later I/O fails fast until re-open,
 // and the eventual fd close releases the kernel's urbs without copyout.
 func (d *usbfsDevice) drainURBs(urbs []usbURB, pending []bool, buf []byte) {
 	npend := 0
@@ -364,7 +362,7 @@ func (d *usbfsDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, da
 	if len(data) > 0 {
 		ct.data = uintptr(unsafe.Pointer(&data[0]))
 	}
-	// USBDEVFS_CONTROL's return value is the transferred byte count — report it, don't
+	// USBDEVFS_CONTROL's return value is the transferred byte count; report it, don't
 	// fabricate len(data): a short control-IN (e.g. the SPI flash read hitting the blob
 	// end) must be visible to callers that terminate on `got < want`.
 	r1, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.f.Fd(), usbdevfsControl, uintptr(unsafe.Pointer(&ct)))
@@ -380,9 +378,9 @@ func (d *usbfsDevice) ControlOut(bRequest uint8, wValue, wIndex uint16, data []b
 	return err
 }
 
-// ControlOutUngated implements UngatedControlSender (ST4 guide pulses ONLY — see
+// ControlOutUngated implements UngatedControlSender (ST4 guide pulses ONLY, see
 // transport.go): the vendor OUT is issued WITHOUT taking ioMu, so a pulse edge cannot
-// queue behind a whole-frame read. The SDK does exactly this (its capture thread never
+// queue behind a whole-frame read. The SDK does the same (its capture thread never
 // holds the API mutex); usbfs control ioctls are independently safe per call. The Close
 // interlock and broken poison still apply.
 func (d *usbfsDevice) ControlOutUngated(bRequest uint8, wValue, wIndex uint16) error {
@@ -420,7 +418,7 @@ const urbWindow = 12
 // bulkOne issues one USBDEVFS_BULK read of up to len(buf) bytes and returns the
 // count actually transferred (which is < len(buf) when the device ends with a short
 // packet). Used by ReadFrameStream (the synchronous windowed pump); BulkRead uses the
-// async-URB path instead — see readFrameURBs.
+// async-URB path instead; see readFrameURBs.
 func (d *usbfsDevice) bulkOne(buf []byte, timeoutMs uint32) (int, error) {
 	bt := usbBulkTransfer{ep: bulkEndpoint, len: uint32(len(buf)), timeout: timeoutMs}
 	if len(buf) > 0 {
@@ -435,7 +433,7 @@ func (d *usbfsDevice) bulkOne(buf []byte, timeoutMs uint32) (int, error) {
 }
 
 // bulkTrace, when ASTROCAM_BULK_TRACE is set, logs one line per submitted/reaped urb to
-// stderr (held-tail / short-packet timing). Diagnostic only — off by default.
+// stderr (held-tail / short-packet timing). Diagnostic only; off by default.
 var bulkTrace = os.Getenv("ASTROCAM_BULK_TRACE") != ""
 
 // BulkRead reads one whole frame from the bulk-IN endpoint into buf via the async-URB pump
@@ -453,7 +451,7 @@ func (d *usbfsDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
 
 // BulkReadQuiet implements QuietBulkReader: like BulkRead, but the first `quiet` of the
 // read is a host-timed integration window during which ioMu stays RELEASED (the sensor is
-// exposing — no data can arrive — but the transfers are already armed so the GPIF never
+// exposing, so no data can arrive, but the transfers are already armed so the GPIF never
 // streams without a reader). The gate engages at quiet-elapsed or first data, whichever
 // comes first. timeout still bounds the WHOLE call, quiet included.
 func (d *usbfsDevice) BulkReadQuiet(buf []byte, quiet, timeout time.Duration) (int, error) {
@@ -466,8 +464,8 @@ func (d *usbfsDevice) BulkReadQuiet(buf []byte, quiet, timeout time.Duration) (i
 }
 
 // readFrameURBs reads one whole frame through the usbfs async urb API. It submits
-// ceil(len/chunk) bulk-IN transfers up front (USBDEVFS_SUBMITURB) — each into its slice of
-// buf at a fixed offset, the last sized to the exact remainder, not a padded full chunk —
+// ceil(len/chunk) bulk-IN transfers up front (USBDEVFS_SUBMITURB), each into its slice of
+// buf at a fixed offset, the last sized to the exact remainder, not a padded full chunk,
 // then reaps them in completion order (USBDEVFS_REAPURBNDELAY) and counts contiguous bytes
 // up to the first short or failed transfer (the FX3 ends a frame with a short packet).
 //
@@ -479,8 +477,8 @@ func (d *usbfsDevice) BulkReadQuiet(buf []byte, quiet, timeout time.Duration) (i
 //
 // It owns the ioMu gate: with quiet 0 the gate is held from before the first submit to
 // after the drain (the classic whole-read wedge gate). With quiet > 0 the first `quiet`
-// is a host-declared integration window — transfers armed, gate RELEASED so EP0 traffic
-// (TEC, telemetry, ST4) flows — and the gate engages at quiet-elapsed or first completion,
+// is a host-declared integration window (transfers armed, gate RELEASED so EP0 traffic
+// (TEC, telemetry, ST4) flows), and the gate engages at quiet-elapsed or first completion,
 // whichever comes first, then stays held through drain. An AbortRead (StopExposure) breaks
 // the reap loop within ~one poll interval; the drained short prefix is returned with a nil
 // error and the worker's Aborted() check maps it to the abort outcome.
@@ -489,7 +487,7 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout, quiet time.Duration) (i
 		return 0, nil
 	}
 	if d.readAborted.Load() {
-		return 0, nil // aborted before we armed anything — don't take ioMu at all
+		return 0, nil // aborted before we armed anything: don't take ioMu at all
 	}
 	start := time.Now()
 	deadline := start.Add(timeout)
@@ -518,7 +516,7 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout, quiet time.Duration) (i
 	}
 	// On any exit, discard + reap every submitted-but-unreaped urb so no completion lands
 	// against buf after we return (see drainURBs: EINTR-safe, bounded, parks + poisons on
-	// failure). The drain runs under the gate — an abort/deadline can strike mid-stream, and
+	// failure). The drain runs under the gate: an abort/deadline can strike mid-stream, and
 	// the discard/reap window is readout as far as the FX3 is concerned. Assembly reads
 	// `done` before this defer runs, so the derived mask is fine.
 	defer func() {
@@ -533,8 +531,8 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout, quiet time.Duration) (i
 
 	// Submit with at most urbWindow transfers in flight; completions slide the window forward.
 	// usbfs pins every in-flight URB's buffer in kernel memory against a per-fd cap (16 MiB
-	// default), so posting a large frame all up front fails at ~slot 16 — and the reaped
-	// prefix then came back as a silently short frame with a nil error. Frames within the
+	// default), so posting a large frame all up front fails at ~slot 16, and the reaped
+	// prefix would come back as a silently short frame with a nil error. Frames within the
 	// window (all current BulkRead sensors) still get every transfer armed before data flows.
 	next := 0
 	noMore := false
@@ -557,7 +555,7 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout, quiet time.Duration) (i
 	for next < n && next < urbWindow {
 		if err := submitNext(); err != nil {
 			if next == 0 {
-				return 0, err // couldn't post a single transfer — fatal
+				return 0, err // couldn't post a single transfer: fatal
 			}
 			break
 		}
@@ -586,7 +584,7 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout, quiet time.Duration) (i
 		err := d.ioctl(usbdevfsReapURBNDelay, unsafe.Pointer(&p))
 		if err == syscall.EAGAIN || err == syscall.EINTR { // EINTR: Go's SIGURG preemption
 			// Adaptive wait: tight (200 µs) around an active readout, coarse (2 ms) once the
-			// pre-data wait has clearly become an integration — 500 wakeups/s instead of 5000
+			// pre-data wait has clearly become an integration: 500 wakeups/s instead of 5000
 			// for a multi-second exposure, without adding reap latency while data streams.
 			s := 200 * time.Microsecond
 			if !gotAny && time.Since(start) > 100*time.Millisecond {
@@ -634,7 +632,7 @@ func (d *usbfsDevice) readFrameURBs(buf []byte, timeout, quiet time.Duration) (i
 }
 
 // ReadFrameStream reads one whole frame, treating the FX3's mid-frame short packets and
-// zero-length packets as non-terminal (the DDR cameras — 6200/585 — hold the frame's final
+// zero-length packets as non-terminal (the DDR cameras, 6200/585, hold the frame's final
 // partial buffer until FPGABufReload flushes it, which the worker pulses on a ticker for the
 // duration of this call). It keeps issuing full maxBulkChunk reads into scratch and copying
 // to a watermark until the frame is in, `idle` passes with no data at all (a genuine stall),
@@ -666,7 +664,7 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 		// Do NOT slice this transfer's timeout below the idle window: a USBDEVFS_BULK
 		// timeout CANCELS the in-flight URB, and a cancel racing an arriving DDR burst
 		// (the worker's 20 ms FPGABufReload cadence keeps them coming) drops the bytes in
-		// flight — every later byte then lands earlier in the frame, a horizontal shear.
+		// flight; every later byte then lands earlier in the frame, a horizontal shear.
 		// Observed on the 6200/IMX455 when this was briefly sliced to 500 ms for abort
 		// promptness: every few frames displaced sideways. Cancels must stay confined to
 		// the idle boundary, where the stream has been silent for the whole window. The
@@ -677,7 +675,7 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 		}
 		msec := uint32(ms.Milliseconds())
 		if msec == 0 {
-			msec = 1 // <1 ms remaining truncates to 0 = INFINITE for usbfs bulk — never block forever
+			msec = 1 // <1 ms remaining truncates to 0 = INFINITE for usbfs bulk; never block forever
 		}
 		n, err := d.bulkOne(scratch, msec)
 		if n > 0 {
@@ -685,7 +683,7 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 			lastData = time.Now()
 			continue
 		}
-		// No data this read (per-read timeout or a ZLP). Not necessarily the end —
+		// No data this read (per-read timeout or a ZLP). Not necessarily the end:
 		// keep cycling until `idle` elapses with no data at all.
 		if errno, ok := err.(syscall.Errno); err != nil && (!ok || (errno != syscall.ETIMEDOUT && errno != syscall.ETIME)) {
 			return got, err // a real pipe/device error, not a timeout
@@ -698,12 +696,12 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 }
 
 // ReadFrameStreamPrequeued reads one frame with the SDK's async-transfer model (initAsyncXfer/
-// startAsyncXfer): bulk-IN URBs covering buf EXACTLY — slot i targets buf[i·1MiB:] and the last
-// slot is sized to the frame remainder, so the batch completes at frame end without relying on
+// startAsyncXfer): bulk-IN URBs covering buf EXACTLY (slot i targets buf[i·1MiB:] and the last
+// slot is sized to the frame remainder), so the batch completes at frame end without relying on
 // a short packet (a full-1MiB tail URB never completes once the FPGA stops after the snap
-// frame — that was the short-frame stall). The slots are pre-queued before the frame arrives,
+// frame). The slots are pre-queued before the frame arrives,
 // so the pipe is armed while the sensor integrates and the GPIF never streams without a reader.
-// No slot is resubmitted: one frame, one batch — a retry is a fresh call. Data lands directly
+// No slot is resubmitted: one frame, one batch; a retry is a fresh call. Data lands directly
 // at each slot's fixed offset, so completion order doesn't matter. Returns the contiguous byte
 // count from the start of buf. idle bounds a no-completion stall; total bounds the whole read.
 // Satisfies PrequeuedFrameStreamer.
@@ -717,7 +715,7 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 	}
 	defer release()
 	if d.readAborted.Load() {
-		return 0, nil // aborted before arming — don't take ioMu at all
+		return 0, nil // aborted before arming: don't take ioMu at all
 	}
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
@@ -758,7 +756,7 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 	defer drain()
 	// prefix is the contiguous byte count from the start of buf: full slots plus the partial
 	// tail of the first incomplete OR errored one. A slot's actualLength counts (the kernel
-	// delivered those bytes — a discarded urb reaps -ENOENT with its partial data in place,
+	// delivered those bytes; a discarded urb reaps -ENOENT with its partial data in place,
 	// a babbled one -EOVERFLOW with everything up to the oversized packet), but counting
 	// STOPS there: a full-length slot with a nonzero status must not let the count run past
 	// a gap. Only meaningful after drain().
@@ -777,7 +775,7 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 	for ; next < nslots && next < window; next++ {
 		if err := submit(next); err != nil {
 			if next == 0 {
-				return 0, fmt.Errorf("asicam: submit urb: %w", err)
+				return 0, fmt.Errorf("astrocam: submit urb: %w", err)
 			}
 			break // window truncated (e.g. usbfs memory cap); completions extend it below
 		}
@@ -787,7 +785,7 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 	lastData := time.Now()
 	gotFirst := false // idle gates only AFTER the first completion: the pre-frame quiet is the
 	// integration (URBs are armed before the exposure and the first slot completes only once
-	// ~1 MiB has streamed), so only `total` bounds it — matching startAsyncXfer, which has no
+	// ~1 MiB has streamed), so only `total` bounds it, matching startAsyncXfer, which has no
 	// idle cutoff at all, just the overall timeout.
 	for done := 0; done < nslots; {
 		if time.Now().After(deadline) || d.readAborted.Load() {
@@ -821,11 +819,11 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 		lastData = time.Now()
 		gotFirst = true
 		if debugPreq {
-			fmt.Printf("[preq] +%6.1fms slot %d done: %d/%d status=%d\n",
+			fmt.Fprintf(os.Stderr, "[preq] +%6.1fms slot %d done: %d/%d status=%d\n",
 				time.Since(deadline.Add(-total)).Seconds()*1e3, i, urbs[i].actualLength, want[i], urbs[i].status)
 		}
 		// A nonzero status (halt, babble) surfaces as a short prefix; the worker's retry
-		// ladder resets the endpoint — matching the SDK, which only counts bytes.
+		// ladder resets the endpoint, matching the SDK, which only counts bytes.
 		if next < nslots {
 			if submit(next) == nil {
 				next++
@@ -837,11 +835,10 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 }
 
 // ResetEndpoint clears a halt/stall on the bulk-IN endpoint (USBDEVFS_CLEAR_HALT). CLEAR_HALT
-// is EP0 control traffic, so it takes ioMu like every other control transfer — landing it
-// mid-readout is exactly the GPIF-wedge interleave the mutex exists to prevent. All callers
-// are capture-sequential today (they reset BETWEEN reads); the lock enforces what was
-// previously convention. NOT a recovery hatch for a stuck read — that is ResetDevice, which
-// deliberately bypasses ioMu.
+// is EP0 control traffic, so it takes ioMu like every other control transfer: landing it
+// mid-readout is the GPIF-wedge interleave the mutex exists to prevent. All callers
+// are capture-sequential (they reset BETWEEN reads); the lock enforces it. NOT a recovery
+// hatch for a stuck read: that is ResetDevice, which bypasses ioMu.
 func (d *usbfsDevice) ResetEndpoint(ep uint8) error {
 	release, err := d.enter()
 	if err != nil {
@@ -854,8 +851,8 @@ func (d *usbfsDevice) ResetEndpoint(ep uint8) error {
 	return d.ioctl(usbdevfsClearHalt, unsafe.Pointer(&e))
 }
 
-// ResetDevice performs a USB port reset of the whole device (USBDEVFS_RESET) — last-resort
-// recovery when the readout wedges. It deliberately does NOT take ioMu: its job includes
+// ResetDevice performs a USB port reset of the whole device (USBDEVFS_RESET), the last-resort
+// recovery when the readout wedges. It does NOT take ioMu: its job includes
 // recovering while a stuck read still holds the lock, and serializing it would deadlock that
 // recovery. The reset drops the kernel's interface claim, so we re-claim interface 0
 // afterwards; the device keeps its address (no node change).
@@ -868,10 +865,10 @@ func (d *usbfsDevice) ResetDevice() error {
 	if err := d.ioctl(usbdevfsReset, nil); err != nil {
 		return err
 	}
-	return d.claim(0) // the reset releases the interface claim — re-take it
+	return d.claim(0) // the reset releases the interface claim; re-take it
 }
 
-// Close waits for in-flight I/O (the closeMu interlock — every I/O is deadline-bounded, so
+// Close waits for in-flight I/O (the closeMu interlock; every I/O is deadline-bounded, so
 // this is too), then closes the fd. The fd release makes the kernel free any still-queued
 // urbs WITHOUT copyout, so nothing can land against user memory afterwards. Idempotent.
 func (d *usbfsDevice) Close() error {
@@ -886,7 +883,7 @@ func (d *usbfsDevice) Close() error {
 
 // OpenHost opens the default USB backend for this platform (Linux: usbfs).
 func OpenHost(vid, pid uint16) (Transport, error) {
-	d, err := OpenUSBFS(vid, pid)
+	d, err := openUSBFS(vid, pid)
 	if err != nil {
 		return nil, err
 	}
@@ -906,7 +903,7 @@ func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 }
 
 // OpenLocation opens the device at a specific busnum/devnum location (from a DeviceInfo)
-// and claims its bulk interface — binds the exact unit chosen from Enumerate. The
+// and claims its bulk interface: it binds the exact unit chosen from Enumerate. The
 // descriptor VID is re-checked because devnum can be reused for a different device after a
 // replug between enumerate and open.
 func OpenLocation(vid uint16, loc uint32) (Transport, error) {
@@ -918,7 +915,7 @@ func OpenLocation(vid uint16, loc uint32) (Transport, error) {
 	}
 	if gotVID != vid {
 		d.Close()
-		return nil, fmt.Errorf("asicam: device at %s is now %04x, not %04x (replugged?)", path, gotVID, vid)
+		return nil, fmt.Errorf("astrocam: device at %s is now %04x, not %04x (replugged?)", path, gotVID, vid)
 	}
 	return d, nil
 }

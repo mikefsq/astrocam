@@ -24,12 +24,10 @@ const (
 	reqSerialNumber = 0xC8 // GetSerialNumber: read the 8-byte factory serial (ASI_ID)
 	reqReadSPIFlash = 0xC3 // ReadSPIFlash: read camera config/calibration from SPI flash (IN)
 
-	// SendCMD opcodes (vendor OUT, no register payload).
-	cmdTEC            = 0xB2 // TEC drive
-	cmdReset          = 0xAF // pipeline reset (drop recovery)
+	// SendCMD opcodes (vendor OUT, no register payload). The stream stop/start/flush trio lives
+	// in capture.go (cmdStreamStop/Start/Flush).
 	cmdST4N           = 0xB0 // ST4 guide on
 	cmdST4F           = 0xB1 // ST4 guide off
-	cmdFPGABankSelect = 0xAE // FPGA bank select, issued at the end of InitCamera
 	cmdEnableGPIF32DQ = 0xBE // EnableGPIF32DQ: enable the FPGA->FX3 32-bit data bus
 )
 
@@ -39,8 +37,8 @@ const (
 type RegBus uint8
 
 const (
-	BusSony   RegBus = iota // WriteSONYREG / ReadSONYREG (0xB6 / 0xB7) — default
-	BusCamera               // WriteCameraRegister (0xA6) — non-Sony dies
+	BusSony   RegBus = iota // WriteSONYREG / ReadSONYREG (0xB6 / 0xB7); the default
+	BusCamera               // WriteCameraRegister (0xA6); non-Sony dies
 )
 
 // VMAX FPGA registers: a strobe write to FPGA reg 1, then the 24-bit frame length
@@ -58,7 +56,7 @@ type zwoRegmap struct {
 	t      Transport
 	bus    RegBus
 	modeMu sync.RWMutex
-	mode   ReadoutMode // live readout context (USB speed, output depth, FPS%) — set by Camera
+	mode   ReadoutMode // live readout context (USB speed, output depth, FPS%), set by Camera
 }
 
 // ReadoutMode implements modeReader: returns the live runtime context the Camera set.
@@ -86,6 +84,21 @@ func (r *zwoRegmap) VID() uint16 { return ZWO.VID }
 var ZWO = &Vendor{
 	VID:  0x03C3,
 	Name: "ZWO",
+	Cmds: FX3Cmds{
+		StreamStop:      cmdStreamStop,
+		StreamStart:     cmdStreamStart,
+		Flush:           cmdFlush,
+		EnableGPIF32DQ:  cmdEnableGPIF32DQ,
+		ReadSPIFlash:    reqReadSPIFlash,
+		FirmwareVersion: reqFirmwareVer,
+		SerialNumber:    reqSerialNumber,
+		ST4On:           cmdST4N,
+		ST4Off:          cmdST4F,
+		ReadTemp:        reqReadTemp,
+		ReadHumidity:    reqReadHumidity,
+
+		ReadHumidityWValue: humidityWValue,
+	},
 	newRegmap: func(t Transport, bus RegBus, mode ReadoutMode) Regmap {
 		return &zwoRegmap{t: t, bus: bus, mode: mode}
 	},
@@ -162,7 +175,7 @@ func SetVMAX(rm Regmap, vmax uint32) (err error) {
 	if err = rm.WriteFPGAReg(fpgaVMAXStrobe, 1); err != nil {
 		return err
 	}
-	// Release the commit strobe (FPGA reg 1: 1 -> 0) after the VMAX bytes — on the error
+	// Release the commit strobe (FPGA reg 1: 1 -> 0) after the VMAX bytes, on the error
 	// paths too (a held strobe gates every later FPGA group commit); the first error wins.
 	defer func() {
 		if rerr := rm.WriteFPGAReg(fpgaVMAXStrobe, 0); err == nil {
@@ -181,17 +194,22 @@ func SetVMAX(rm Regmap, vmax uint32) (err error) {
 	return nil
 }
 
-// --- camera/FPGA registers (ZWO's own, not the sensor's) ---
-
-func (c *Camera) writeCamReg(reg, val uint16) error {
-	return c.t.ControlOut(reqWriteCamReg, reg, val, nil)
+// vendorCmd issues a SendCMD-style FX3 vendor command through the vendor's command table.
+func (c *Camera) vendorCmd(op FX3Op) error {
+	code := c.vend.Cmds.cmd(op)
+	if code == 0 {
+		return fmt.Errorf("astrocam: FX3 %s not decoded for vendor %s", op, c.vend.Name)
+	}
+	return c.t.ControlOut(code, 0, 0, nil)
 }
 
-func (c *Camera) writeFPGAReg(reg, val uint16) error {
-	return c.t.ControlOut(reqWriteFPGAReg, reg, val, nil)
+// vendorIn issues a vendor IN request from the command table (code 0 = not decoded).
+func (c *Camera) vendorIn(code uint8, what string, wValue, wIndex uint16, data []byte) (int, error) {
+	if code == 0 {
+		return 0, fmt.Errorf("astrocam: FX3 %s not decoded for vendor %s", what, c.vend.Name)
+	}
+	return c.t.ControlIn(code, wValue, wIndex, data)
 }
-
-func (c *Camera) vendorCmd(op uint8) error { return c.t.ControlOut(op, 0, 0, nil) }
 
 // FlashHPCMapAddr is the flash address of the factory hot/dead-pixel correction map blob.
 // Layout: 2 KiB header with magic "ASID" (defect map; "ASIG" = gain map) and a big-endian
@@ -202,14 +220,18 @@ const FlashHPCMapAddr = 0x40000
 // blocks (wIndex tracks addr>>8). SPI flash and the sensor's 32-bit GPIF data bus share FX3
 // pins, so the read is bracketed by EnableGPIF32DQ(false)/(true); the camera must be Init'd first.
 func (c *Camera) ReadSPIFlash(addr uint32, n int) (out []byte, err error) {
-	if err := c.t.ControlOut(cmdEnableGPIF32DQ, 0, 0, nil); err != nil {
+	gpif, flash := c.vend.Cmds.EnableGPIF32DQ, c.vend.Cmds.ReadSPIFlash
+	if gpif == 0 || flash == 0 {
+		return nil, fmt.Errorf("astrocam: SPI flash read not decoded for vendor %s", c.vend.Name)
+	}
+	if err := c.t.ControlOut(gpif, 0, 0, nil); err != nil {
 		return nil, err
 	}
 	defer func() {
 		// The data bus MUST come back up: left disabled, the next readout is silently dead.
 		// Surface a failed re-enable (a read error from the body wins if both fail).
-		if rerr := c.t.ControlOut(cmdEnableGPIF32DQ, 1, 0, nil); err == nil && rerr != nil {
-			err = fmt.Errorf("asicam: re-enable GPIF32DQ after flash read: %w", rerr)
+		if rerr := c.t.ControlOut(gpif, 1, 0, nil); err == nil && rerr != nil {
+			err = fmt.Errorf("astrocam: re-enable GPIF32DQ after flash read: %w", rerr)
 		}
 	}()
 	const block = 2048
@@ -220,7 +242,7 @@ func (c *Camera) ReadSPIFlash(addr uint32, n int) (out []byte, err error) {
 			want = block
 		}
 		buf := make([]byte, want)
-		got, err := c.t.ControlIn(reqReadSPIFlash, 0, uint16(addr>>8), buf)
+		got, err := c.t.ControlIn(flash, 0, uint16(addr>>8), buf)
 		if err != nil {
 			return out, err
 		}
@@ -236,7 +258,7 @@ func (c *Camera) ReadSPIFlash(addr uint32, n int) (out []byte, err error) {
 // FirmwareVersion reads the camera firmware version.
 func (c *Camera) FirmwareVersion() (uint16, error) {
 	buf := make([]byte, 2)
-	if _, err := c.t.ControlIn(reqFirmwareVer, 0, 0, buf); err != nil {
+	if _, err := c.vendorIn(c.vend.Cmds.FirmwareVersion, "FirmwareVersion", 0, 0, buf); err != nil {
 		return 0, err
 	}
 	return uint16(buf[0]) | uint16(buf[1])<<8, nil
@@ -260,7 +282,7 @@ func (s Serial) String() string {
 // 0xC8, wValue 0, wIndex 0) returning the 8 raw ASI_ID bytes.
 func (c *Camera) SerialNumber() (Serial, error) {
 	var s Serial
-	if _, err := c.t.ControlIn(reqSerialNumber, 0, 0, s[:]); err != nil {
+	if _, err := c.vendorIn(c.vend.Cmds.SerialNumber, "SerialNumber", 0, 0, s[:]); err != nil {
 		return Serial{}, err
 	}
 	return s, nil

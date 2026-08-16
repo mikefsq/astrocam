@@ -40,7 +40,7 @@ func TestDefectMapOddLengthNoStraddle(t *testing.T) {
 
 // TestDefectMapBlockAdvance: a 00 00 entry advances the 256-byte block base.
 func TestDefectMapBlockAdvance(t *testing.T) {
-	blob := asidBlob(0x00, 0x00, 0x00, 0x01) // advance base to 256, then bitmap[256] = 0x01
+	blob := asidBlob(0x00, 0x00, 0x00, 0x01)            // advance base to 256, then bitmap[256] = 0x01
 	m := parseDefectMap(blob, len(blob), 64, 64, false) // 4096 px = 512 bitmap bytes
 	want := 256 * 8
 	if len(m.Defects) != 1 || m.Defects[0] != want {

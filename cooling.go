@@ -59,7 +59,7 @@ type CoolerConfig struct {
 	// MaxPower clamps TEC drive (≤100 %).
 	MaxPower float64
 
-	// SlewPerStep caps how far TEC power may move in one tick — a hard safety limit on
+	// SlewPerStep caps how far TEC power may move in one tick, a hard safety limit on
 	// top of the velocity form's own Ki-paced ramp. 0 disables (the form self-limits).
 	SlewPerStep float64
 
@@ -84,7 +84,7 @@ type CoolerConfig struct {
 // tune per model.
 func DefaultCoolerConfig() CoolerConfig {
 	return CoolerConfig{
-		// Velocity-form PD (no integral): Kp=0.6, Ki=0.2, Kd=0, with e = temp−setpoint and
+		// Velocity-form PI (Kd = 0): Kp=0.6, Ki=0.2, with e = temp−setpoint and
 		// Δ = Kp·(e−e₁) + Ki·e + Kd·(e−2e₁+e₂). Ki paces the drive ramp (arrival speed),
 		// Kp damps the approach.
 		Kp:          0.6,
@@ -99,7 +99,7 @@ func DefaultCoolerConfig() CoolerConfig {
 }
 
 // Cooler is the host-side PID cooling loop over a Thermal. Safe for the Run
-// goroutine to regulate while others call SetTarget/Stop/Power/Target — all state
+// goroutine to regulate while others call SetTarget/Stop/Power/Target; all state
 // access is guarded by mu.
 type Cooler struct {
 	io  Thermal
@@ -148,7 +148,7 @@ func (c *Cooler) SetConfig(cfg CoolerConfig) {
 
 // SetTarget arms cooling toward target °C: seeds the effective target at the current
 // temperature so the ramp eases in from where we are, and clears the error history.
-// Does not reset power — in the velocity form the current drive is the accumulator,
+// Does not reset power: in the velocity form the current drive is the accumulator,
 // so a retarget continues from the present power.
 func (c *Cooler) SetTarget(target float64) {
 	c.mu.Lock()
@@ -189,7 +189,7 @@ func (c *Cooler) rampTarget(dt time.Duration) {
 	}
 	step := c.cfg.RampRate / 60 * dt.Seconds() // °C of setpoint movement this tick
 	if step <= 0 {
-		return // dt ≤ 0 (clock stall / degenerate tick): hold — never collapse the anti-shock ramp
+		return // dt ≤ 0 (clock stall / degenerate tick): hold; never collapse the anti-shock ramp
 	}
 	if d := c.target - c.effTgt; math.Abs(d) <= step {
 		c.effTgt = c.target
@@ -200,7 +200,7 @@ func (c *Cooler) rampTarget(dt time.Duration) {
 	}
 }
 
-// SetRampRate sets the cooldown/warmup setpoint slew in °C per minute — the Alpaca
+// SetRampRate sets the cooldown/warmup setpoint slew in °C per minute, the Alpaca
 // "cooldown rate" setting. 0 disables the ramp. Safe to call while Run is regulating.
 func (c *Cooler) SetRampRate(degPerMin float64) {
 	c.mu.Lock()
@@ -208,7 +208,7 @@ func (c *Cooler) SetRampRate(degPerMin float64) {
 	c.mu.Unlock()
 }
 
-// SeedPower sets the current TEC drive to pct % — in the velocity form the power is
+// SeedPower sets the current TEC drive to pct %: in the velocity form the power is
 // the accumulator, so this warm-starts (or restores on reconnect) the controller at
 // a known drive instead of from 0. The loop then regulates from there. Safe to call
 // while Run runs.
@@ -288,10 +288,13 @@ const runMaxConsecFails = 15
 
 // Run drives Step on the configured Tick until ctx is canceled. Call it in its own
 // goroutine. Transient Step errors are tolerated (the loop keeps ticking and re-tries);
-// after runMaxConsecFails consecutive failures it drives the TEC to zero (best-effort —
+// after runMaxConsecFails consecutive failures it drives the TEC to zero (best-effort;
 // never leave an unregulated TEC at its last power) and returns the last error.
 func (c *Cooler) Run(ctx context.Context) error {
-	t := time.NewTicker(c.cfg.Tick)
+	c.mu.Lock()
+	tick := c.cfg.Tick
+	c.mu.Unlock()
+	t := time.NewTicker(tick)
 	defer t.Stop()
 	last := time.Now()
 	fails := 0
@@ -302,7 +305,7 @@ func (c *Cooler) Run(ctx context.Context) error {
 		case <-t.C:
 			// dt from the wall clock, not the tick timestamp: a Step blocked behind a long
 			// readout (ioMu) leaves a stale tick in the channel, and its old timestamp would
-			// understate dt — the rate guard then reads a slow real drift as a fast swing
+			// understate dt; the rate guard then reads a slow real drift as a fast swing
 			// (Δtemp over 30 s divided by 200 ms) and skips regulation.
 			now := time.Now()
 			if _, err := c.Step(now.Sub(last)); err != nil {

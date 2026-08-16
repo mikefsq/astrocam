@@ -36,7 +36,7 @@ type StubTransport struct {
 	// subtype gate; the default 0x5056 is the real ASI6200 value (subtype 0x50 ≥ 0x12,
 	// the all-FPGA init path). Set before Init to exercise a different branch.
 	Firmware uint16
-	// Serial is returned for the GetSerialNumber read (0xC8) — the 8-byte ASI_ID.
+	// Serial is returned for the GetSerialNumber read (0xC8), the 8-byte ASI_ID.
 	Serial Serial
 	// Frame fills a caller buffer with synthetic pixel data; default is a 16-bit ramp.
 	Frame func(buf []byte)
@@ -86,7 +86,7 @@ func (t *StubTransport) ControlOut(bRequest uint8, wValue, wIndex uint16, data [
 	case reqWriteFPGAReg:
 		t.fpga[wValue] = wIndex
 	}
-	// Any other bRequest is an FX3 vendor command (0xAA/0xA9/0xAF/0xAE/0xBE) — no state.
+	// Any other bRequest is an FX3 vendor command (0xAA/0xA9/0xAF/0xBE); no state.
 	return nil
 }
 
@@ -131,10 +131,10 @@ func (t *StubTransport) BulkReadQuiet(buf []byte, quiet, timeout time.Duration) 
 }
 
 // AbortRead / ArmRead satisfy ReadAborter with the real level-triggered semantics: while
-// aborted, frame reads return (0, nil) fast — so Camera-level abort tests run against the
+// aborted, frame reads return (0, nil) fast, so Camera-level abort tests run against the
 // same contract the hardware backends implement.
 func (t *StubTransport) AbortRead() { t.mu.Lock(); t.aborted = true; t.mu.Unlock() }
-func (t *StubTransport) ArmRead()  { t.mu.Lock(); t.aborted = false; t.mu.Unlock() }
+func (t *StubTransport) ArmRead()   { t.mu.Lock(); t.aborted = false; t.mu.Unlock() }
 
 // ReadFrameStream satisfies FrameStreamer (the large-frame USB3 windowed pump).
 func (t *StubTransport) ReadFrameStream(buf []byte, idle, total time.Duration) (int, error) {
@@ -142,7 +142,7 @@ func (t *StubTransport) ReadFrameStream(buf []byte, idle, total time.Duration) (
 }
 
 // ReadFrameStreamPrequeued satisfies PrequeuedFrameStreamer (the free-run exact-cover batch),
-// so tests exercise the same dispatch the real backends take (finding 2.4).
+// so tests exercise the same dispatch the real backends take.
 func (t *StubTransport) ReadFrameStreamPrequeued(buf []byte, idle, total time.Duration) (int, error) {
 	return t.serve(buf)
 }

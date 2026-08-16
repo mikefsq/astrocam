@@ -3,7 +3,7 @@ package astrocam
 // Hardware Thermal backend: the control-transfer implementation of the Thermal seam
 // the Cooler drives (cooling.go), for FPGA-cooled models (ASI2600 / ASI6200):
 //
-//	ReadTemp     GetSensorTemp    — SendCMD 0xB3 IN 2B; °C = int8(hi) + lo/16
+//	ReadTemp     GetSensorTemp    — SendCMD 0xB3 IN 2B; signed 12-bit (hi<<4 | lo>>4) × 1/16 °C
 //	ReadHumidity GetHumidity      — SendCMD(0x85, wValue 0xF5) IN 2B; Sensirion RH
 //	SetTECPower  SetFPGACoolPower — WriteFPGAREG reg 0x26
 //	SetFan       EnableCfan       — RMW FPGA reg 0x19 bit7 (0x80)
@@ -15,11 +15,13 @@ package astrocam
 // through a calibrated DAC (SetDA cubic → SendCMD 0xB2) and read temperature via I2C
 // ADC chips; that path is not implemented and would need its own Thermal.
 
+import "fmt"
+
 // FPGA register numbers for the cooling block (wValue to WriteFPGAREG 0xBD).
 const (
 	fpgaCoolPower = 0x26 // SetFPGACoolPower: TEC drive, 0..0xff
 	fpgaCoolFlags = 0x19 // EnableCfan bit7 (0x80) = fan, EnableWarm bit6 (0x40) = anti-dew heater
-	fpgaHeatPower = 0x2a // SetFPGAHeaterPowerPercent: anti-dew heater %, 0..100
+	fpgaHeatPower = 0x2a // SetFPGAHeaterPowerPercent: anti-dew heater 8-bit PWM duty, 0..255 (percent mapped onto it)
 )
 
 const (
@@ -29,23 +31,31 @@ const (
 )
 
 // camThermal maps the Thermal interface to control transfers for one camera, holding
-// the Transport (control transfers) and the Regmap (FPGA register RMW).
+// the Transport (control transfers), the Regmap (FPGA register RMW) and the vendor's
+// FX3 request codes for the temperature/humidity reads.
 type camThermal struct {
-	t  Transport
-	rm Regmap
+	t    Transport
+	rm   Regmap
+	cmds FX3Cmds
+	vend string
 }
 
 // HardwareThermal returns the control-transfer Thermal backend for this (FPGA-cooled)
 // camera: cam.EnableCooling(cam.HardwareThermal(), …).
-func (c *Camera) HardwareThermal() Thermal { return &camThermal{t: c.t, rm: c.rm} }
+func (c *Camera) HardwareThermal() Thermal {
+	return &camThermal{t: c.t, rm: c.rm, cmds: c.vend.Cmds, vend: c.vend.Name}
+}
 
 // ReadTemp reads the sensor temperature in °C (GetSensorTemp): a 2-byte IN packed as
 // a signed 12-bit fixed-point value, temp = signed12 × 1/16, where the 12 bits are
 // (hi << 4) | (lo >> 4). High byte is the integer °C, high nibble of the low byte is
 // the sixteenths.
 func (h *camThermal) ReadTemp() (float64, error) {
+	if h.cmds.ReadTemp == 0 {
+		return 0, fmt.Errorf("astrocam: FX3 ReadTemp not decoded for vendor %s", h.vend)
+	}
 	var b [2]byte
-	if _, err := h.t.ControlIn(reqReadTemp, 0, 0, b[:]); err != nil {
+	if _, err := h.t.ControlIn(h.cmds.ReadTemp, 0, 0, b[:]); err != nil {
 		return 0, err
 	}
 	raw := int(b[1])<<4 | int(b[0])>>4 // 12-bit fixed point
@@ -58,8 +68,11 @@ func (h *camThermal) ReadTemp() (float64, error) {
 // ReadHumidity reads relative humidity % (GetHumidity): a 2-byte LE IN run through
 // the Sensirion transfer function RH = -6 + 125·raw/2^16, clamped 0..100.
 func (h *camThermal) ReadHumidity() (int, error) {
+	if h.cmds.ReadHumidity == 0 {
+		return 0, fmt.Errorf("astrocam: FX3 ReadHumidity not decoded for vendor %s", h.vend)
+	}
 	var b [2]byte
-	if _, err := h.t.ControlIn(reqReadHumidity, humidityWValue, 0, b[:]); err != nil {
+	if _, err := h.t.ControlIn(h.cmds.ReadHumidity, h.cmds.ReadHumidityWValue, 0, b[:]); err != nil {
 		return 0, err
 	}
 	raw := int(b[0]) | int(b[1])<<8

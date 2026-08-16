@@ -10,7 +10,7 @@ import (
 
 // modeCarrier is implemented by a vendor Regmap that holds the live ReadoutMode the Camera
 // updates (FPS%, output depth, bin), letting the Camera mutate it without asserting a concrete
-// regmap type. Mutations run under the regmap's mode lock — capture goroutines read the mode
+// regmap type. Mutations run under the regmap's mode lock; capture goroutines read the mode
 // (ModeOf) concurrently with camera methods changing it.
 type modeCarrier interface{ updateMode(func(*ReadoutMode)) }
 
@@ -27,7 +27,7 @@ type Camera struct {
 	model  Model
 	sensor *Sensor
 	rm     Regmap
-	pid    uint16
+	vend   *Vendor // the wire dialect (Regmap factory + FX3 command table) for this VID
 
 	// mu guards the mutable capture-state scalars below (the Camera is called from several
 	// goroutines at once). It is held only across the scalar transitions, never across USB I/O
@@ -53,8 +53,7 @@ type Camera struct {
 	// it; StartExposure clears it). Distinct from status: a status poll deriving SUCCESS must
 	// not read as an abort to the worker still integrating.
 	expAborted bool
-	expLight   bool // light/dark flag of the current exposure (recovery re-arms with the same)
-	subtype    int  // firmware subtype byte (GetFirmwareVer); gates init branches
+	subtype    int // firmware subtype byte (GetFirmwareVer); gates init branches
 
 	// ST4 pulse state (guide.go), under mu: st4Lines is the bitmask of asserted guide
 	// lines (bit = GuideDir), st4Pulses counts host-timed PulseGuide calls in flight.
@@ -67,7 +66,7 @@ type Camera struct {
 	stalls atomic.Int64
 
 	// dead is the firmware-crash circuit breaker, set when a short/failed readout is followed by
-	// a firmware-version read that changed from baseFW (or won't read) — the FX3 dropped its
+	// a firmware-version read that changed from baseFW (or won't read): the FX3 dropped its
 	// firmware and only a USB reset + re-scan + re-Open recovers it. Once dead, the camera refuses
 	// to arm new frames (StartExposure/GetDataAfterExp return ErrDeviceWedged).
 	dead     atomic.Bool
@@ -89,14 +88,14 @@ type Camera struct {
 func Open(t Transport, vid, pid uint16) (*Camera, error) {
 	m, ok := Lookup(vid, pid)
 	if !ok {
-		return nil, fmt.Errorf("asicam: unknown/unregistered camera %04x:%04x", vid, pid)
+		return nil, fmt.Errorf("astrocam: unknown/unregistered camera %04x:%04x", vid, pid)
 	}
 	vend, ok := VendorOf(vid)
 	if !ok {
-		return nil, fmt.Errorf("asicam: no vendor protocol registered for VID 0x%04x", vid)
+		return nil, fmt.Errorf("astrocam: no vendor protocol registered for VID 0x%04x", vid)
 	}
 	if m.Sensor == nil {
-		return nil, fmt.Errorf("asicam: model %q has no sensor profile yet", m.Name)
+		return nil, fmt.Errorf("astrocam: model %q has no sensor profile yet", m.Name)
 	}
 	// The readout mode the shared FPS/line-time engine reads (fps.go): link speed from the
 	// negotiated USB link (falls back to the model capability), output depth from the sensor ADC
@@ -110,17 +109,17 @@ func Open(t Transport, vid, pid uint16) (*Camera, error) {
 	if sr, ok := t.(superSpeedReporter); ok {
 		usb3 = sr.SuperSpeed()
 	}
-	// FPSPercent defaults to 100 (full speed) on a USB3 link, but a USB2 HighSpeed link can't drain
+	// FPSPercent defaults to 100 (full speed) on a USB3 link. A USB2 HighSpeed link can't drain
 	// the readout at full rate without the FX3 FIFO overrunning (frame tearing on the free-run
-	// STARVIS sensors), so default it to 50 there — a conservative throttle (larger HMAX). This is
-	// a default only: the user overrides either with SetFPSPercent (Alpaca "fpspercent" action).
+	// STARVIS sensors), so it defaults to 40 there, the SDK's USB2 BANDWIDTHOVERLOAD default (a
+	// larger HMAX). This is a default only: SetFPSPercent (Alpaca "fpspercent" action) overrides it.
 	fpsPercent := 100
 	if !usb3 {
 		fpsPercent = 40 // slow USB2 link: matches the SDK's USB2 default (its runtime BANDWIDTHOVERLOAD default)
 	}
 	mode := ReadoutMode{USB3: usb3, BytesPerPx: bpp, FPSPercent: fpsPercent}
 	c := &Camera{
-		t: t, model: m, sensor: m.Sensor, rm: vend.newRegmap(t, m.Sensor.Bus, mode), pid: pid,
+		t: t, model: m, sensor: m.Sensor, rm: vend.newRegmap(t, m.Sensor.Bus, mode), vend: vend,
 		roiW: m.Sensor.Info.MaxWidth, roiH: m.Sensor.Info.MaxHeight, bin: 1,
 		offset: m.Sensor.OffsetDef,
 	}
@@ -140,7 +139,7 @@ func (c *Camera) SetFPSPercent(pct int) {
 	}
 }
 
-// FPSPercent reports the live effective FPS-percent throttle — the user-set value, or the
+// FPSPercent reports the live effective FPS-percent throttle: the user-set value, or the
 // link-dependent default when none was set (100 on USB3, 40 on a USB2 HighSpeed link).
 func (c *Camera) FPSPercent() int { return ModeOf(c.rm).FPSPercent }
 
@@ -169,15 +168,16 @@ func (c *Camera) Color() bool { return c.model.Color }
 // ST4 reports whether the model has an ST4 guide port (CanPulseGuide).
 func (c *Camera) ST4() bool { return c.model.ST4 }
 
-// Close quiesces any in-flight capture (StopExposure: abort flag + sensor master-stop +
-// FPGA stop + flush — a sensor left free-running into a closed host is the FX3-crash
-// mechanism), stops the TEC regulation goroutine (joining it cleanly), zeroes the TEC if
-// cooling was active (a disconnecting client must not leave the cooler driving open-loop at
-// its last power — the FPGA holds the drive register), and closes the transport. The stop
-// writes queue behind a bulk read still in flight (ioMu), which is bounded by the read's
-// total gate; a blocked GetDataAfterExp is not joined — its generation-guarded writes are
-// no-ops and the transport's own Close interlock covers the I/O. DisableCooling alone still
-// leaves the TEC as-is for deliberate stop-regulation-keep-drive uses. Safe to call once.
+// Close quiesces any in-flight capture, stops the TEC regulation goroutine, zeroes the TEC
+// if cooling was active, and closes the transport. The capture stop is StopExposure (abort
+// flag + sensor master-stop + FPGA stop + flush); a sensor left free-running into a closed
+// host is the FX3-crash mechanism. The TEC is zeroed because the FPGA holds the drive
+// register, so a disconnecting client would otherwise leave the cooler driving open-loop at
+// its last power. The stop writes queue behind a bulk read still in flight (ioMu), which is
+// bounded by the read's total gate. A blocked GetDataAfterExp is not joined: its
+// generation-guarded writes are no-ops and the transport's own Close interlock covers the
+// I/O. DisableCooling alone leaves the TEC as-is (stop regulation, keep the drive). Safe to
+// call once.
 func (c *Camera) Close() error {
 	c.mu.Lock()
 	busy := c.status == ExpWorking
@@ -200,7 +200,7 @@ func (c *Camera) Close() error {
 // Calling it again retargets the running loop instead of starting a second.
 func (c *Camera) EnableCooling(thermal Thermal, target float64, cfg CoolerConfig) error {
 	if !c.model.Cooled {
-		return fmt.Errorf("asicam: %s has no cooler", c.model.Name)
+		return fmt.Errorf("astrocam: %s has no cooler", c.model.Name)
 	}
 	c.mu.Lock()
 	if thermal == nil {
@@ -208,7 +208,7 @@ func (c *Camera) EnableCooling(thermal Thermal, target float64, cfg CoolerConfig
 	}
 	if thermal == nil {
 		c.mu.Unlock()
-		return fmt.Errorf("asicam: %s: no thermal backend", c.model.Name)
+		return fmt.Errorf("astrocam: %s: no thermal backend", c.model.Name)
 	}
 	c.thermal = thermal
 	cl := c.cooler
@@ -220,10 +220,10 @@ func (c *Camera) EnableCooling(thermal Thermal, target float64, cfg CoolerConfig
 		c.coolWg.Add(1)
 		go func() { defer c.coolWg.Done(); _ = cl.Run(ctx) }()
 	} else {
-		cl.SetConfig(cfg) // a retarget also applies the new tunables (previously ignored)
+		cl.SetConfig(cfg) // a retarget also applies the new tunables
 	}
 	c.mu.Unlock()
-	cl.SetTarget(target) // reads temp (I/O) — outside c.mu; the Cooler is self-locked
+	cl.SetTarget(target) // reads temp (I/O), outside c.mu; the Cooler is self-locked
 	return nil
 }
 
@@ -294,7 +294,7 @@ func (c *Camera) Temperature() (float64, error) {
 	th := c.thermal
 	c.mu.Unlock()
 	if th == nil {
-		return 0, fmt.Errorf("asicam: %s has no thermal sensor attached", c.model.Name)
+		return 0, fmt.Errorf("astrocam: %s has no thermal sensor attached", c.model.Name)
 	}
 	return th.ReadTemp()
 }
@@ -328,17 +328,22 @@ const InitDelayReg uint16 = 0xffff
 // Init replays the sensor's init register sequence, honoring InitDelayReg entries as sleeps.
 func (c *Camera) Init() error {
 	if c.sensor.Init == nil {
-		return fmt.Errorf("asicam: %s init sequence not yet transcribed", c.sensor.Name)
+		return fmt.Errorf("astrocam: %s init sequence not yet transcribed", c.sensor.Name)
 	}
 	// FX3 streaming state persists across host close/open. A prior session that didn't stop
 	// cleanly can leave it streaming, and FPGA register writes in InitFPGA then fail while the
 	// GPIF is busy. Quiesce first with FX3 vendor commands (stop, clear pipe, flush), which work
-	// even when the FPGA path is blocked. Best-effort; errors are expected on a fresh device.
-	_ = c.t.ControlOut(cmdStreamStop, 0, 0, nil) // 0xAA: stop any leftover async stream
+	// even when the FPGA path is blocked. Best-effort on the wire (errors are expected on a
+	// fresh device), but a vendor whose commands are not decoded stops here rather than
+	// driving the camera with another vendor's bytes.
+	if c.vend.Cmds.StreamStop == 0 || c.vend.Cmds.StreamStart == 0 || c.vend.Cmds.Flush == 0 {
+		return fmt.Errorf("astrocam: FX3 stream commands not decoded for vendor %s; cannot init %s", c.vend.Name, c.model.Name)
+	}
+	_ = c.vendorCmd(FX3StreamStop) // 0xAA on ZWO: stop any leftover async stream
 	if r, ok := c.t.(EndpointResetter); ok {
 		_ = r.ResetEndpoint(bulkEndpoint)
 	}
-	_ = c.t.ControlOut(cmdFlush, 0, 0, nil) // 0xAF: flush the pipeline
+	_ = c.vendorCmd(FX3Flush) // 0xAF on ZWO: flush the pipeline
 
 	// Firmware subtype (GetFirmwareVer's version byte) gates the init branches.
 	if fw, err := c.FirmwareVersion(); err == nil {
@@ -359,15 +364,16 @@ func (c *Camera) Init() error {
 			return fmt.Errorf("init reg 0x%04x: %w", w.Reg, err)
 		}
 	}
-	// FPGA-side init (brings up the readout pipeline) — the non-Sony-register part of InitCamera.
+	// FPGA-side init (brings up the readout pipeline): the non-Sony-register part of InitCamera.
 	// The GPIF data bus was already enabled once by readCalibrationBlob above.
 	if c.sensor.InitFPGA != nil {
 		if err := c.sensor.InitFPGA(c.rm, c.subtype); err != nil {
 			return fmt.Errorf("init fpga: %w", err)
 		}
 	}
-	// Apply the profile's default offset / black level (e.g. 30 for the 462); without it the
-	// sensor keeps its power-on pedestal. An explicit SetOffset later overrides this.
+	// Apply the profile's default offset / black level (OffsetDef, e.g. 30 for the 462, 50 for
+	// the 6200); without it the sensor keeps its power-on pedestal. An explicit SetOffset later
+	// overrides this.
 	if c.sensor.SetOffset != nil {
 		if err := c.sensor.SetOffset(c.rm, c.offset); err != nil {
 			return fmt.Errorf("init offset: %w", err)
@@ -376,25 +382,30 @@ func (c *Camera) Init() error {
 	return nil
 }
 
-// readCalibrationBlob runs the init-time SPI-flash calibration read (opcode 0xC3). With the GPIF
-// data bus disabled (0xBE=0) it reads the ~10 KB per-unit config blob — wIndex in 256-byte pages
-// from 0x400, 2 KB (8 pages) per chunk plus a 256 B tail — then re-enables the bus (0xBE=1).
+// readCalibrationBlob runs the init-time SPI-flash calibration read (ZWO opcode 0xC3). With the
+// GPIF data bus disabled (0xBE=0) it reads the ~10 KB per-unit config blob (wIndex in 256-byte
+// pages from 0x400, 2 KB (8 pages) per chunk plus a 256 B tail), then re-enables the bus (0xBE=1).
 // Shape: 0xBE=0 → 6×0xC3 → 0xBE=1. The data is discarded; the read brings the FPGA data path into
-// right-aligned RAW16 mode. Best-effort: a fresh/odd device may NAK.
+// right-aligned RAW16 mode. Best-effort: a fresh/odd device may NAK, and a vendor without the
+// commands decoded skips it.
 func (c *Camera) readCalibrationBlob() {
-	_ = c.t.ControlOut(cmdEnableGPIF32DQ, 0, 0, nil) // 0xBE=0: quiesce the bus for the flash read
+	gpif, flash := c.vend.Cmds.EnableGPIF32DQ, c.vend.Cmds.ReadSPIFlash
+	if gpif == 0 || flash == 0 {
+		return
+	}
+	_ = c.t.ControlOut(gpif, 0, 0, nil) // 0xBE=0: quiesce the bus for the flash read
 	buf := make([]byte, 2048)
 	for _, idx := range []uint16{0x0400, 0x0408, 0x0410, 0x0418, 0x0420} {
-		_, _ = c.t.ControlIn(reqReadSPIFlash, 0, idx, buf)
+		_, _ = c.t.ControlIn(flash, 0, idx, buf)
 	}
-	_, _ = c.t.ControlIn(reqReadSPIFlash, 0, 0x0428, buf[:256])
-	_ = c.t.ControlOut(cmdEnableGPIF32DQ, 1, 0, nil) // 0xBE=1: re-enable the data bus
+	_, _ = c.t.ControlIn(flash, 0, 0x0428, buf[:256])
+	_ = c.t.ControlOut(gpif, 1, 0, nil) // 0xBE=1: re-enable the data bus
 }
 
 // SetGain sets analog gain (ASI 0.1 dB units) via the sensor profile.
 func (c *Camera) SetGain(gain int) error {
 	if c.sensor.SetGain == nil {
-		return fmt.Errorf("asicam: %s SetGain not implemented", c.sensor.Name)
+		return fmt.Errorf("astrocam: %s SetGain not implemented", c.sensor.Name)
 	}
 	if err := c.sensor.SetGain(c.rm, gain); err != nil {
 		return err
@@ -408,7 +419,7 @@ func (c *Camera) SetGain(gain int) error {
 // SetOffset sets the sensor offset / black level (ASI Brightness) via the sensor profile.
 func (c *Camera) SetOffset(offset int) error {
 	if c.sensor.SetOffset == nil {
-		return fmt.Errorf("asicam: %s SetOffset not implemented", c.sensor.Name)
+		return fmt.Errorf("astrocam: %s SetOffset not implemented", c.sensor.Name)
 	}
 	if err := c.sensor.SetOffset(c.rm, offset); err != nil {
 		return err
@@ -419,15 +430,30 @@ func (c *Camera) SetOffset(offset int) error {
 	return nil
 }
 
-// Offset returns the last offset set (ASI Brightness / black level).
-func (c *Camera) Offset() int { c.mu.Lock(); defer c.mu.Unlock(); return c.offset }
+// Offset returns the sensor offset / black level (ASI Brightness). When the profile can read it
+// back (Sensor.GetOffset) the value comes from the sensor registers, so it reflects what the
+// camera is set to (Init's default or a later SetOffset, from this or any other driver); the
+// cached last-set value is the fallback for profiles without read-back or on a read error.
+func (c *Camera) Offset() int {
+	if c.sensor.GetOffset != nil {
+		if v, err := c.sensor.GetOffset(c.rm); err == nil {
+			c.mu.Lock()
+			c.offset = v
+			c.mu.Unlock()
+			return v
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.offset
+}
 
 // SetOutputDepth selects the output bytes-per-pixel (1 = RAW8, 2 = RAW16) and reprograms the FX3
 // output width, carrying the depth on the readout mode so the next SetROI/SetExposure/FrameBytes
 // follow it. Call before arming a capture, not mid-stream.
 func (c *Camera) SetOutputDepth(bpp int) error {
 	if bpp != 1 && bpp != 2 {
-		return fmt.Errorf("asicam: output depth %d invalid (1 = RAW8, 2 = RAW16)", bpp)
+		return fmt.Errorf("astrocam: output depth %d invalid (1 = RAW8, 2 = RAW16)", bpp)
 	}
 	if err := SetFPGAOutputWidth(c.rm, bpp >= 2); err != nil {
 		return err
@@ -441,10 +467,10 @@ func (c *Camera) SetOutputDepth(bpp int) error {
 // OutputDepth returns the current output bytes-per-pixel (1 = RAW8, 2 = RAW16).
 func (c *Camera) OutputDepth() int { return ModeOf(c.rm).BytesPerPx }
 
-// SetHighSpeedMode selects the sensor's 10-bit high-speed readout — ~2× the frame rate by trading
-// 2 bits of depth. Only effective for RAW8 output, so also call SetOutputDepth(1). Carried on the
-// live mode; the next SetROI/SetExposure reprogram the sensor format, pixel clock, and HMAX floor.
-// Call before arming.
+// SetHighSpeedMode selects the sensor's 10-bit high-speed readout: about 2× the frame rate for 2
+// bits less depth. It is only effective for RAW8 output, so also call SetOutputDepth(1). The
+// setting is carried on the live mode; the next SetROI/SetExposure reprogram the sensor format,
+// pixel clock, and HMAX floor. Call before arming.
 func (c *Camera) SetHighSpeedMode(on bool) {
 	if r, ok := c.rm.(modeCarrier); ok {
 		r.updateMode(func(m *ReadoutMode) { m.HighSpeed = on })
@@ -470,11 +496,11 @@ func (c *Camera) OffsetRange() (min, max, def int, ok bool) {
 // SetExposure sets the exposure time via the sensor profile.
 func (c *Camera) SetExposure(d time.Duration) error {
 	if c.sensor.SetExposure == nil {
-		return fmt.Errorf("asicam: %s SetExposure not implemented", c.sensor.Name)
+		return fmt.Errorf("astrocam: %s SetExposure not implemented", c.sensor.Name)
 	}
 	// Clamp to the sensor's exposure range (e.g. IMX174 ≤31µs→32µs, >2000s→2000s). Clamping here
-	// keeps the stored expDur — which the host-timed worker integrates against — in range, so an
-	// out-of-range request can't desync the worker's sleep from the programmed registers.
+	// keeps the stored expDur (which the host-timed worker integrates against) in range, so an
+	// out-of-range request cannot desync the worker's sleep from the programmed registers.
 	if min := time.Duration(c.sensor.ExpMinUs) * time.Microsecond; c.sensor.ExpMinUs > 0 && d < min {
 		d = min
 	}
@@ -497,7 +523,7 @@ func (c *Camera) SetExposure(d time.Duration) error {
 // translation.
 func (c *Camera) SetROI(x, y, w, h int) error {
 	if c.sensor.SetROI == nil {
-		return fmt.Errorf("asicam: %s SetROI not implemented", c.sensor.Name)
+		return fmt.Errorf("astrocam: %s SetROI not implemented", c.sensor.Name)
 	}
 	c.mu.Lock()
 	bin := c.bin
@@ -507,10 +533,10 @@ func (c *Camera) SetROI(x, y, w, h int) error {
 	}
 	maxW, maxH := c.sensor.Info.MaxWidth/bin, c.sensor.Info.MaxHeight/bin
 	if x < 0 || y < 0 || w < 1 || h < 1 {
-		return fmt.Errorf("asicam: ROI (%d,%d %dx%d) invalid: offset must be ≥0 and size ≥1", x, y, w, h)
+		return fmt.Errorf("astrocam: ROI (%d,%d %dx%d) invalid: offset must be ≥0 and size ≥1", x, y, w, h)
 	}
 	if x+w > maxW || y+h > maxH {
-		return fmt.Errorf("asicam: ROI (%d,%d %dx%d) exceeds %dx%d at bin %d", x, y, w, h, maxW, maxH, bin)
+		return fmt.Errorf("astrocam: ROI (%d,%d %dx%d) exceeds %dx%d at bin %d", x, y, w, h, maxW, maxH, bin)
 	}
 	// RAW16 binning is done in software: these sensors have no hardware 16-bit binned mode (the
 	// bin register tables are 12-bit, for the RAW8/hardware-bin path). Drive a bin-1
@@ -526,7 +552,7 @@ func (c *Camera) SetROI(x, y, w, h int) error {
 		// to an even product: the 6200 accepts bin 2 (9576×6388) and bin 4 (→1597) but rejects
 		// bin 3 (6388/3 is odd). bin·output = the sensor-pixel extent.
 		if c.Color() && ((w*bin)%2 != 0 || (h*bin)%2 != 0) {
-			return fmt.Errorf("asicam: RAW16 color binning needs an even sensor extent for %s (bin %d → %dx%d sensor px is odd); use a bin that evenly divides the sensor, or RAW8", c.sensor.Name, bin, w*bin, h*bin)
+			return fmt.Errorf("astrocam: RAW16 color binning needs an even sensor extent for %s (bin %d → %dx%d sensor px is odd); use a bin that evenly divides the sensor, or RAW8", c.sensor.Name, bin, w*bin, h*bin)
 		}
 		soft = bin
 		sx, sy, sw, sh, sbin = x*bin, y*bin, w*bin, h*bin, 1
@@ -555,7 +581,7 @@ func (c *Camera) SetROI(x, y, w, h int) error {
 // call SetBinning before SetROI. The readout-mode switch happens in the next SetROI.
 func (c *Camera) SetBinning(bin int) error {
 	if bin < 1 {
-		return fmt.Errorf("asicam: binning %d invalid (must be ≥1)", bin)
+		return fmt.Errorf("astrocam: binning %d invalid (must be ≥1)", bin)
 	}
 	ok := false
 	for _, b := range c.sensor.Info.Bins {
@@ -565,7 +591,7 @@ func (c *Camera) SetBinning(bin int) error {
 		}
 	}
 	if !ok {
-		return fmt.Errorf("asicam: %s does not support bin %d (supported: %v)", c.sensor.Name, bin, c.sensor.Info.Bins)
+		return fmt.Errorf("astrocam: %s does not support bin %d (supported: %v)", c.sensor.Name, bin, c.sensor.Info.Bins)
 	}
 	c.mu.Lock()
 	c.bin = bin
@@ -607,7 +633,7 @@ func (c *Camera) ExposureRange() (min, max time.Duration) {
 // ExposureStep is the exposure resolution (whole µs; Alpaca ExposureResolution).
 func (c *Camera) ExposureStep() time.Duration { return time.Microsecond }
 
-// ROI returns the current readout window (x, y, width, height) — Alpaca StartX/StartY/NumX/NumY.
+// ROI returns the current readout window (x, y, width, height): Alpaca StartX/StartY/NumX/NumY.
 func (c *Camera) ROI() (x, y, w, h int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

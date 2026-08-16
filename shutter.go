@@ -5,25 +5,25 @@ import "time"
 // ShutterModel parameterizes a rolling-shutter (Sony STARVIS 0x30xx family) sensor's
 // exposure programming.
 //
-//	lineTime_ns   = HMAX * 1000 / clock
+//	lineTime_ns   = HMAX * 1000 / clock         (HMAX from the FPS/bandwidth engine, or FixedHMAX)
 //	exposureLines = exposure / lineTime
-//	VMAX          = max(DefaultVMAX, exposureLines + SHSOffset + 1)  // extend frame for long exp
-//	SHS           = VMAX + SHSOffset - exposureLines                 // clamped to >= 1
+//	VMAX          = height + VBlankAdd, stretched to exposureLines + 1 for long exposures
+//	SHS           = height + SHSOffset - exposureLines, clamped to [1, height + SHSOffset - 1]
 //
 // VMAX (frame length) is programmed into the camera FPGA (SetVMAX); SHS into the sensor's
-// 24-bit shutter registers. LineTimeNs is the value at the sensor's default full-resolution
-// mode; non-default modes (USB2/3, binning, high-speed) re-derive it.
+// 24-bit shutter registers. The line time is derived from the live ReadoutMode (USB2/3,
+// binning, high-speed) at every call, never stored.
 type ShutterModel struct {
 	SHS0, SHS1, SHS2 uint16 // 24-bit SHS registers, little-endian
 	SHSOffset        uint32 // SHS = (height + offset) - lines (e.g. 0x11 for IMX290/462)
 	MinExpUs         uint64
 	MaxExpUs         uint64
 
-	// --- computed form: when Clock != 0, ApplyExposure derives the line time from the
-	// HMAX formula (fps.go) using the live ReadoutMode and the STARVIS VMAX/SHS math:
-	// VMAX = height + VBlankAdd, SHS = clamp(height + SHSOffset - lines, 1, height +
-	// SHSOffset - 1). DefaultWidth/Height are the full-frame geometry. ---
-	Clock     uint32 // pixel clock for the readout mode (e.g. 0x2441)
+	// ApplyExposure derives the line time from the HMAX formula (fps.go) using the live
+	// ReadoutMode and the STARVIS VMAX/SHS math: VMAX = height + VBlankAdd, SHS = clamp(height +
+	// SHSOffset - lines, 1, height + SHSOffset - 1). DefaultWidth/Height are the full-frame
+	// geometry.
+	Clock     uint32 // pixel clock for the readout mode (e.g. 0x2441); required
 	FloorHMAX uint32 // REG_FRAME_LENGTH_PKG_MIN, the HMAX lower bound (e.g. 0xcb)
 	VBlankAdd uint32 // VMAX = height + VBlankAdd (e.g. 0x12)
 
@@ -39,21 +39,13 @@ type ShutterModel struct {
 	FixedHMAX     uint32
 	DefaultWidth  uint32 // full-frame width  (HMAX geometry)
 	DefaultHeight uint32 // full-frame height (VMAX/SHS reference + HMAX geometry)
-
-	// --- legacy form: baked line time + precomputed full-frame VMAX. Used only when
-	// Clock == 0. Deprecated. ---
-	LineTimeNs  uint64
-	DefaultVMAX uint32
 }
 
-// lineTimeNs returns the readout line time: computed from the HMAX formula and the
-// live ReadoutMode when the sensor supplies Clock, else the baked legacy value.
+// lineTimeNs returns the readout line time from the HMAX formula and the live ReadoutMode
+// (or FixedHMAX), never below 1 ns.
 func (m ShutterModel) lineTimeNs(rm Regmap) uint64 {
 	if m.Clock == 0 {
-		if m.LineTimeNs == 0 {
-			return 1
-		}
-		return m.LineTimeNs
+		return 1
 	}
 	if m.FixedHMAX != 0 { // baked-constant HMAX (e.g. IMX178): no bandwidth/FPS derivation
 		lt := uint64(m.FixedHMAX) * 1_000_000 / uint64(m.Clock)
@@ -63,7 +55,7 @@ func (m ShutterModel) lineTimeNs(rm Regmap) uint64 {
 		return lt
 	}
 	// Use the live ROI dimensions (set by SetROI) so the SHS line time matches the ROI HMAX;
-	// fall back to the full-frame defaults. Both dims must be set — taking a Width with a zero
+	// fall back to the full-frame defaults. Both dims must be set: taking a Width with a zero
 	// Height would collapse the bandwidth candidate (and ApplyExposure keys on Height alone).
 	w, h := int(m.DefaultWidth), int(m.DefaultHeight)
 	clock, floor := m.Clock, m.FloorHMAX
@@ -102,36 +94,6 @@ func (m ShutterModel) starvis(effH, lines uint64) (vmax, shs uint32) {
 	return uint32(v), uint32(s)
 }
 
-// Shutter computes the (vmax, shs) pair for a requested exposure, clamping to the
-// model's exposure range and extending VMAX when the exposure exceeds one frame.
-func (m ShutterModel) Shutter(d time.Duration) (vmax, shs uint32) {
-	us := uint64(d.Microseconds())
-	if us < m.MinExpUs {
-		us = m.MinExpUs
-	}
-	if m.MaxExpUs != 0 && us > m.MaxExpUs {
-		us = m.MaxExpUs
-	}
-	lt := m.LineTimeNs
-	if lt == 0 {
-		lt = 1
-	}
-	lines := us * 1000 / lt // exposure(ns) / lineTime(ns)
-	v := uint64(m.DefaultVMAX)
-	if v < lines+uint64(m.SHSOffset)+1 {
-		v = lines + uint64(m.SHSOffset) + 1
-	}
-	if v > 0xffffff { // clamp BEFORE narrowing — uint32(lines+…) first would wrap, not saturate
-		v = 0xffffff
-	}
-	vmax = uint32(v)
-	s := int64(vmax) + int64(m.SHSOffset) - int64(lines)
-	if s < 1 {
-		s = 1
-	}
-	return vmax, uint32(s)
-}
-
 // ExposureLines converts a requested duration to a sensor line count at the given line
 // time, clamping to [minUs, maxUs]. Shared front half of every family's exposure math.
 func ExposureLines(d time.Duration, lineTimeNs, minUs, maxUs uint64) uint64 {
@@ -149,7 +111,7 @@ func ExposureLines(d time.Duration, lineTimeNs, minUs, maxUs uint64) uint64 {
 }
 
 // WithLatch runs fn with the sensor's coupled-group latch held (latchReg=1), releasing it
-// (latchReg=0) even when fn errors — a held latch freezes every later grouped-register
+// (latchReg=0) even when fn errors: a held latch freezes every later grouped-register
 // update, so error paths must drop it too. The first error wins. The shared bracket for
 // every profile's latched register group (gain, ROI, exposure).
 func WithLatch(rm Regmap, latchReg uint16, fn func() error) (err error) {
@@ -187,27 +149,35 @@ func WriteRegLE(rm Regmap, latchReg uint16, regs []uint16, val uint32) (err erro
 	return nil
 }
 
+// ReadRegLE reads regs (regs[0] = low byte) from the sensor register space and assembles the
+// little-endian value, the read-back dual of WriteRegLE.
+func ReadRegLE(rm Regmap, regs []uint16) (uint32, error) {
+	var v uint32
+	for i, r := range regs {
+		b, err := rm.ReadReg(r)
+		if err != nil {
+			return 0, err
+		}
+		v |= uint32(b&0xff) << (8 * uint(i))
+	}
+	return v, nil
+}
+
 // ApplyExposure programs a requested exposure: VMAX into the FPGA (SetVMAX) then the 24-bit
 // SHS into the sensor, bracketed by latchReg (0 = no latch). Shared SetExposure body for the
-// STARVIS-family profiles. When the model supplies Clock the line time is computed from the
-// live ReadoutMode; otherwise the legacy baked line time / DefaultVMAX path runs.
+// STARVIS-family profiles; the line time is computed from the live ReadoutMode.
 func ApplyExposure(rm Regmap, m ShutterModel, latchReg uint16, d time.Duration) error {
-	var vmax, shs uint32
-	if m.Clock != 0 {
-		lines := ExposureLines(d, m.lineTimeNs(rm), m.MinExpUs, m.MaxExpUs)
-		// Effective readout height = the live ROI height (set by SetROI), else full-frame
-		// height. VMAX follows it, so a sub-frame ROI free-runs at a higher fps.
-		effH := uint64(m.DefaultHeight)
-		if h := ModeOf(rm).Height; h > 0 {
-			effH = uint64(h)
-		}
-		vmax, shs = m.starvis(effH, lines)
-		// EnableFPGAWaitMode(1): reg0 bit6 — SetExp sets this on the standard path.
-		if err := SetFPGABit(rm, 0x00, 0x40, true); err != nil {
-			return err
-		}
-	} else {
-		vmax, shs = m.Shutter(d)
+	lines := ExposureLines(d, m.lineTimeNs(rm), m.MinExpUs, m.MaxExpUs)
+	// Effective readout height = the live ROI height (set by SetROI), else full-frame
+	// height. VMAX follows it, so a sub-frame ROI free-runs at a higher fps.
+	effH := uint64(m.DefaultHeight)
+	if h := ModeOf(rm).Height; h > 0 {
+		effH = uint64(h)
+	}
+	vmax, shs := m.starvis(effH, lines)
+	// EnableFPGAWaitMode(1): reg0 bit6; SetExp sets this on the standard path.
+	if err := SetFPGABit(rm, 0x00, 0x40, true); err != nil {
+		return err
 	}
 	if err := SetVMAX(rm, vmax); err != nil {
 		return err

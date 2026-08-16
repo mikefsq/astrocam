@@ -10,8 +10,8 @@ package astrocam
 // (reg0 bit4 clear: → 0x61) → ResetEndPoint(0x81) → bulk read. The generic SendCMD/FPGA/
 // endpoint parts are here; the sensor master stop/start is the Sensor.StreamStop/StreamStart hook.
 //
-// Delivered bulk data is raw pixels from offset 0 (the FX3 strips the 0xBB00AA11 frame magic);
-// frames are validated by size, not a header.
+// Delivered bulk data is raw pixels from offset 0 (the FX3 strips its internal 0xBB00AA11 frame
+// delimiter); frames are validated by size, not a header.
 
 import (
 	"errors"
@@ -22,22 +22,16 @@ import (
 // ErrDeviceWedged is returned once the camera is dead: a short/failed readout whose
 // firmware-version recheck showed the FX3 dropped its firmware. Recovery is a USB reset
 // (USBDEVFS_RESET) + re-scan + re-Open. Callers match this with errors.Is.
-var ErrDeviceWedged = errors.New("asicam: device wedged (FX3 firmware crash) — needs USB reset + re-scan")
+var ErrDeviceWedged = errors.New("astrocam: device wedged (FX3 firmware crash): needs USB reset + re-scan")
 
-// FrameMagic is the FX3 stream's internal frame delimiter; it is stripped before readout
-// and not present in the delivered frame. Reference only; frames are validated by size.
-const FrameMagic uint32 = 0xBB00AA11
-
-// Generic FX3 streaming vendor commands (SendCMD).
+// ZWO's FX3 streaming vendor commands (SendCMD); they seed ZWO.Cmds. Other vendors fill their
+// own table.
 const (
 	cmdStreamStop  = 0xAA // stop/prepare before (re)arming
 	cmdStreamStart = 0xA9 // begin streaming
 	cmdFlush       = 0xAF // pipeline flush / drop recovery
 	bulkEndpoint   = 0x81 // bulk-IN endpoint
 )
-
-// pidNeedsCapBit reports whether the PID-gated FPGA reg-0x45 capture bit applies.
-func pidNeedsCapBit(pid uint16) bool { return pid == 0x461e || pid == 0x411e }
 
 // FPGA mode register 0: bit4 stops the readout pipeline (FPGAStop sets it, FPGAStart clears it).
 const (
@@ -48,7 +42,7 @@ const (
 func (c *Camera) fpgaSetReg0(mask, val uint16) error {
 	v, err := c.rm.ReadFPGAReg(fpgaModeReg0)
 	if err != nil {
-		return fmt.Errorf("asicam: read FPGA reg0: %w", err)
+		return fmt.Errorf("astrocam: read FPGA reg0: %w", err)
 	}
 	return c.rm.WriteFPGAReg(fpgaModeReg0, ((v&^mask)|val)&0xff)
 }
@@ -61,8 +55,9 @@ func (c *Camera) fpgaStart() error { return c.fpgaSetReg0(fpgaStopBit, 0) }
 // Rm returns the Camera's Regmap (sensor + FPGA register R/W).
 func (c *Camera) Rm() Regmap { return c.rm }
 
-// VendorCmd issues an FX3 vendor command.
-func (c *Camera) VendorCmd(cmd uint8) error { return c.vendorCmd(cmd) }
+// VendorCmd issues a SendCMD-style FX3 vendor command (FX3StreamStop / FX3StreamStart /
+// FX3Flush), resolved through the vendor's command table.
+func (c *Camera) VendorCmd(op FX3Op) error { return c.vendorCmd(op) }
 
 // ResetEndpoint clears the bulk-IN pipe (EP 0x81) when the backend supports it.
 func (c *Camera) ResetEndpoint() error {
@@ -72,15 +67,15 @@ func (c *Camera) ResetEndpoint() error {
 	return nil
 }
 
-// ResetDevice performs a whole-device USB reset — the worker's last-resort recovery for a
+// ResetDevice performs a whole-device USB reset, the worker's last-resort recovery for a
 // wedged readout. On a backend without DeviceResetter (WinUSB exposes no device-level
-// reset) it returns an error rather than silently pretending the reset happened, so a
-// recovery ladder's last rung fails loud instead of looping on a still-wedged device.
+// reset) it returns an error rather than pretending the reset happened, so a recovery
+// ladder's last rung fails loud instead of looping on a still-wedged device.
 func (c *Camera) ResetDevice() error {
 	if r, ok := c.t.(DeviceResetter); ok {
 		return r.ResetDevice()
 	}
-	return fmt.Errorf("asicam: transport has no device reset (recovery rung unavailable)")
+	return fmt.Errorf("astrocam: transport has no device reset (recovery rung unavailable)")
 }
 
 // BulkRead reads from the bulk-IN endpoint with the given timeout.
@@ -153,7 +148,7 @@ func (c *Camera) binFrame(buf []byte, n int) int {
 		return n
 	}
 	if want := m.Width * m.Height * 2; n < want || m.Width <= 0 || m.Height <= 0 {
-		return n // not the expected full RAW16 frame — leave it for the caller to flag
+		return n // not the expected full RAW16 frame; leave it for the caller to flag
 	}
 	if c.Color() {
 		return colorBinRAW16(buf, m.Width, m.Height, m.SoftBin)
@@ -164,7 +159,7 @@ func (c *Camera) binFrame(buf []byte, n int) int {
 // colorBinRAW16 is the Bayer-preserving equivalent of averageBinRAW16: it averages only
 // same-color samples so the binned output stays a valid mosaic. Output is floor dims
 // (fullW/bin)×(fullH/bin). Each output pixel (oy,ox) keeps Bayer phase (oy%2,ox%2) and averages
-// the same-phase pixels in the bin×bin source block at (bin·oy, bin·ox) — for an even bin, the
+// the same-phase pixels in the bin×bin source block at (bin·oy, bin·ox): for an even bin, the
 // (bin/2)² same-color samples (bin 2 = 1 sample, bin 4 = 4). cnt clamps partial edge blocks (none
 // for exact divisors, the only color bins SetROI allows). Scratch output avoids in-place aliasing.
 func colorBinRAW16(buf []byte, fullW, fullH, bin int) int {
@@ -239,18 +234,19 @@ func averageBinRAW16(buf []byte, fullW, fullH, bin int) int {
 	return outW * outH * 2
 }
 
-// StartExposure arms a single (snap) exposure: sets the PID-gated FPGA capture bit, brackets the
-// sensor's master start with the generic FX3 stream stop/start commands, and seeds the exposure
-// status to Working. The frame is read by GetDataAfterExp once GetExpStatus reports Success.
-// light selects a light vs dark frame (the FPGA capture-start bit).
+// StartExposure arms a single (snap) exposure: it brackets the sensor's master start with the
+// FX3 stream stop/start commands (or runs the profile's own Arm) and seeds the exposure status
+// to Working. GetDataAfterExp reads the frame once GetExpStatus reports Success. light is the
+// ASCOM/ASI light-vs-dark flag, accepted for API parity; none of the supported cameras has a
+// mechanical shutter, so it has no hardware effect (cover the optics for darks).
 func (c *Camera) StartExposure(light bool) error {
 	if c.dead.Load() {
-		return ErrDeviceWedged // dead device — refuse new frames until reset+re-Open
+		return ErrDeviceWedged // dead device: refuse new frames until reset+re-Open
 	}
 	// Claim the exposure atomically: the busy check and the Working transition happen in ONE
 	// critical section (check-then-act across an unlock let two StartExposure calls double-arm).
 	// Claiming also bumps the generation and clears the abort flag, superseding any stale
-	// capture still unwinding — its generation-guarded writes become no-ops.
+	// capture still unwinding; its generation-guarded writes become no-ops.
 	c.mu.Lock()
 	if c.status == ExpWorking {
 		c.mu.Unlock()
@@ -261,10 +257,9 @@ func (c *Camera) StartExposure(light bool) error {
 	c.expGen++
 	gen := c.expGen
 	c.expAborted = false
-	c.expLight = light
 	c.mu.Unlock()
 	// Re-enable frame reads: a prior StopExposure left the transport's read-abort latched
-	// (level-triggered — see ReadAborter) so stale reads fail fast; this exposure owns the
+	// (level-triggered, see ReadAborter) so stale reads fail fast; this exposure owns the
 	// bus again.
 	if ra, ok := c.t.(ReadAborter); ok {
 		ra.ArmRead()
@@ -272,7 +267,7 @@ func (c *Camera) StartExposure(light bool) error {
 	// A sensor Worker arms, host-times, and reads inside GetDataAfterExp, so the worker path
 	// seeds state only. The non-worker path arms here, unlocked.
 	if c.sensor.Worker == nil {
-		if err := c.arm(light); err != nil {
+		if err := c.arm(); err != nil {
 			c.setStatusIfGen(gen, ExpIdle) // release the claim (unless superseded meanwhile)
 			return err
 		}
@@ -280,14 +275,7 @@ func (c *Camera) StartExposure(light bool) error {
 	return nil
 }
 
-// setStatus stores the exposure status under the lock.
-func (c *Camera) setStatus(s ExposureStatus) {
-	c.mu.Lock()
-	c.status = s
-	c.mu.Unlock()
-}
-
-// setStatusIfGen stores the exposure status only if the exposure generation is still gen —
+// setStatusIfGen stores the exposure status only if the exposure generation is still gen:
 // a stale capture (superseded by a newer StartExposure) must not clobber the new exposure's
 // state.
 func (c *Camera) setStatusIfGen(gen uint64, s ExposureStatus) {
@@ -299,8 +287,8 @@ func (c *Camera) setStatusIfGen(gen uint64, s ExposureStatus) {
 }
 
 // abortedGen reports whether the generation-gen exposure is aborted: StopExposure ran
-// (expAborted), or a newer StartExposure superseded it. Deliberately independent of status —
-// a poll deriving SUCCESS at window end must not read as an abort mid-integration.
+// (expAborted), or a newer StartExposure superseded it. Independent of status: a poll deriving
+// SUCCESS at window end must not read as an abort mid-integration.
 func (c *Camera) abortedGen(gen uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -333,26 +321,15 @@ func (c *Camera) expDuration() time.Duration {
 	return c.expDur
 }
 
-// arm issues the arm sequence: PID-gated FPGA capture bit, then SendCMD 0xAA → FPGA stop →
-// sensor master stop → SendCMD 0xA9 → sensor master start → settle → FPGA start (clear reg0
-// bit4, un-halting the readout so frames reach EP 0x81). Shared by StartExposure and the
-// GetDataAfterExp recovery path.
-func (c *Camera) arm(light bool) error {
-	// PID-gated FPGA capture-start bit (reg 0x45 bit1) for the models that need it.
-	if pidNeedsCapBit(c.pid) {
-		cur, err := c.rm.ReadFPGAReg(0x45)
-		if err != nil {
-			return fmt.Errorf("asicam: read FPGA 0x45: %w", err)
-		}
-		v := cur &^ 0x2
-		if light {
-			v |= 0x2
-		}
-		if err := c.rm.WriteFPGAReg(0x45, v); err != nil {
-			return fmt.Errorf("asicam: write FPGA 0x45: %w", err)
-		}
+// arm issues the arm sequence: the sensor's own Arm hook when it has one, else the generic
+// SendCMD 0xAA → FPGA stop → sensor master stop → SendCMD 0xA9 → sensor master start → settle →
+// FPGA start (clear reg0 bit4, un-halting the readout so frames reach EP 0x81). Shared by
+// StartExposure, StartVideo and the GetDataAfterExp recovery path.
+func (c *Camera) arm() error {
+	if c.sensor.Arm != nil {
+		return c.sensor.Arm(c) // the profile's own choreography (see Sensor.Arm)
 	}
-	if err := c.vendorCmd(cmdStreamStop); err != nil {
+	if err := c.vendorCmd(FX3StreamStop); err != nil {
 		return err
 	}
 	if err := c.fpgaStop(); err != nil {
@@ -363,7 +340,7 @@ func (c *Camera) arm(light bool) error {
 			return err
 		}
 	}
-	if err := c.vendorCmd(cmdStreamStart); err != nil {
+	if err := c.vendorCmd(FX3StreamStart); err != nil {
 		return err
 	}
 	if c.sensor.StreamStart != nil {
@@ -381,10 +358,7 @@ func (c *Camera) arm(light bool) error {
 // bit4) but keeps WaitMode (bit6) as SetExposure left it: the 174 stream runs at reg0=0x61
 // (bit4 clear, bit6 set). Short (non-trigger) exposures only; long-exp trigger stays single-shot.
 func (c *Camera) StartVideo(light bool) error {
-	if err := c.arm(light); err != nil {
-		return err
-	}
-	if err := c.fpgaSetReg0(fpgaStopBit, 0); err != nil { // un-halt readout (bit4); keep WaitMode (bit6)
+	if err := c.arm(); err != nil { // ends with FPGAStart: readout un-halted (bit4 clear), WaitMode (bit6) untouched
 		return err
 	}
 	if r, ok := c.t.(EndpointResetter); ok {
@@ -395,7 +369,6 @@ func (c *Camera) StartVideo(light bool) error {
 	c.expStart = nowFunc()
 	c.expGen++ // supersede any stale single-shot capture still unwinding
 	c.expAborted = false
-	c.expLight = light
 	c.mu.Unlock()
 	if ra, ok := c.t.(ReadAborter); ok {
 		ra.ArmRead() // clear a prior StopExposure's read-abort latch (see StartExposure)
@@ -408,7 +381,7 @@ func (c *Camera) StartVideo(light bool) error {
 func (c *Camera) StartStream(total time.Duration) (FrameStream, error) {
 	ss, ok := c.t.(StreamStarter)
 	if !ok {
-		return nil, fmt.Errorf("asicam: backend has no resident stream session")
+		return nil, fmt.Errorf("astrocam: backend has no resident stream session")
 	}
 	return ss.StartStream(c.FrameBytes(), total)
 }
@@ -418,9 +391,8 @@ var nowFunc = time.Now
 
 // GetExpStatus reports the snap exposure status: WORKING while the exposure is in flight,
 // SUCCESS once the host-timed window has elapsed (frame ready for readout). Poll until SUCCESS,
-// then call GetDataAfterExp. The SUCCESS at window end is DERIVED, not stored: a getter that
-// mutated status turned every concurrent poll into an abort signal for the worker still
-// integrating (Aborted() used to key off status), killing long exposures at ~99%.
+// then call GetDataAfterExp. The SUCCESS at window end is DERIVED, not stored, so a status poll
+// never changes what the worker still integrating observes.
 func (c *Camera) GetExpStatus() ExposureStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -464,16 +436,27 @@ func repairFX3DMAMarkers(buf []byte, bpp int) {
 	fill(n-4, n, n-4-bpp) // trailing marker word <- last real pixel (ends at byte n-4)
 }
 
+// RepairFrame applies the FX3 DDR frame-marker repair to a delivered frame when the profile has
+// the markers (Sensor.FX3DMAMarkers) and RepairDMAMarkers is on; a no-op otherwise. GetDataAfterExp
+// applies it itself; callers pulling frames from the free-run paths (ReadFrame, a resident
+// FrameStream) call it per frame. In free-run the header word's third byte is a frame counter,
+// so an unrepaired stream shows the corner pixel stepping 1, 2, 3, ….
+func (c *Camera) RepairFrame(buf []byte) {
+	if RepairDMAMarkers && c.sensor.FX3DMAMarkers {
+		repairFX3DMAMarkers(buf, ModeOf(c.rm).BytesPerPx)
+	}
+}
+
 // Wedged reports whether the camera has been marked dead by the firmware-crash check (see
 // ErrDeviceWedged / checkDead). Recovery is a USB reset + re-scan + re-Open.
 func (c *Camera) Wedged() bool { return c.dead.Load() }
 
 // checkDead re-reads the firmware version after a short/failed readout and compares it to the
 // baseline cached at Init: if it changed (or won't read) the FX3 dropped its firmware and the
-// camera is dead — it latches c.dead so later StartExposure/GetDataAfterExp fail fast with
+// camera is dead. It latches c.dead so later StartExposure/GetDataAfterExp fail fast with
 // ErrDeviceWedged. A matching firmware means a transient stall, so it returns false and the
 // caller surfaces the ordinary short-frame error. The firmware read is one bounded control
-// transfer (no bulk in flight), so it can't itself hang.
+// transfer (no bulk in flight), so it cannot itself hang.
 func (c *Camera) checkDead() bool {
 	if c.dead.Load() {
 		return true
@@ -491,9 +474,9 @@ func (c *Camera) checkDead() bool {
 // and retries with recovery (re-arm) on a failed/short read.
 func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 	if c.dead.Load() {
-		return 0, ErrDeviceWedged // already dead — don't issue reads that would hang
+		return 0, ErrDeviceWedged // already dead: don't issue reads that would hang
 	}
-	// Snapshot the state the read needs — INCLUDING the exposure generation — then release the
+	// Snapshot the state the read needs (INCLUDING the exposure generation), then release the
 	// lock for the duration of the (multi-second) USB read so concurrent status polls / aborts
 	// aren't blocked. Every status write below is generation-guarded: if a StopExposure +
 	// StartExposure supersedes this capture mid-read, its writes become no-ops instead of
@@ -505,7 +488,7 @@ func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 	expDur := c.expDur
 	c.mu.Unlock()
 	if st != ExpWorking && st != ExpSuccess {
-		return 0, fmt.Errorf("asicam: no frame ready (status %s)", st)
+		return 0, fmt.Errorf("astrocam: no frame ready (status %s)", st)
 	}
 	// Per-sensor worker path: host-timed single-shot capture, doing the whole
 	// arm → expose → re-arm → fire → read itself.
@@ -513,24 +496,24 @@ func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 		n, err := worker(workerCtl{c, gen}, buf, expDur)
 		if err != nil {
 			// Clean abort (StopExposure ran, or a new StartExposure superseded us): leave the
-			// status alone — StopExposure already set Idle / the new exposure owns it — and
+			// status alone (StopExposure already set Idle / the new exposure owns it) and
 			// don't probe the firmware (that control transfer would interleave with the new
 			// capture's readout).
 			if c.abortedGen(gen) {
-				return n, fmt.Errorf("asicam: capture worker: %w", err)
+				return n, fmt.Errorf("astrocam: capture worker: %w", err)
 			}
 			c.setStatusIfGen(gen, ExpFailed)
 			if c.checkDead() {
 				return n, ErrDeviceWedged
 			}
-			return n, fmt.Errorf("asicam: capture worker: %w", err)
+			return n, fmt.Errorf("astrocam: capture worker: %w", err)
 		}
 		if n < c.FrameBytes() {
 			c.setStatusIfGen(gen, ExpFailed)
 			if c.checkDead() { // FX3 firmware crash? re-read firmware; if it changed, latch dead
 				return n, ErrDeviceWedged
 			}
-			return n, fmt.Errorf("asicam: short frame (%d of %d bytes)", n, c.FrameBytes())
+			return n, fmt.Errorf("astrocam: short frame (%d of %d bytes)", n, c.FrameBytes())
 		}
 		if RepairDMAMarkers && c.sensor.FX3DMAMarkers {
 			repairFX3DMAMarkers(buf[:n], ModeOf(c.rm).BytesPerPx)
@@ -542,7 +525,7 @@ func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 	var lastErr error
 	for attempt := 0; attempt < frameReadAttempts; attempt++ {
 		if c.abortedGen(gen) {
-			return 0, fmt.Errorf("asicam: exposure aborted")
+			return 0, fmt.Errorf("astrocam: exposure aborted")
 		}
 		if attempt > 0 {
 			// Recover the pipe and re-arm so the retry has a fresh frame to read.
@@ -570,15 +553,14 @@ func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 	if r, ok := c.t.(DeviceResetter); ok {
 		_ = r.ResetDevice()
 	}
-	return 0, fmt.Errorf("asicam: frame read failed after %d attempts: %w", frameReadAttempts, lastErr)
+	return 0, fmt.Errorf("astrocam: frame read failed after %d attempts: %w", frameReadAttempts, lastErr)
 }
 
 // recoverAndRearm escalates pipe recovery, then re-arms a fresh exposure for the next read
 // attempt. It does not bus-reset (that wipes init state); the bus reset is GetDataAfterExp's
 // final give-up action only. Generation-guarded: it refuses to resurrect an aborted or
-// superseded exposure, re-arms with the exposure's OWN light/dark flag (a hardcoded light
-// re-arm silently converted retried dark frames to lights), and never drops the status to
-// Idle mid-recovery (that opened a window for a concurrent StartExposure to double-arm).
+// superseded exposure and never drops the status to Idle mid-recovery (which would open a
+// window for a concurrent StartExposure to double-arm).
 func (c *Camera) recoverAndRearm(attempt int, gen uint64) error {
 	if c.abortedGen(gen) {
 		return fmt.Errorf("exposure aborted")
@@ -587,12 +569,9 @@ func (c *Camera) recoverAndRearm(attempt int, gen uint64) error {
 		_ = r.ResetEndpoint(bulkEndpoint) // clear any stall / leftover data
 	}
 	if attempt >= 2 {
-		_ = c.vendorCmd(cmdFlush) // 0xAF: flush the FX3 pipeline
+		_ = c.vendorCmd(FX3Flush) // 0xAF on ZWO: flush the FX3 pipeline
 	}
-	c.mu.Lock()
-	light := c.expLight
-	c.mu.Unlock()
-	if err := c.arm(light); err != nil {
+	if err := c.arm(); err != nil {
 		return err
 	}
 	c.mu.Lock()
@@ -606,7 +585,7 @@ func (c *Camera) recoverAndRearm(attempt int, gen uint64) error {
 
 // ReadFrame reads one frame from the already-armed, running stream into buf (no arm/re-arm) and
 // returns the bytes read. reset clears the bulk pipe first (a fresh frame boundary); pass false
-// for back-to-back continuous reads.
+// for back-to-back continuous reads. A complete frame gets the FX3 marker repair (RepairFrame).
 func (c *Camera) ReadFrame(buf []byte, reset bool) (int, error) {
 	if reset {
 		if r, ok := c.t.(EndpointResetter); ok {
@@ -617,7 +596,11 @@ func (c *Camera) ReadFrame(buf []byte, reset bool) (int, error) {
 	if to < 2*time.Second {
 		to = 2 * time.Second
 	}
-	return c.t.BulkRead(buf, to)
+	n, err := c.t.BulkRead(buf, to)
+	if err == nil && n > 0 && n == c.FrameBytes() {
+		c.RepairFrame(buf[:n])
+	}
+	return n, err
 }
 
 // readFrame fills buf with one whole-frame BulkRead; the backend supplies the transfer
@@ -627,9 +610,9 @@ func (c *Camera) readFrame(buf []byte) (int, error) {
 	if r, ok := c.t.(EndpointResetter); ok {
 		_ = r.ResetEndpoint(bulkEndpoint)
 	}
-	// Open bug: above ~0.4 s every frame takes ~2× the exposure to arrive (dead-time, not a
-	// double exposure — brightness is correct). Size the timeout for 2× the exposure plus a
-	// readout/jitter margin so the bulk read doesn't abort before the frame appears.
+	// Size the timeout for 2× the exposure plus a readout/jitter margin: a free-run frame can
+	// arrive up to one frame period after the exposure ends, so the bulk read must not abort
+	// before it appears.
 	to := 2*c.expDuration() + 3*time.Second
 	if to < 2*time.Second {
 		to = 2 * time.Second
@@ -647,16 +630,16 @@ func (c *Camera) StopExposure() error {
 	c.mu.Unlock()
 	// Break any frame read blocked in the transport BEFORE issuing the stop writes: a
 	// whole-frame read holds ioMu for seconds, and the master-stop control transfers below
-	// would queue behind it — the classic "AbortExposure hangs" (finding 1.5). AbortRead is
+	// would queue behind it (an AbortExposure that hangs for the rest of the read). AbortRead is
 	// level-triggered, so a stale worker's follow-up read also fails fast instead of
 	// re-taking the bus; the next StartExposure/StartVideo re-arms reads.
 	if ra, ok := c.t.(ReadAborter); ok {
 		ra.AbortRead()
 	}
-	_ = c.vendorCmd(cmdStreamStop) // 0xAA
+	_ = c.vendorCmd(FX3StreamStop) // 0xAA on ZWO
 	if c.sensor.StreamStop != nil {
 		_ = c.sensor.StreamStop(c.rm) // master stop (0x200=1)
 	}
 	_ = c.fpgaStop()
-	return c.vendorCmd(cmdFlush) // 0xAF
+	return c.vendorCmd(FX3Flush) // 0xAF on ZWO
 }

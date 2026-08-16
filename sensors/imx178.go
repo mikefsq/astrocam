@@ -6,16 +6,17 @@
 //
 // Register/behavior summary:
 //
-//	ctor              (HMAX 420; FPS%-default 80)
+//	ctor              (HMAX 420; the SDK's FPS%-default 80 is not applied here)
 //	InitCamera        (reglist 89 entries + tail + FPGA bringup)
 //	SetCMOSClk        (clock 27000 kHz bin1, clk-byte 0x3101=0x30; bin2/4 6750/0x32)
-//	Cam_SetResolution (bin1 mode 0x300e=0/0x3010=0, VBLK 15; window W 0x31a2/3 H 0x319e/f; FPGA swap)
+//	Cam_SetResolution (bin1 mode 0x300e=0/0x3010=0, VBLK 15; window W 0x31a2/3 H 0x319e/f; FPGA W/H)
 //	SetStartPos       (ROI X 0x319c/0x319d, Y 0x31a0/0x31a1; X align 4, Y align 2)
 //	SetGain           (clamp 0..510, conv-gain 0x301b 0/0x1e ABOVE gain 30, raw code 0x301f/0x3020)
 //	SetExp            (SHS 24-bit 0x3034-36; line_time=HMAX·1000/clock; VMAX=height+29; ≥1 s→trigger)
 //	SetBrightness     (offset -> 0x3015/0x3016, 16-bit LE, no scaling)
 //	Start/StopSensorStreaming (standby 0x3000: 6 on → 0 off, +usleep, +FPGAStart; stop=FPGAStop)
-//	the capture worker (capture: arm, FPGABufReload, TriggerSignal+XHSStop window, async xfer)
+//	the capture worker (capture: arm, TriggerSignal+XHSStop window, one BulkRead)
+
 package sensors
 
 import . "github.com/mikefsq/astrocam"
@@ -55,9 +56,8 @@ const (
 	imx178ExpMaxUs  = 2_000_000_000 // 2000 s ceiling
 	imx178LongExpUs = 1_000_000     // ≥ 1 s enters FPGA trigger mode — EXACT
 
-	// Die/mode readout facts (shared engine: fps.go / shutter.go). Geometry is image-orientation
-	// (3072 wide × 2048 tall), stored swapped — 2048 (lines, drives VMAX/SHS + the HMAX divisor),
-	// 3072 — and Cam_SetResolution swaps SetFPGAHeight/Width to match.
+	// Die/mode readout facts (shared engine: fps.go / shutter.go). Geometry is image-orientation:
+	// 3072 wide × 2048 tall; the height is the line count that drives VMAX/SHS.
 	imx178FullWidth  = 3072  // active pixels, horizontal
 	imx178FullHeight = 2048  // vertical (the line count VMAX = height + 29 uses)
 	imx178ClkKHz     = 27000 // at bin1 = 27 MHz; bin2/4 = 6750
@@ -102,6 +102,7 @@ var imx178Init = []RegVal{
 	{Reg: 0x3008, Val: 0x01}, {Reg: 0x305e, Val: 0x00},
 }
 
+// IMX178 is the Sony IMX178 profile (ZWO ASI178, PlayerOne Sedna). Not yet hardware-validated.
 var IMX178 = Sensor{
 	Name:      "IMX178", // ASI178 / Sedna-M; Sony IMX178 (mono die; MC adds a CFA)
 	GainMax:   imx178GainMax,
@@ -121,6 +122,7 @@ var IMX178 = Sensor{
 	SetGain:     imx178SetGain,
 	SetExposure: imx178SetExposure,
 	SetOffset:   imx178SetOffset,
+	GetOffset:   imx178GetOffset,
 	SetROI:      imx178SetROI,
 	StreamStop:  func(rm Regmap) error { return rm.WriteReg(imx178RegStandby, 6) }, // standby on (the capture worker)
 	StreamStart: func(rm Regmap) error { return rm.WriteReg(imx178RegStandby, 0) }, // standby off (the capture worker)
@@ -136,13 +138,13 @@ func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	rm := ctl.Rm()
 	arm := func(full bool) error {
 		if full {
-			if err := ctl.VendorCmd(0xAA); err != nil {
+			if err := ctl.VendorCmd(FX3StreamStop); err != nil {
 				return err
 			}
 			if err := SetFPGABit(rm, 0x00, 0x10, true); err != nil { // FPGAStop
 				return err
 			}
-			if err := ctl.VendorCmd(0xA9); err != nil {
+			if err := ctl.VendorCmd(FX3StreamStart); err != nil {
 				return err
 			}
 		}
@@ -181,7 +183,7 @@ func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	// from the object; no 178 on the bench at port time.
 	defer func() {
 		_ = SetFPGABit(rm, 0x00, 0x10, true) // FPGAStop: reg0 bit4
-		_ = ctl.VendorCmd(0xAA)
+		_ = ctl.VendorCmd(FX3StreamStop)
 		_ = ctl.ResetEndpoint()
 	}()
 	_ = ctl.ResetEndpoint()
@@ -215,7 +217,7 @@ func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	_ = ctl.ResetEndpoint()
 	// Read EXACTLY the frame bytes, like the object's WorkingFunc (0131_CCameraS178MM.o:
 	// startAsyncXfer's size argument is the image-size slot) — an oversized read runs into
-	// the next free-run frame or times out short (REVIEW 2.11).
+	// the next free-run frame or times out short.
 	want := ctl.FrameBytes()
 	if want > len(buf) {
 		want = len(buf)
@@ -314,6 +316,12 @@ func imx178SetExposure(rm Regmap, d time.Duration) error {
 }
 
 // imx178SetOffset — SetBrightness: offset 16-bit LE to 0x3015/0x3016.
+// imx178GetOffset reads the offset back from 0x3015 (low) / 0x3016 (high).
+func imx178GetOffset(rm Regmap) (int, error) {
+	v, err := ReadRegLE(rm, []uint16{0x3015, 0x3016})
+	return int(v), err
+}
+
 func imx178SetOffset(rm Regmap, offset int) error {
 	v := uint16(offset)
 	if err := rm.WriteReg(0x3016, (v>>8)&0xff); err != nil {

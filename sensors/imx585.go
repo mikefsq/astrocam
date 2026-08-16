@@ -6,7 +6,7 @@
 //
 // Register/behavior summary:
 //
-//	ctor              (geometry 3840x2160 (lit16 0x3440); clock 20000; HMAX 192; FPS%-default 80)
+//	ctor              (geometry 3840x2160 (lit16 0x3440); clock 20000; HMAX 192; the SDK's FPS%-default 80 is not applied here)
 //	InitCamera        (reglist = 226 records [reg:u16le][val:u16le], size 0x388;
 //	                   tail 0x3015/0x3002/0x3018/0x301b/0x3022/0x3023; FPGAReset + DDR bringup)
 //	SetCMOSClk        (clock 20000 kHz; no static HMAX floor → HMAX is baked 192)
@@ -18,7 +18,8 @@
 //	                   SHS=clamp((VMAX-8)-lines, 8, VMAX-8); ≥1 s → FPGA trigger mode)
 //	SetBrightness     (offset -> 0x30dc (low) / 0x30dd (high), 16-bit LE; latch 0x3001)
 //	Start/StopSensorStreaming (start: 0x3004=0, 0x3000=0, FPGAStart; stop: FPGAStop, 0x3000=1)
-//	the capture worker (DDR capture: arm, FPGABufReload, TriggerSignal+XHSStop window, windowed xfer)
+//	the capture worker (DDR capture: arm, TriggerSignal+XHSStop window, windowed xfer)
+
 package sensors
 
 import . "github.com/mikefsq/astrocam"
@@ -123,6 +124,7 @@ var imx585Init = []RegVal{
 	{Reg: 0x3001, Val: 0x00}, // latch off; FPGAReset + SendCMD(0xAF) follow in imx585InitFPGA / Camera.Init
 }
 
+// IMX585 is the Sony IMX585 STARVIS 2 profile (ZWO ASI585, PlayerOne Uranus). Not yet hardware-validated.
 var IMX585 = Sensor{
 	Name:      "IMX585", // ASI585 / Xena 585M; Sony IMX585 STARVIS 2 (mono die; MC adds a CFA)
 	GainMax:   imx585GainMax,
@@ -142,6 +144,7 @@ var IMX585 = Sensor{
 	SetGain:     imx585SetGain,
 	SetExposure: imx585SetExposure,
 	SetOffset:   imx585SetOffset,
+	GetOffset:   imx585GetOffset,
 	SetROI:      imx585SetROI,
 	StreamStop:  func(rm Regmap) error { return rm.WriteReg(imx585RegStandby, 1) }, // standby on (StopSensorStreaming)
 	StreamStart: imx585StreamStart,
@@ -239,6 +242,12 @@ func imx585SetExposure(rm Regmap, d time.Duration) error {
 
 // imx585SetOffset — SetBrightness: offset 16-bit LE to 0x30dc (low) / 0x30dd (high), bracketed by
 // the 0x3001 latch.
+// imx585GetOffset reads the offset back from 0x30dc (low) / 0x30dd (high).
+func imx585GetOffset(rm Regmap) (int, error) {
+	v, err := ReadRegLE(rm, []uint16{imx585RegOffsetL, imx585RegOffsetH})
+	return int(v), err
+}
+
 func imx585SetOffset(rm Regmap, offset int) error {
 	return WriteRegLE(rm, imx585RegLatch, []uint16{imx585RegOffsetL, imx585RegOffsetH}, uint32(uint16(offset)))
 }
@@ -344,13 +353,13 @@ func imx585InitFPGA(rm Regmap, subtype int) error {
 // pump. XHSStop is FPGA reg0a bit4; TriggerSignal is reg0b bit0.
 func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
-	if err := ctl.VendorCmd(0xAA); err != nil {
+	if err := ctl.VendorCmd(FX3StreamStop); err != nil {
 		return 0, err
 	}
 	if err := SetFPGABit(rm, 0x00, 0x10, true); err != nil { // FPGAStop
 		return 0, err
 	}
-	if err := ctl.VendorCmd(0xA9); err != nil {
+	if err := ctl.VendorCmd(FX3StreamStart); err != nil {
 		return 0, err
 	}
 	if err := imx585StreamStart(rm); err != nil { // 0x3004=0, 0x3000=0
@@ -368,7 +377,7 @@ func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	defer func() {
 		_ = SetFPGABit(rm, 0x00, 0x10, true) // FPGAStop: reg0 bit4
 		_ = rm.WriteReg(imx585RegStandby, 1) // standby (sensor stop)
-		_ = ctl.VendorCmd(0xAA)
+		_ = ctl.VendorCmd(FX3StreamStop)
 		_ = ctl.ResetEndpoint()
 	}()
 	_ = ctl.ResetEndpoint()

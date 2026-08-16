@@ -231,3 +231,52 @@ func TestCameraVendorCapsDispatch(t *testing.T) {
 		t.Errorf("PlayerOne OffsetRange = max %d def %d ok %v, want 2000/20", mx, df, ok)
 	}
 }
+
+// TestCameraOffsetReadsBack: Camera.Offset reports the sensor's register value (Sensor.GetOffset),
+// not the driver's cache — a change made behind the driver's back shows up, and a profile without
+// read-back falls back to the last value set.
+func TestCameraOffsetReadsBack(t *testing.T) {
+	s := Sensor{
+		Name:      "OFFRB",
+		Info:      CameraInfo{MaxWidth: 4, MaxHeight: 2, BitDepth: 12},
+		OffsetMax: 100, OffsetDef: 7,
+		SetOffset: func(rm Regmap, o int) error { return WriteRegLE(rm, 0, []uint16{0x10, 0x11}, uint32(o)) },
+		GetOffset: func(rm Regmap) (int, error) { v, err := ReadRegLE(rm, []uint16{0x10, 0x11}); return int(v), err },
+	}
+	Register(ZWO.VID, 0x0CF0, Model{Name: "OffRB", Sensor: &s})
+	st := NewStubTransport() // echoes register writes back on reads
+	c, err := Open(st, ZWO.VID, 0x0CF0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetOffset(37); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Offset(); got != 37 {
+		t.Fatalf("Offset after SetOffset(37) = %d", got)
+	}
+	// Someone else reprograms the sensor: the read-back must reflect it, not the cache.
+	if err := c.Rm().WriteReg(0x10, 0x2c); err != nil { // 300 = 0x012c
+		t.Fatal(err)
+	}
+	if err := c.Rm().WriteReg(0x11, 0x01); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Offset(); got != 300 {
+		t.Fatalf("Offset after external write = %d, want 300 (register read-back)", got)
+	}
+	// No read-back on the profile: the cached last-set value is reported.
+	noRB := s
+	noRB.GetOffset = nil
+	Register(ZWO.VID, 0x0CF1, Model{Name: "OffNoRB", Sensor: &noRB})
+	c2, err := Open(NewStubTransport(), ZWO.VID, 0x0CF1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.SetOffset(12); err != nil {
+		t.Fatal(err)
+	}
+	if got := c2.Offset(); got != 12 {
+		t.Fatalf("Offset without read-back = %d, want cached 12", got)
+	}
+}

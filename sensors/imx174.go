@@ -8,6 +8,7 @@
 //	SetCMOSClk()        (pixel clock = 0x4e20 = 20000; master 0x1220a = 74250)
 //	capture worker      (stream gate: master 0x200 = 1 stop / 0 start)
 //	reglist             (31 reg/val16 entries)
+
 package sensors
 
 import . "github.com/mikefsq/astrocam"
@@ -62,7 +63,6 @@ const (
 	// USB2/USB3 bandwidth constants below. USB2 RAW16 full-frame at FPSPercent 40 = 4337.
 	imx174ClkKHz    = 20000 // pixel clock in kHz (SetCMOSClk = 0x4e20)
 	imx174HMAXFloor = 780   // 0x30c: HMAX floor
-	imx174HMAXFull  = 4337  // 0x10f1: USB2 full-frame HMAX @ bandwidth 40 (reference)
 	imx174FPGAHMAXL = 0x13  // SetFPGAHMAX -> FPGA 0x13/0x14
 	imx174FPGAHMAXH = 0x14
 	imx174BWUSB2    = 43272000.0  // HMAXBW USB2 bandwidth const 0x4c2511d0 (universal)
@@ -71,19 +71,14 @@ const (
 
 // imx174HMAX computes the FPGA HMAX for a window from the live ReadoutMode (USB speed,
 // output depth, FPSPercent) via HMAXBW with the 174's constants. USB2 RAW16 full-frame at
-// FPSPercent=40 == imx174HMAXFull (4337).
+// FPSPercent=40 gives 4337 (0x10f1), the SDK's value.
 func imx174HMAX(rm Regmap, w, h int) uint16 {
 	return HMAXBW(w, h, imx174ClkKHz, imx174HMAXFloor, imx174VMAXOffset, imx174BWUSB2, imx174BWUSB3, ModeOf(rm))
 }
 
-// imx174LineTimeNs is the readout line time (ns) for the full-frame window: HMAX*1e6/clock.
-func imx174LineTimeNs(rm Regmap) uint64 {
-	return uint64(imx174HMAX(rm, imx174FullWidth, imx174FullHeight)) * 1_000_000 / imx174ClkKHz
-}
-
 // imx174Init is InitCamera: the 31-entry reglist (loop over 0x7c bytes; reg 0xffff =
 // InitDelayReg, delay = val ms) then the explicit WriteSONYREG tail. FPGA bringup is in
-// imx174InitFPGA; SendCMD(0xAE) is Camera-level.
+// imx174InitFPGA; the SDK's trailing SendCMD(0xAE) is not replayed.
 var imx174Init = []RegVal{
 	// --- reglist (31 entries) ---
 	{Reg: 0x200, Val: 0x01}, {Reg: 0xffff, Val: 20}, // delay 20 ms
@@ -103,6 +98,7 @@ var imx174Init = []RegVal{
 	{Reg: 0x7b1, Val: 0x26}, {Reg: 0x213, Val: 0x00},
 }
 
+// IMX174 is the Sony IMX174 global-shutter profile (ZWO ASI174 family, PlayerOne Apollo).
 var IMX174 = Sensor{
 	Name:     "IMX174", // Sony IMX174 global-shutter CMOS (mono die; MC adds a CFA)
 	GainMax:  imx174GainMax,
@@ -124,11 +120,16 @@ var IMX174 = Sensor{
 	SetGain:     imx174SetGain,
 	SetExposure: imx174SetExposure,
 	SetOffset:   imx174SetOffset,
+	GetOffset:   imx174GetOffset,
 	SetROI:      imx174SetROI,
 	StreamStop:  func(rm Regmap) error { return rm.WriteReg(imx174RegMaster, 1) }, // master stop
 	StreamStart: func(rm Regmap) error { return rm.WriteReg(imx174RegMaster, 0) }, // master start
 	Worker:      imx174Worker,
 }
+
+// errExposureAborted is returned by a capture worker when StopExposure interrupts it mid-flight,
+// so the driver can drop the discarded frame and the abort path returns promptly.
+var errExposureAborted = fmt.Errorf("exposure aborted")
 
 // imx174Worker is the host-timed single-shot capture worker. It arms the sensor, integrates
 // (host-timed only in the >4 s trigger band), reads the frame via the async windowed bulk pump,
@@ -144,12 +145,7 @@ var IMX174 = Sensor{
 //	arm:   SendCMD(0xAA)·FPGAStop·0x212=1·0x200=1·SendCMD(0xA9)·0x200=0·10ms·FPGAStart·0x212=0·50ms·0x22e=0x0a
 //	integrate: trigger band only — EnableFPGATriggerSignal(1)·poll-sleep until elapsed·(0)·release
 //	read:  ctl.BulkRead = async urb pump w/ exact-remainder tail (gets the FX3 held tail); no FPGABufReload
-//	stop:  after a good read — FPGAStop·master-stop(0x200=1)·SendCMD(0xAA): halts free-run
-//
-// errExposureAborted is returned by a capture worker when StopExposure interrupts it mid-flight,
-// so the driver can drop the discarded frame and the abort path returns promptly.
-var errExposureAborted = fmt.Errorf("exposure aborted")
-
+//	stop:  after a good read: FPGAStop·master-stop(0x200=1)·SendCMD(0xAA): halts free-run
 func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 	// FPGA reg0 bit4 = readout stop (FPGAStop/Start); reg 0x0b bit0 = the trigger signal.
@@ -173,7 +169,7 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	// re-arm (arm-2): sensor toggle + FPGAStart only.
 	armSensor := func(full bool) error {
 		if full {
-			if err := ctl.VendorCmd(0xAA); err != nil {
+			if err := ctl.VendorCmd(FX3StreamStop); err != nil {
 				return err
 			}
 			if err := fpgaStop(); err != nil {
@@ -187,7 +183,7 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 			return err
 		}
 		if full {
-			if err := ctl.VendorCmd(0xA9); err != nil {
+			if err := ctl.VendorCmd(FX3StreamStart); err != nil {
 				return err
 			}
 		}
@@ -277,7 +273,7 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		_ = rm.WriteReg(0x212, 1)
 		_ = rm.WriteReg(imx174RegMaster, 1) // sensor master stop
 		_ = fpgaStop()                      // FPGA reg0 bit4 = 1 (readout-stop)
-		_ = ctl.VendorCmd(0xAA)             // SendCMD stream-stop
+		_ = ctl.VendorCmd(FX3StreamStop)    // SendCMD stream-stop
 		_ = ctl.ResetEndpoint()
 	}()
 
@@ -315,9 +311,9 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 //	SetFPGAADCWidthOutputWidth(1, 0)   reg0xa bit0=1, bit4=0
 //	SetFPGAGain(0x80,0x80,0x80,0x80)   FPGA 0x0c-0x0f, strobed
 //
-// Camera.Init then issues SendCMD(0xAE). A second SetFPGAADCWidthOutputWidth(1, output depth)
-// follows the bank-select: outputWidth = bit-depth flag (1 for RAW16). Replicated here,
-// parameterized for RAW8.
+// The SDK then issues SendCMD(0xAE) (not replayed here) and a second
+// SetFPGAADCWidthOutputWidth(1, output depth): outputWidth = bit-depth flag (1 for RAW16).
+// The second call is replicated here, parameterized for RAW8.
 func imx174InitFPGA(rm Regmap, subtype int) error {
 	if subtype < 0x12 {
 		// Legacy <0x12 path not reproduced (this camera is >=0x12). It skips the writes
@@ -358,7 +354,7 @@ func imx174InitFPGA(rm Regmap, subtype int) error {
 	if err := rm.WriteFPGAReg(0x01, 0); err != nil {
 		return err
 	}
-	// Second SetFPGAADCWidthOutputWidth(1, output depth) after SendCMD(0xAE): output width =
+	// Second SetFPGAADCWidthOutputWidth(1, output depth) (the SDK's post-0xAE call): output width =
 	// bit depth. bit4 derived from the live ReadoutMode (1 for RAW16) so RAW8 isn't forced to
 	// 16-bit (matches imx290InitFPGA).
 	adcOut := uint16(0x01) // bit0 = adc
@@ -368,10 +364,14 @@ func imx174InitFPGA(rm Regmap, subtype int) error {
 	return FPGAWriteBits(rm, 0x0a, 0x11, adcOut)
 }
 
-// imx174SetGain — SetGain. Clamps the ASI gain to [0, 400] and writes it to the 16-bit gain
-// code 0x404/0x405 — no conversion-gain bit, no curve. Latched by 0x20c (1 before, 0 after).
 // imx174SetOffset — SetBrightness (ASI Brightness / black level): offset written 16-bit
 // little-endian to sensor 0x458 (low) / 0x459 (high), no scaling.
+// imx174GetOffset reads the offset back from 0x458 (low) / 0x459 (high).
+func imx174GetOffset(rm Regmap) (int, error) {
+	v, err := ReadRegLE(rm, []uint16{0x458, 0x459})
+	return int(v), err
+}
+
 func imx174SetOffset(rm Regmap, offset int) error {
 	v := uint16(offset)
 	if err := rm.WriteReg(0x459, (v>>8)&0xff); err != nil {
@@ -380,6 +380,8 @@ func imx174SetOffset(rm Regmap, offset int) error {
 	return rm.WriteReg(0x458, v&0xff)
 }
 
+// imx174SetGain — SetGain. Clamps the ASI gain to [0, 400] and writes it to the 16-bit gain
+// code 0x404/0x405 (no conversion-gain bit, no curve). Latched by 0x20c (1 before, 0 after).
 func imx174SetGain(rm Regmap, gain int) error {
 	if gain > imx174GainMax {
 		gain = imx174GainMax

@@ -1,7 +1,6 @@
 package astrocam
 
 import (
-	"encoding/binary"
 	"errors"
 	"strings"
 	"sync"
@@ -9,8 +8,8 @@ import (
 	"time"
 )
 
-// frameTransport records control writes (the arm sequence) and serves one
-// magic-prefixed frame from its bulk endpoint.
+// frameTransport records control writes (the arm sequence) and serves one frame from its
+// bulk endpoint.
 type frameTransport struct {
 	out   []ctrlCall
 	frame []byte
@@ -39,10 +38,9 @@ var armSensor = Sensor{
 }
 
 func TestSnapDataPlane(t *testing.T) {
-	// A 16-byte frame prefixed with the header magic.
-	frame := make([]byte, 4+16)
-	binary.LittleEndian.PutUint32(frame[:4], FrameMagic)
-	for i := 4; i < len(frame); i++ {
+	// One 16-byte frame (4×2 RAW16), validated by size.
+	frame := make([]byte, 16)
+	for i := range frame {
 		frame[i] = byte(i)
 	}
 	f := &frameTransport{frame: frame}
@@ -131,8 +129,8 @@ func (d *pqDispatchTransport) ReadFrameStreamPrequeued(buf []byte, _, _ time.Dur
 
 // TestStreamFramePrequeuedDispatch locks the capability-dispatch order of the worker read
 // primitives: StreamFramePrequeued uses the pre-queued batch when the backend has it, falls
-// back to the windowed pump, then to a plain BulkRead (finding 2.4: the free-run 462 worker
-// depends on the pre-queued path whenever the backend offers it; all in-tree backends now do).
+// back to the windowed pump, then to a plain BulkRead (the free-run 462 worker depends on the
+// pre-queued path whenever the backend offers it; all in-tree backends do).
 func TestStreamFramePrequeuedDispatch(t *testing.T) {
 	buf := make([]byte, 32)
 	cases := []struct {
@@ -166,7 +164,7 @@ func TestStreamFramePrequeuedDispatch(t *testing.T) {
 	}
 }
 
-// TestStubImplementsPrequeued pins finding 2.4's fix: every in-tree backend the free-run
+// TestStubImplementsPrequeued: every in-tree backend the free-run
 // worker can land on must offer the pre-queued read (the StreamFrame fallback idles out
 // from t0 and breaks free-run exposures ≳ the idle window). Linux/darwin/windows are
 // build-tagged; the stub is assertable everywhere.
@@ -387,7 +385,7 @@ func (d *quietDispatchTransport) BulkReadQuiet(buf []byte, _, _ time.Duration) (
 }
 
 // TestBulkReadQuietDispatch: the worker primitive routes to the transport's quiet-gated
-// read when offered and falls back to the fully-gated BulkRead otherwise (finding 3.5).
+// read when offered and falls back to the fully-gated BulkRead otherwise.
 func TestBulkReadQuietDispatch(t *testing.T) {
 	buf := make([]byte, 32)
 	q := &quietDispatchTransport{}
@@ -457,14 +455,14 @@ func (a *abortableTransport) ArmRead() {
 	}
 }
 
-// TestStopExposureBreaksBlockedRead pins the finding-1.5 contract at the Camera level:
+// TestStopExposureBreaksBlockedRead pins the abort-promptness contract at the Camera level:
 // a GetDataAfterExp blocked in a multi-second transport read must return within moments of
 // StopExposure (via ReadAborter), reporting an abort — not run out its read timeout. Also
 // asserts the ArmRead/AbortRead lifecycle: StartExposure re-arms, StopExposure aborts.
 func TestStopExposureBreaksBlockedRead(t *testing.T) {
 	at := newAbortableTransport()
-	Register(ZWO.VID, 0x00D1, Model{Name: "Abort", Sensor: &armSensor})
-	c, err := Open(at, ZWO.VID, 0x00D1)
+	Register(ZWO.VID, 0x00D3, Model{Name: "Abort", Sensor: &armSensor})
+	c, err := Open(at, ZWO.VID, 0x00D3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,5 +519,36 @@ func TestStubImplementsAbortAndQuiet(t *testing.T) {
 	st.ArmRead()
 	if n, _ := st.BulkRead(make([]byte, 8), time.Second); n != 8 {
 		t.Errorf("re-armed stub BulkRead = %d bytes, want 8", n)
+	}
+}
+
+// TestStartVideoUsesSensorArm: a profile with its own Arm hook (the DDR cameras) has StartVideo
+// run that choreography instead of the generic SendCMD/FPGA/master sequence.
+func TestStartVideoUsesSensorArm(t *testing.T) {
+	calls := 0
+	s := Sensor{
+		Name:        "ARMHOOK",
+		Info:        CameraInfo{MaxWidth: 4, MaxHeight: 2, BitDepth: 12},
+		SetExposure: func(Regmap, time.Duration) error { return nil },
+		SetROI:      func(Regmap, int, int, int, int, int) error { return nil },
+		Arm:         func(ctl WorkerCtl) error { calls++; return ctl.Rm().WriteReg(0x19e, 1) },
+	}
+	f := &frameTransport{}
+	Register(ZWO.VID, 0x00D4, Model{Name: "ArmHook", Sensor: &s})
+	c, err := Open(f, ZWO.VID, 0x00D4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.StartVideo(true); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("Sensor.Arm called %d times by StartVideo, want 1", calls)
+	}
+	// The generic arm's SendCMD stop/start must not have been issued alongside the hook.
+	for _, x := range f.out {
+		if x.bRequest == cmdStreamStop || x.bRequest == cmdStreamStart {
+			t.Fatalf("generic arm command 0x%02x issued despite Sensor.Arm: %+v", x.bRequest, f.out)
+		}
 	}
 }

@@ -334,7 +334,7 @@ static void* asi_rd_run(void* arg) {
 // rc 0 = ok; -2..-5 = setup failure (nothing in flight); -6 = transfers ABANDONED after an
 // abort: the kernel may still DMA into buf and a late completion can still be delivered
 // through a future event source on this interface (IOKit queues it on the interface's async
-// port), so the batch state is deliberately leaked and the CALLER must pin buf and poison
+// port), so the batch state is leaked on purpose and the CALLER must pin buf and poison
 // the transport.
 static int asi_read_frame_async(asicam_dev* d, void* buf, uint32_t bufSize,
                                 uint32_t chunk, uint32_t timeoutMs, uint32_t* outLen) {
@@ -926,17 +926,17 @@ import (
 	"unsafe"
 )
 
-// errClosed is returned by a transfer attempted after Close has freed the handle —
+// errClosed is returned by a transfer attempted after Close has freed the handle,
 // instead of dereferencing the dangling t.d (a SIGSEGV inside the C library).
-var errClosed = errors.New("asicam: transport closed")
+var errClosed = errors.New("astrocam: transport closed")
 
 // errTransportBroken marks a device whose aborted transfers never completed (C rc -6): the
-// kernel may still DMA into outstanding buffers, so all further I/O — including the final
-// interface release — is refused. Only unplugging the device / process exit recovers.
-var errTransportBroken = errors.New("asicam: transport broken (abandoned in-flight transfers)")
+// kernel may still DMA into outstanding buffers, so all further I/O (including the final
+// interface release) is refused. Only unplugging the device / process exit recovers.
+var errTransportBroken = errors.New("astrocam: transport broken (abandoned in-flight transfers)")
 
 // darwinLeakedIO pins Go buffers the kernel may still DMA into (a read returned rc -6):
-// they must never be reused or collected. Deliberately package-level and never cleared.
+// they must never be reused or collected. Package-level and never cleared, on purpose.
 var (
 	darwinLeakedIOMu sync.Mutex
 	darwinLeakedIO   [][]byte
@@ -956,7 +956,7 @@ type darwinDevice struct {
 	// ioMu serializes EP0 control transfers (the IOUSBLib handle isn't safe for concurrent
 	// DeviceRequestTO) and a whole-frame BulkRead, so a control transfer can't interleave with
 	// the readout and wedge the un-buffered USB2 path. ReadFrameStream (the USB3/DDR path)
-	// stays unlocked — it needs the worker's concurrent FPGABufReload. See transport_linux.go
+	// stays unlocked; it needs the worker's concurrent FPGABufReload. See transport_linux.go
 	// (usbfsDevice.ioMu) for the full rationale.
 	ioMu sync.Mutex
 
@@ -993,9 +993,10 @@ func (t *darwinDevice) forfeit(buf []byte) {
 	darwinLeakedIOMu.Unlock()
 }
 
-// OpenIOUSBHost finds the first device matching vid/pid via IOKit, opens it, and
-// claims its bulk interface. On failure it reports exactly where it stopped.
-func OpenIOUSBHost(vid, pid uint16) (*darwinDevice, error) {
+// openIOUSBHost finds the first device matching vid/pid via IOKit, opens it, and
+// claims its bulk interface (OpenHost is the public entry). On failure it reports where it
+// stopped.
+func openIOUSBHost(vid, pid uint16) (*darwinDevice, error) {
 	dev := (*C.asicam_dev)(C.calloc(1, C.size_t(unsafe.Sizeof(C.asicam_dev{}))))
 	t := &darwinDevice{d: dev}
 	if rc := C.asi_open(C.uint16_t(vid), C.uint16_t(pid), dev, &t.diag); rc != 0 {
@@ -1005,7 +1006,7 @@ func OpenIOUSBHost(vid, pid uint16) (*darwinDevice, error) {
 	return t, nil
 }
 
-// enumerateRaw lists every ZWO-VID USB device the OS sees, without opening any (the shared
+// enumerateRaw lists every USB device on vid the OS sees, without opening any (the shared
 // Enumerate filters these to known camera PIDs). It reads idProduct, locationID and the
 // cached USB product-name string straight from the IORegistry.
 func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
@@ -1013,7 +1014,7 @@ func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 	arr := make([]C.asicam_devinfo, max)
 	n := int(C.asi_enumerate(C.uint16_t(vid), &arr[0], C.int(max)))
 	if n < 0 {
-		return nil, fmt.Errorf("asicam: USB enumerate failed (rc %d)", n)
+		return nil, fmt.Errorf("astrocam: USB enumerate failed (rc %d)", n)
 	}
 	if n > max {
 		n = max // C reported more than fit; we only have the first max
@@ -1031,7 +1032,7 @@ func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 }
 
 // OpenLocation opens the camera at a specific USB location id (from a DeviceInfo) and
-// claims its bulk interface — binds the exact unit chosen from Enumerate when several
+// claims its bulk interface: it binds the exact unit chosen from Enumerate when several
 // identical cameras are attached.
 func OpenLocation(vid uint16, loc uint32) (Transport, error) {
 	dev := (*C.asicam_dev)(C.calloc(1, C.size_t(unsafe.Sizeof(C.asicam_dev{}))))
@@ -1039,12 +1040,12 @@ func OpenLocation(vid uint16, loc uint32) (Transport, error) {
 	if rc := C.asi_open_location(C.uint16_t(vid), C.uint32_t(loc), dev, &t.diag); rc != 0 {
 		C.free(unsafe.Pointer(dev))
 		if t.diag.matched == 0 {
-			return nil, fmt.Errorf("asicam: no device at USB location 0x%08x (unplugged or moved)", loc)
+			return nil, fmt.Errorf("astrocam: no device at USB location 0x%08x (unplugged or moved)", loc)
 		}
 		if kr := uint32(t.diag.openKR); kr != 0 {
-			return nil, fmt.Errorf("asicam: device at location 0x%08x found but USBDeviceOpen failed (IOReturn 0x%08x — busy/exclusively open?)", loc, kr)
+			return nil, fmt.Errorf("astrocam: device at location 0x%08x found but USBDeviceOpen failed (IOReturn 0x%08x; busy/exclusively open?)", loc, kr)
 		}
-		return nil, fmt.Errorf("asicam: device at location 0x%08x found but interface/bulk setup failed (rc %d, %d endpoints, inPipe %d)",
+		return nil, fmt.Errorf("astrocam: device at location 0x%08x found but interface/bulk setup failed (rc %d, %d endpoints, inPipe %d)",
 			loc, int(t.diag.ifaceKR), int(t.diag.numEndpoints), int(t.diag.inPipe))
 	}
 	return t, nil
@@ -1053,19 +1054,19 @@ func OpenLocation(vid uint16, loc uint32) (Transport, error) {
 func openError(vid, pid uint16, d *C.asicam_diag) error {
 	switch {
 	case d.matched == 0:
-		return fmt.Errorf("asicam: no device %04x:%04x found — not plugged in, wrong PID, or claimed by another driver before it enumerated", vid, pid)
+		return fmt.Errorf("astrocam: no device %04x:%04x found: not plugged in, wrong PID, or claimed by another driver before it enumerated", vid, pid)
 	case d.openKR != 0:
 		kr := uint32(d.openKR)
 		hint := ""
 		switch kr {
 		case kIOReturnExclusiveAccess:
-			hint = " — busy/exclusively open (another app, or a prior run that didn't Close cleanly); unplug and replug to clear"
+			hint = ": busy/exclusively open (another app, or a prior run that didn't Close cleanly); unplug and replug to clear"
 		case kIOReturnNoDevice:
-			hint = " — device went away mid-open"
+			hint = ": device went away mid-open"
 		}
-		return fmt.Errorf("asicam: %04x:%04x found but USBDeviceOpen failed (IOReturn 0x%08x)%s", vid, pid, kr, hint)
+		return fmt.Errorf("astrocam: %04x:%04x found but USBDeviceOpen failed (IOReturn 0x%08x)%s", vid, pid, kr, hint)
 	default:
-		return fmt.Errorf("asicam: %04x:%04x opened but interface/bulk setup failed (rc %d, %d endpoints, inPipe %d)",
+		return fmt.Errorf("astrocam: %04x:%04x opened but interface/bulk setup failed (rc %d, %d endpoints, inPipe %d)",
 			vid, pid, int(d.ifaceKR), int(d.numEndpoints), int(d.inPipe))
 	}
 }
@@ -1073,10 +1074,10 @@ func openError(vid, pid uint16, d *C.asicam_diag) error {
 // Describe returns the negotiated transport facts (for bring-up diagnostics).
 func (t *darwinDevice) Describe() string {
 	link := "?"
-	switch int(t.diag.inMaxPacket) {
-	case 512:
+	switch mp := int(t.diag.inMaxPacket); {
+	case mp == 512:
 		link = "USB2 HighSpeed"
-	case 1024:
+	case mp >= 1024: // 1024, or the burst-multiplied value IOUSBHost reports on SuperSpeed
 		link = "USB3 SuperSpeed"
 	}
 	return fmt.Sprintf("IOUSBHost: %d endpoints, bulk-IN pipe %d, maxPacket %d (%s)",
@@ -1106,7 +1107,7 @@ func (t *darwinDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, d
 	rc := C.asi_control(t.d, C.uint8_t(reqType), C.uint8_t(bRequest), C.uint16_t(wValue), C.uint16_t(wIndex),
 		ptr, C.uint16_t(len(data)), &done)
 	if rc != 0 {
-		return 0, fmt.Errorf("asicam: control transfer (req 0x%02x) failed", bRequest)
+		return 0, fmt.Errorf("astrocam: control transfer (req 0x%02x) failed", bRequest)
 	}
 	return int(done), nil
 }
@@ -1122,7 +1123,7 @@ func (t *darwinDevice) ControlIn(bRequest uint8, wValue, wIndex uint16, data []b
 
 // AbortRead / ArmRead implement ReadAborter (see transport.go): the Go latch handles the
 // entry fail-fast, and the C-side read_abort flag breaks a read already blocked inside a
-// cgo call — its reap loops poll the flag every ≤100 ms and abort the pipe.
+// cgo call; its reap loops poll the flag every ≤100 ms and abort the pipe.
 func (t *darwinDevice) AbortRead() {
 	t.readAborted.Store(true)
 	t.closeMu.RLock()
@@ -1173,13 +1174,13 @@ func (t *darwinDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) 
 		return int(n), errTransportBroken
 	}
 	if rc != 0 {
-		return 0, fmt.Errorf("asicam: async bulk read setup failed (rc %d)", int(rc))
+		return 0, fmt.Errorf("astrocam: async bulk read setup failed (rc %d)", int(rc))
 	}
 	if n == 0 {
 		if t.readAborted.Load() {
 			return 0, nil // aborted mid-read: a clean short prefix, not a timeout failure
 		}
-		return 0, fmt.Errorf("asicam: async bulk read got no data (timeout)")
+		return 0, fmt.Errorf("astrocam: async bulk read got no data (timeout)")
 	}
 	return int(n), nil
 }
@@ -1188,7 +1189,7 @@ func (t *darwinDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) 
 // (asi_read_frame_stream): a small window of transfers kept cycling on EP 0x81 until
 // len(buf) bytes are in, copied contiguously so a short packet at a USB burst boundary
 // can't leave a gap. idle bounds a per-completion stall (the caller recovers and reads the
-// remainder); total bounds the whole read. Returns the contiguous bytes received — which
+// remainder); total bounds the whole read. Returns the contiguous bytes received, which
 // may be < len(buf) on a stall, leaving the caller to continue into buf[n:]. Satisfies
 // FrameStreamer.
 func (t *darwinDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (int, error) {
@@ -1219,20 +1220,20 @@ func (t *darwinDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 	rc := C.asi_read_frame_stream(t.d, unsafe.Pointer(&buf[0]), C.uint32_t(len(buf)),
 		C.uint32_t(chunk), C.uint32_t(idleMs), C.uint32_t(totalMs), &n)
 	if rc == -6 {
-		// The abandoned transfers land in C-side scratch (leaked there), not buf — no pin
+		// The abandoned transfers land in C-side scratch (leaked there), not buf: no pin
 		// needed, but the pipe can no longer be trusted.
 		t.broken.Store(true)
 		return int(n), errTransportBroken
 	}
 	if rc != 0 {
-		return 0, fmt.Errorf("asicam: windowed stream read setup failed (rc %d)", int(rc))
+		return 0, fmt.Errorf("astrocam: windowed stream read setup failed (rc %d)", int(rc))
 	}
 	return int(n), nil
 }
 
 // ReadFrameStreamPrequeued reads one frame the way the ASI SDK's capture thread does
 // (PrequeuedFrameStreamer): the whole frame's transfers are queued on the pipe before the
-// frame arrives so the read overlaps the sensor readout — what a USB2 HighSpeed link needs
+// frame arrives so the read overlaps the sensor readout, which a USB2 HighSpeed link needs
 // to not shear free-run frames. `total` bounds the whole read; `idle` gates only after the
 // first byte. Holds ioMu for the whole frame (the USB2 control-interleave wedge gate), like
 // BulkRead and unlike ReadFrameStream (the USB3/DDR path that needs concurrent FPGABufReload).
@@ -1270,12 +1271,12 @@ func (t *darwinDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 		return int(n), errTransportBroken
 	}
 	if rc != 0 {
-		return 0, fmt.Errorf("asicam: prequeued frame read setup failed (rc %d)", int(rc))
+		return 0, fmt.Errorf("astrocam: prequeued frame read setup failed (rc %d)", int(rc))
 	}
 	return int(n), nil
 }
 
-// darwinStream is a resident windowed-stream session (the video/burst path) — the C
+// darwinStream is a resident windowed-stream session (the video/burst path): the C
 // pump stays primed across frames so the per-frame setup cost is paid once. Its methods
 // guard against the transport closing under them (closeMu readers), but the session itself
 // is single-consumer: Next/NextZC/Release/Close must not race each other.
@@ -1309,7 +1310,7 @@ func (t *darwinDevice) StartStream(frameBytes int, total time.Duration) (FrameSt
 	}
 	s := C.asi_stream_start(t.d, C.uint32_t(chunk), C.uint32_t(totalMs))
 	if s == nil {
-		return nil, fmt.Errorf("asicam: stream session start failed")
+		return nil, fmt.Errorf("astrocam: stream session start failed")
 	}
 	st := &darwinStream{t: t, s: s}
 	t.streamMu.Lock()
@@ -1340,7 +1341,7 @@ func (st *darwinStream) Next(buf []byte, idle time.Duration) (int, error) {
 	}
 	n := C.asi_stream_next(st.s, unsafe.Pointer(&buf[0]), C.uint32_t(len(buf)), C.uint32_t(idleMs))
 	if n < 0 {
-		return 0, fmt.Errorf("asicam: stream read hard error")
+		return 0, fmt.Errorf("astrocam: stream read hard error")
 	}
 	return int(n), nil
 }
@@ -1365,7 +1366,7 @@ func (st *darwinStream) NextZC(idle time.Duration) ([]byte, error) {
 	var p *C.char
 	n := C.asi_stream_next_zc(st.s, &p, C.uint32_t(idleMs))
 	if n < 0 {
-		return nil, fmt.Errorf("asicam: stream read hard error")
+		return nil, fmt.Errorf("astrocam: stream read hard error")
 	}
 	if n == 0 || p == nil {
 		return nil, nil // idle stall
@@ -1404,19 +1405,39 @@ func (st *darwinStream) Close() error {
 	return nil
 }
 
-// ResetEndpoint clears a stall/flushes the bulk pipe (ClearPipeStallBothEnds).
+// ResetEndpoint clears a stall/flushes the bulk pipe (ClearPipeStallBothEnds). It holds the
+// Close interlock (closeMu reader) like every other transfer, so a worker's teardown reset
+// that lands after Close returns errClosed instead of touching the freed handle. It does not
+// take ioMu.
 func (t *darwinDevice) ResetEndpoint(ep uint8) error {
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+	if t.closed {
+		return errClosed
+	}
+	if t.broken.Load() {
+		return errTransportBroken
+	}
 	if kr := C.asi_reset_pipe(t.d); kr != 0 {
-		return fmt.Errorf("asicam: clear pipe stall IOReturn 0x%08x", uint32(kr))
+		return fmt.Errorf("astrocam: clear pipe stall IOReturn 0x%08x", uint32(kr))
 	}
 	return nil
 }
 
-// ResetDevice issues a USB bus reset (DeviceResetter) — the last-resort recovery. The
-// device loses all state, so a re-Init is required after.
+// ResetDevice issues a USB bus reset (DeviceResetter), the last-resort recovery. The
+// device loses all state, so a re-Init is required after. It holds the Close interlock
+// (closeMu reader) but NOT ioMu: its job includes recovering a read that still holds ioMu.
 func (t *darwinDevice) ResetDevice() error {
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+	if t.closed {
+		return errClosed
+	}
+	if t.broken.Load() {
+		return errTransportBroken
+	}
 	if kr := C.asi_reset_device(t.d); kr != 0 {
-		return fmt.Errorf("asicam: reset device IOReturn 0x%08x", uint32(kr))
+		return fmt.Errorf("astrocam: reset device IOReturn 0x%08x", uint32(kr))
 	}
 	return nil
 }
@@ -1424,8 +1445,8 @@ func (t *darwinDevice) ResetDevice() error {
 // Close releases the IOKit interfaces and frees the handle. Takes closeMu as the writer, so
 // it blocks until every in-flight transfer has returned and no new one can start (they
 // observe closed and return errClosed). Any resident stream session still open is stopped
-// first — its pump thread and in-flight transfers reference the interface being released.
-// On a broken transport (abandoned transfers) the handle is deliberately leaked: releasing
+// first; its pump thread and in-flight transfers reference the interface being released.
+// On a broken transport (abandoned transfers) the handle is leaked: releasing
 // the interface would let IOKit complete into freed state. Idempotent.
 func (t *darwinDevice) Close() error {
 	t.closeMu.Lock()
@@ -1455,7 +1476,7 @@ func (t *darwinDevice) Close() error {
 
 // OpenHost opens the default USB backend for this platform (macOS: IOUSBHost).
 func OpenHost(vid, pid uint16) (Transport, error) {
-	d, err := OpenIOUSBHost(vid, pid)
+	d, err := openIOUSBHost(vid, pid)
 	if err != nil {
 		return nil, err
 	}

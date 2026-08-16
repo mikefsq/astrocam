@@ -15,7 +15,7 @@ type fakeCtl struct {
 }
 
 func (f *fakeCtl) Rm() Regmap                                        { return f.rm }
-func (f *fakeCtl) VendorCmd(uint8) error                             { return nil }
+func (f *fakeCtl) VendorCmd(FX3Op) error                             { return nil }
 func (f *fakeCtl) ResetEndpoint() error                              { return nil }
 func (f *fakeCtl) ResetDevice() error                                { return nil }
 func (f *fakeCtl) NoteStall()                                        {}
@@ -83,7 +83,7 @@ func (s *scriptCtl) Rm() Regmap {
 	}
 	return s.rm
 }
-func (s *scriptCtl) VendorCmd(uint8) error { return nil }
+func (s *scriptCtl) VendorCmd(FX3Op) error { return nil }
 func (s *scriptCtl) ResetEndpoint() error  { s.resetEP++; return nil }
 func (s *scriptCtl) ResetDevice() error    { s.resetDev++; return nil }
 func (s *scriptCtl) NoteStall()            { s.stalls++ }
@@ -197,7 +197,7 @@ func TestIMX462WorkerGivesUp(t *testing.T) {
 	}
 }
 
-// TestIMX462WorkerTriggerBandReintegrates locks finding 2.8: in the >= 1 s trigger band, a
+// TestIMX462WorkerTriggerBandReintegrates: in the >= 1 s trigger band, a
 // ResetDevice recovery must re-run the trigger cycle — the re-armed FPGA is back in wait
 // mode, and without a fresh trigger edge (reg 0x0b bit0 on->off) the frame can never arrive.
 func TestIMX462WorkerTriggerBandReintegrates(t *testing.T) {
@@ -248,7 +248,7 @@ func TestIMX290WorkerAbortMapsCleanly(t *testing.T) {
 	}
 }
 
-// TestIMX174WorkerQuietWindow pins the finding-3.5 wiring: in the sensor-timed (≤4 s)
+// TestIMX174WorkerQuietWindow pins the quiet-window wiring: in the sensor-timed (≤4 s)
 // bands the read spans the integration, so the worker must declare quiet = exposure−500 ms
 // (clamped at 0) to BulkReadQuiet; the >4 s trigger band integrates BEFORE the read, so its
 // quiet is 0 (the read is pure readout and keeps the full wedge gate).
@@ -282,7 +282,7 @@ func (r *reg23Regmap) ReadFPGAReg(reg uint16) (uint16, error) {
 	return 0, nil
 }
 
-// TestIMX290WorkerRetryShortFrame locks the 2.13 fix: a transient short read (the observed
+// TestIMX290WorkerRetryShortFrame: a transient short read (the observed
 // tiny-ROI 960/38400 shape) is retried after a ResetEndpoint and the next full read succeeds.
 func TestIMX290WorkerRetryShortFrame(t *testing.T) {
 	const fb = 38400
@@ -355,7 +355,7 @@ func TestIMX290WorkerTriggerReload(t *testing.T) {
 	}
 }
 
-// TestWorkerReadClamp locks finding 2.11: a caller buffer larger than the frame must not
+// TestWorkerReadClamp: a caller buffer larger than the frame must not
 // widen the wire read — the objects' WorkingFuncs read EXACTLY the frame byte count, and an
 // oversized read runs into the next free-run frame or times out short.
 func TestWorkerReadClamp(t *testing.T) {

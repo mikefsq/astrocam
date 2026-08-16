@@ -7,12 +7,11 @@ import (
 	. "github.com/mikefsq/astrocam"
 )
 
-// fakeRegmap records register writes so a sensor profile's encoding can be
-// asserted without any transport.
-// fakeRegmap records sensor-bus writes (WriteReg/WriteRegBits) and FPGA-bus writes
-// (WriteFPGAReg) in SEPARATE logs — they are distinct register spaces on hardware, and
-// merging them lets the FX3 reg-1 commit strobe (FPGAWrite16) collide with a sensor reg
-// 0x0001. Use last(f.writes) for sensor regs and last(f.fpgaWrites) for FPGA regs.
+// fakeRegmap records register writes so a sensor profile's encoding can be asserted without any
+// transport. Sensor-bus writes (WriteReg/WriteRegBits) and FPGA-bus writes (WriteFPGAReg) go to
+// SEPARATE logs: they are distinct register spaces on hardware, and merging them lets the FX3
+// reg-1 commit strobe (FPGAWrite16) collide with a sensor reg 0x0001. Use lastVals(f.writes)
+// for sensor regs and lastVals(f.fpgaWrites) for FPGA regs.
 type fakeRegmap struct {
 	writes     []RegVal // sensor bus (WriteSONYREG / camera-reg)
 	fpgaWrites []RegVal // FPGA bus (WriteFPGAREG)
@@ -71,11 +70,7 @@ func TestIMX174Gain(t *testing.T) {
 	}
 }
 
-// TestIMX455Exposure2s locks the trigger-mode exposure (SetExp) to the
-// SDK USB capture: a 2 s exposure (>= 1 s) must enter wait+trigger mode (FPGA reg0 bit6
-// 0x40 + bit7 0x80), hold VMAX at one frame = 0x0019c0 = 6592 (NOT exposure/line_time =
-// 26400, the prior ~4× bug), and write SHS = 10. The integration itself is host-timed.
-// TestIMX178Exposure locks the corrected IMX178 exposure path: a BAKED HMAX of 420
+// TestIMX178Exposure locks the IMX178 exposure path: a BAKED HMAX of 420
 // (line_time = 420·1e6/27000 = 15555 ns), VMAX = height+29, SHS = height+29−lines.
 // A 10 ms exposure stays within one frame; a 2 s exposure trips FPGA trigger mode.
 func TestIMX178Exposure(t *testing.T) {
@@ -197,6 +192,10 @@ func TestIMX585Exposure(t *testing.T) {
 	}
 }
 
+// TestIMX455Exposure2s locks the trigger-mode exposure (SetExp) to the SDK USB capture: a 2 s
+// exposure (>= 1 s) must enter wait+trigger mode (FPGA reg0 bit6 0x40 + bit7 0x80), hold VMAX
+// at one frame = 0x0019c0 = 6592 (not exposure/line_time = 26400), and write SHS = 10. The
+// integration itself is host-timed.
 func TestIMX455Exposure2s(t *testing.T) {
 	f := &fakeRegmap{}
 	if err := IMX455.SetExposure(f, 2*time.Second); err != nil {
@@ -224,6 +223,47 @@ func TestIMX455Exposure2s(t *testing.T) {
 	}
 	if !sawWait || !sawTrig {
 		t.Errorf("mode bits: wait=%v trigger=%v (want both); reg0 writes=%v", sawWait, sawTrig, reg0)
+	}
+}
+
+// TestIMX571Exposure2s locks the 571's trigger-mode exposure to the IMX455 shape it tracks: a
+// 2 s exposure enters wait+trigger mode (reg0 bit6+bit7), holds VMAX at ONE frame — bin 1:
+// (frameUs+10ms)/line+20 with frameUs = (48+4168)·67.5 µs → 4384 = 0x001120, NOT the exposure
+// line count (~29630) — and writes SHS = 20>>1 = 10 to 0x18/0x19. A 10 ms exposure stays in
+// free-run: default VMAX 4216 = 0x001078, SHS = (4216−1−148)>>1 = 2033 = 0x07f1.
+func TestIMX571Exposure2s(t *testing.T) {
+	f := &fakeRegmap{}
+	if err := IMX571.SetExposure(f, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	sens, fpga := lastVals(f.writes), lastVals(f.fpgaWrites)
+	if fpga[0x10] != 0x20 || fpga[0x11] != 0x11 || fpga[0x12] != 0x00 {
+		t.Errorf("VMAX = %02x/%02x/%02x, want 20/11/00 (4384, one frame)", fpga[0x10], fpga[0x11], fpga[0x12])
+	}
+	if sens[0x18] != 0x0a || sens[0x19] != 0x00 {
+		t.Errorf("SHS = %02x/%02x, want 0a/00 (20>>1)", sens[0x18], sens[0x19])
+	}
+	var sawWait, sawTrig bool
+	for _, w := range f.fpgaWrites {
+		if w.Reg == 0x00 {
+			sawWait = sawWait || w.Val&0x40 != 0
+			sawTrig = sawTrig || w.Val&0x80 != 0
+		}
+	}
+	if !sawWait || !sawTrig {
+		t.Errorf("mode bits: wait=%v trigger=%v (want both)", sawWait, sawTrig)
+	}
+
+	g := &fakeRegmap{}
+	if err := IMX571.SetExposure(g, 10*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	sens, fpga = lastVals(g.writes), lastVals(g.fpgaWrites)
+	if fpga[0x10] != 0x78 || fpga[0x11] != 0x10 || fpga[0x12] != 0x00 {
+		t.Errorf("free-run VMAX = %02x/%02x/%02x, want 78/10/00 (4216)", fpga[0x10], fpga[0x11], fpga[0x12])
+	}
+	if sens[0x18] != 0xf1 || sens[0x19] != 0x07 {
+		t.Errorf("free-run SHS = %02x/%02x, want f1/07 (2033)", sens[0x18], sens[0x19])
 	}
 }
 
@@ -619,8 +659,7 @@ func TestVendorOffsetDispatch(t *testing.T) {
 }
 
 // TestVendorGainDispatch confirms gain dispatch is wired and vendor-agnostic: ZWO drives its
-// encoding, an unknown vendor errors, and the PlayerOne arm routes per die (the IMX455 body is
-// decoded and works; the IMX571 body is still a stub and errors).
+// encoding, an unknown vendor errors, and the PlayerOne arm works for both dies.
 func TestVendorGainDispatch(t *testing.T) {
 	for _, s := range []Sensor{IMX455, IMX571} {
 		if err := s.SetGain(&fakeRegmap{vid: ZWO.VID}, 100); err != nil {
@@ -660,7 +699,7 @@ func TestVendorCaps(t *testing.T) {
 		vid              uint16
 		omin, omax, odef int
 	}{
-		{IMX455, ZWO.VID, 0, 200, 1},
+		{IMX455, ZWO.VID, 0, 200, 50},
 		{IMX455, POA.VID, 0, 2000, 20},
 		{IMX571, ZWO.VID, 0, 240, 1},
 		{IMX571, POA.VID, 0, 2000, 20},
@@ -822,7 +861,7 @@ func (m *modeRegmap) ReadReg(reg uint16) (uint16, error) {
 }
 
 // clockSelCase runs one profile op and asserts the FINAL 0x3009 value — the clock/FRSEL
-// select the tail SetCMOSClk write (REVIEW 2.6) must leave: FRSEL 0x01 for the 12-bit
+// select the tail SetCMOSClk write must leave: FRSEL 0x01 for the 12-bit
 // normal clock, 0x00 for 10-bit high-speed, preserving the conversion-gain bit 0x10.
 func clockSelCase(t *testing.T, name string, highSpeed bool, hcgIn uint16, want uint16, op func(rm Regmap) error) {
 	t.Helper()
@@ -857,4 +896,66 @@ func TestIMX290ClockSelect(t *testing.T) {
 	clockSelCase(t, "SetExposure highspeed+HCG", true, 0x10, 0x10, exp)
 	clockSelCase(t, "SetROI normal", false, 0x00, 0x01, roi)
 	clockSelCase(t, "SetROI highspeed", true, 0x00, 0x00, roi)
+}
+
+// TestIMX455ADCBitFollowsTable locks SetOutput16Bits: FPGA reg 0xa bit0 (ADC_BIT) is 1 for the
+// 16-bit readout table and 0 for the 12-bit tables (high-speed at bin 1, hardware bin 2/4), with
+// bit4 = RAW16. Wire-checked on the ASI6200MC: ADC_BIT left at 1 on a 12-bit table delivers
+// unreadable frames; the SDK's high-speed RAW8 clears it.
+func TestIMX455ADCBitFollowsTable(t *testing.T) {
+	cases := []struct {
+		name  string
+		hs    bool
+		bpp   int
+		bin   int
+		w, h  int
+		want  uint16 // reg 0xa bits {4,0}
+		table uint16 // reg 0x0001 of the selected table
+	}{
+		{"bin1 RAW16", false, 2, 1, 9576, 6388, 0x11, 0x00},
+		{"bin1 RAW8", false, 1, 1, 9576, 6388, 0x01, 0x00},
+		{"bin1 RAW8 high-speed", true, 1, 1, 9576, 6388, 0x00, 0x80},
+		{"bin2 RAW8", false, 1, 2, 4788, 3194, 0x00, 0x85},
+	}
+	for _, c := range cases {
+		rm := &modeRegmap{mode: ReadoutMode{HighSpeed: c.hs, BytesPerPx: c.bpp, Bin: c.bin}, regVals: map[uint16]uint16{}}
+		if err := IMX455.SetROI(rm, 0, 0, c.w, c.h, c.bin); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got := lastVals(rm.fpgaWrites)[0x0a] & 0x11; got != c.want {
+			t.Errorf("%s: FPGA reg 0xa bits{4,0} = 0x%02x, want 0x%02x", c.name, got, c.want)
+		}
+		if got := lastVals(rm.writes)[0x0001]; got != c.table {
+			t.Errorf("%s: mode table reg 0x0001 = 0x%02x, want 0x%02x", c.name, got, c.table)
+		}
+	}
+}
+
+// TestGetOffsetRoundTrip: every profile's GetOffset reads back what SetOffset programmed, in the
+// same units, for the ZWO scale (and PlayerOne on the shared dies).
+func TestGetOffsetRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		s   Sensor
+		vid uint16
+	}{
+		{IMX174, ZWO.VID}, {IMX178, ZWO.VID}, {IMX290, ZWO.VID}, {IMX462, ZWO.VID}, {IMX585, ZWO.VID},
+		{IMX455, ZWO.VID}, {IMX455, POA.VID}, {IMX571, ZWO.VID}, {IMX571, POA.VID},
+	} {
+		for _, off := range []int{0, 1, 30, 50, 100} {
+			rm := &modeRegmap{fakeRegmap: fakeRegmap{vid: tc.vid}, mode: ReadoutMode{BytesPerPx: 2, Bin: 1}, regVals: map[uint16]uint16{}}
+			if err := tc.s.SetOffset(rm, off); err != nil {
+				t.Fatalf("%s/%#x SetOffset(%d): %v", tc.s.Name, tc.vid, off, err)
+			}
+			for r, v := range lastVals(rm.writes) { // the sensor now holds what was written
+				rm.regVals[r] = v
+			}
+			got, err := tc.s.GetOffset(rm)
+			if err != nil {
+				t.Fatalf("%s/%#x GetOffset: %v", tc.s.Name, tc.vid, err)
+			}
+			if got != off {
+				t.Errorf("%s/%#x: SetOffset(%d) reads back %d", tc.s.Name, tc.vid, off, got)
+			}
+		}
+	}
 }

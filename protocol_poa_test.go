@@ -115,3 +115,62 @@ func TestPOAVendorRegistered(t *testing.T) {
 		t.Errorf("poaRegmap live mode Bin = %d, want 2", got)
 	}
 }
+
+// TestPOACmdsNotDecoded: with an empty FX3 command table the Camera must refuse to drive a
+// PlayerOne body with ZWO's opcodes. Init errors before any vendor command, FirmwareVersion /
+// SerialNumber / ReadSPIFlash error, and the transport log carries none of ZWO's 0xAA/0xA9/
+// 0xAF/0xBE/0xC3/0xAD/0xC8 requests. The ZWO table itself carries the known opcodes.
+func TestPOACmdsNotDecoded(t *testing.T) {
+	if z := ZWO.Cmds; z.StreamStop != 0xAA || z.StreamStart != 0xA9 || z.Flush != 0xAF ||
+		z.EnableGPIF32DQ != 0xBE || z.ReadSPIFlash != 0xC3 || z.FirmwareVersion != 0xAD || z.SerialNumber != 0xC8 ||
+		z.ST4On != 0xB0 || z.ST4Off != 0xB1 || z.ReadTemp != 0xB3 || z.ReadHumidity != 0x85 || z.ReadHumidityWValue != 0xF5 {
+		t.Fatalf("ZWO.Cmds = %+v, want the decoded ZWO opcodes", z)
+	}
+	if POA.Cmds != (FX3Cmds{}) {
+		t.Fatalf("POA.Cmds = %+v, want zero (not decoded)", POA.Cmds)
+	}
+	s := Sensor{
+		Name: "POAINIT",
+		Info: CameraInfo{MaxWidth: 4, MaxHeight: 2, BitDepth: 12},
+		Init: []RegVal{{Reg: 0x3000, Val: 1}},
+	}
+	Register(POA.VID, 0x0CE2, Model{Name: "poa-init", Sensor: &s})
+	st := NewStubTransport()
+	c, err := Open(st, POA.VID, 0x0CE2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Init(); err == nil {
+		t.Error("Init on a vendor with no FX3 commands decoded succeeded, want an error")
+	}
+	if _, err := c.FirmwareVersion(); err == nil {
+		t.Error("FirmwareVersion succeeded, want a not-decoded error")
+	}
+	if _, err := c.SerialNumber(); err == nil {
+		t.Error("SerialNumber succeeded, want a not-decoded error")
+	}
+	if _, err := c.ReadSPIFlash(FlashHPCMapAddr, 16); err == nil {
+		t.Error("ReadSPIFlash succeeded, want a not-decoded error")
+	}
+	if err := c.VendorCmd(FX3StreamStop); err == nil {
+		t.Error("VendorCmd(FX3StreamStop) succeeded, want a not-decoded error")
+	}
+	// ST4 and thermal: 0xB0/0xB3 are PlayerOne's sensor-register write/CrypWrite opcodes, so a
+	// ZWO-literal pulse or temperature read would land as a sensor register write on a POA body.
+	if err := c.PulseGuideOn(GuideNorth); err == nil {
+		t.Error("PulseGuideOn succeeded, want a not-decoded error")
+	}
+	th := c.HardwareThermal()
+	if _, err := th.ReadTemp(); err == nil {
+		t.Error("ReadTemp succeeded, want a not-decoded error")
+	}
+	if _, err := th.ReadHumidity(); err == nil {
+		t.Error("ReadHumidity succeeded, want a not-decoded error")
+	}
+	for _, x := range st.Log {
+		switch x.BRequest {
+		case 0xAA, 0xA9, 0xAF, 0xBE, 0xC3, 0xAD, 0xC8, 0xB0, 0xB1, 0xB3, 0x85:
+			t.Errorf("ZWO opcode 0x%02x sent to a PlayerOne camera: %+v", x.BRequest, x)
+		}
+	}
+}

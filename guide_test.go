@@ -64,10 +64,10 @@ func (p *pulseRecorder) ControlOutUngated(bRequest uint8, wValue, wIndex uint16)
 }
 
 // TestPulseGuideUngatedDispatch: the ST4 commands route through UngatedControlSender when
-// the transport offers it (REVIEW 4.3 — a pulse edge must not queue behind ioMu).
+// the transport offers it (a pulse edge must not queue behind ioMu).
 func TestPulseGuideUngatedDispatch(t *testing.T) {
 	p := &pulseRecorder{}
-	c := &Camera{t: p}
+	c := &Camera{t: p, vend: ZWO}
 	if err := c.PulseGuide(GuideNorth, time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestPulseGuideUngatedDispatch(t *testing.T) {
 
 // TestIsPulseGuiding: line-state and in-flight-pulse tracking back ASCOM IsPulseGuiding.
 func TestIsPulseGuiding(t *testing.T) {
-	c := &Camera{t: NewStubTransport()}
+	c := &Camera{t: NewStubTransport(), vend: ZWO}
 	if c.IsPulseGuiding() {
 		t.Fatal("idle camera reports pulse guiding")
 	}

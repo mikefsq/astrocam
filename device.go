@@ -7,20 +7,17 @@ import (
 
 // DeviceInfo describes one attached camera discovered on the USB bus without opening it:
 // VID/PID, the USB product-name string, and a platform location id. The factory serial is
-// absent (no USB serial-number descriptor; reading it means opening the device — see
+// absent (no USB serial-number descriptor; reading it means opening the device, see
 // OpenSerial / Camera.SerialNumber).
 type DeviceInfo struct {
 	VID, PID uint16
 	Name     string // USB product-name string, e.g. "ASI6200MC Pro"
-	Location uint32 // platform USB location id — stable per physical port; pass to OpenLocation
+	Location uint32 // platform USB location id, stable per physical port; pass to OpenLocation
 }
 
 func (d DeviceInfo) String() string {
 	return fmt.Sprintf("%04x:%04x %-16q loc=0x%08x", d.VID, d.PID, d.Name, d.Location)
 }
-
-// errEnumUnsupported is returned by the not-yet-implemented platform backends.
-var errEnumUnsupported = errors.New("asicam: USB enumeration not implemented on this platform yet")
 
 // Enumerate lists attached cameras (across every known vendor VID) that map to a registered
 // camera model, without opening any of them. Devices that share a vendor id but aren't
@@ -62,18 +59,22 @@ func filterCameras(raw []DeviceInfo) []DeviceInfo {
 	return out
 }
 
-// readSerial reads the 8-byte factory serial off a Transport (the 0xC8 vendor-IN) without
-// binding a full Camera.
-func readSerial(t Transport) (Serial, error) {
+// readSerial reads the 8-byte factory serial off a Transport (the vendor's SerialNumber
+// request, 0xC8 on ZWO) without binding a full Camera.
+func readSerial(t Transport, vid uint16) (Serial, error) {
+	v, ok := VendorOf(vid)
+	if !ok || v.Cmds.SerialNumber == 0 {
+		return Serial{}, fmt.Errorf("astrocam: serial-number request not decoded for VID 0x%04x", vid)
+	}
 	var s Serial
-	if _, err := t.ControlIn(reqSerialNumber, 0, 0, s[:]); err != nil {
+	if _, err := t.ControlIn(v.Cmds.SerialNumber, 0, 0, s[:]); err != nil {
 		return Serial{}, err
 	}
 	return s, nil
 }
 
 // OpenSerial finds and opens the attached camera whose factory serial matches (hex, as
-// Serial.String renders it) — the stable per-unit key, since bus locations move on replug.
+// Serial.String renders it), the stable per-unit key, since bus locations move on replug.
 // It enumerates, opens each candidate by location, reads its serial, and returns the match
 // (closing the others). Errors if no attached camera has that serial.
 func OpenSerial(serial string) (Transport, DeviceInfo, error) {
@@ -84,12 +85,12 @@ func OpenSerial(serial string) (Transport, DeviceInfo, error) {
 	for _, d := range devs {
 		t, err := OpenLocation(d.VID, d.Location)
 		if err != nil {
-			continue // busy or vanished — try the next candidate
+			continue // busy or vanished: try the next candidate
 		}
-		if sn, err := readSerial(t); err == nil && sn.String() == serial {
+		if sn, err := readSerial(t, d.VID); err == nil && sn.String() == serial {
 			return t, d, nil
 		}
 		t.Close()
 	}
-	return nil, DeviceInfo{}, fmt.Errorf("asicam: no attached camera with serial %s", serial)
+	return nil, DeviceInfo{}, fmt.Errorf("astrocam: no attached camera with serial %s", serial)
 }

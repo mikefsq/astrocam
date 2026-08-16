@@ -63,7 +63,7 @@ func TestIoMuDiscipline(t *testing.T) {
 			_, _ = d.ReadFrameStreamPrequeued(buf, 100*time.Millisecond, time.Second)
 		}},
 		// CLEAR_HALT is EP0 traffic: it must not land mid-readout any more than a
-		// register read may (REVIEW 3.1).
+		// register read may.
 		{"ResetEndpoint", func(d *usbfsDevice) { _ = d.ResetEndpoint(bulkEndpoint) }},
 	}
 	for _, g := range guarded {
@@ -91,7 +91,7 @@ func TestIoMuDiscipline(t *testing.T) {
 			_ = d.ResetDevice()
 		}},
 		// ST4 pulse edges must land mid-readout (the SDK issues them concurrently with its
-		// capture thread); a gated pulse-off stretches a guide correction (REVIEW 4.3).
+		// capture thread); a gated pulse-off stretches a guide correction.
 		{"ControlOutUngated", "ST4 pulse edges must not queue behind a frame read", func(d *usbfsDevice) {
 			_ = d.ControlOutUngated(0xB0, 0, 0)
 		}},

@@ -96,7 +96,7 @@ func (r *poaRegmap) WriteRegBits(reg uint16, lo, hi uint8, val uint16) error {
 }
 
 // WriteFPGAReg writes a camera-FPGA register (Fx3FpgaWrite 0xC0; reg in wIndex, value in
-// wValue). val is transmitted as given — FPGA regs are byte-wide and every in-tree caller
+// wValue). val is transmitted as given: FPGA regs are byte-wide and every in-tree caller
 // pre-masks to the low byte (same convention as the ZWO dialect); what an over-byte wValue
 // does on the POA wire is unverified.
 func (r *poaRegmap) WriteFPGAReg(reg, val uint16) error {
@@ -117,11 +117,11 @@ func (r *poaRegmap) ReadFPGAReg(reg uint16) (uint16, error) {
 }
 
 // POA is the vendor descriptor for PlayerOne Astronomy cameras (USB VID 0xA0A0). Its
-// Regmap dialect is defined above. Registered at init.
-//
-// NOTE: PlayerOne product rows (PID -> sensor) are not yet registered. The PlayerOne SDK
-// carries no static PID->sensor table (it reads sensor identity from the opened device at
-// runtime), so per-product PIDs must be captured from hardware before enumeration works.
+// Regmap dialect is defined above. Registered at init; the product rows (PID -> sensor) are
+// registered by the sensors package. No PlayerOne camera has been driven on hardware yet, and
+// its FX3 vendor commands (stream stop/start/flush, GPIF bus, flash read, firmware, serial)
+// are not decoded: Cmds is zero, so Camera.Init, ReadSPIFlash, FirmwareVersion and
+// SerialNumber return "not decoded" errors instead of sending ZWO's opcodes.
 var POA = &Vendor{
 	VID:  0xA0A0,
 	Name: "PlayerOne",

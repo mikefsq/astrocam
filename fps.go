@@ -7,7 +7,7 @@ package astrocam
 // ReadoutMode is the runtime readout context the FPS/line-time math needs (USB link speed,
 // output depth, frame-rate setting). Not sensor-die facts; supplied by the Camera.
 type ReadoutMode struct {
-	USB3       bool // negotiated link speed (Model.USB3) — selects the bandwidth budget
+	USB3       bool // negotiated link speed (Model.USB3); selects the bandwidth budget
 	BytesPerPx int  // output bytes/pixel: 2 = RAW16, 1 = RAW8
 	FPSPercent int  // requested frame-rate percentage, clamped to 40..100 by the FPS-percent throttle
 	Bin        int  // symmetric binning factor; 0 normalized to 1
@@ -52,8 +52,8 @@ func (m ReadoutMode) norm() ReadoutMode {
 // camera; bwUSB3 varies per camera (290 0x4dac0098, 455 0x4db9f76c, 174 0x4db79512), so
 // when it matters pass the sensor's own via HMAXBW.
 const (
-	bwUSB2 = 43272000.0  // float32(0x4c2511d0); ~43 MB/s (USB2 HighSpeed) — universal
-	bwUSB3 = 360715008.0 // float32(0x4dac0098); ~360 MB/s (USB3) — IMX290's; per-camera
+	bwUSB2 = 43272000.0  // float32(0x4c2511d0); ~43 MB/s (USB2 HighSpeed); universal
+	bwUSB3 = 360715008.0 // float32(0x4dac0098); ~360 MB/s (USB3); IMX290's, per-camera
 )
 
 // HMAX computes the per-line readout period, which doubles as the line-time numerator
@@ -92,8 +92,8 @@ func HMAXBW(w, h, clock, floor, vblankAdd int, bw2, bw3 float64, m ReadoutMode) 
 	return uint16(hm)
 }
 
-// The ASI SDK's SetFPSPerc computes exactly HMAXBW: candidate from the link-switched bandwidth
-// (MAX_DATASIZE global, written by SetOutput16Bits: USB3→360715, USB2→43272 — ×10×100 = the
+// The ASI SDK's SetFPSPerc computes the same formula as HMAXBW: candidate from the link-switched bandwidth
+// (MAX_DATASIZE global, written by SetOutput16Bits: USB3→360715, USB2→43272; ×10×100 = the
 // bw3/bw2 constants here), clamped up to REG_FRAME_LENGTH_PKG_MIN, then derated ×100/FPSPercent.
 // On USB3 the floor usually dominates (462 full-frame candidate ≈196 < its 261 floor); on USB2 the
 // candidate dominates (462 full-frame 1634 → wire-confirmed HMAX 4085 at pct=40) and pins the
@@ -120,7 +120,7 @@ func ModeOf(rm Regmap) ReadoutMode {
 }
 
 // FPGA register numbers (the wValue passed to WriteFPGAREG 0xBD). Shared by every
-// camera — not per-sensor.
+// camera, not per-sensor.
 const (
 	fpgaStrobe  = 0x01 // reg-1 commit strobe (1 before a group, 0 after); all setters
 	fpgaHBLK0   = 0x02 // SetFPGAHBLK  lo
@@ -136,7 +136,7 @@ const (
 )
 
 // FPGAWrite16 writes a 16-bit value little-endian to an FPGA register pair, bracketed
-// by the FX3 reg-1 commit strobe (1 then 0) — the form every SetFPGA{HBLK,VBLK,Width,
+// by the FX3 reg-1 commit strobe (1 then 0), the form every SetFPGA{HBLK,VBLK,Width,
 // Height,HMAX} setter takes. The strobe is released even when a data write errors (a held
 // strobe gates every later FPGA group commit); the first error wins.
 func FPGAWrite16(rm Regmap, loReg, hiReg, val uint16) (err error) {
@@ -160,14 +160,15 @@ func FPGAWrite16(rm Regmap, loReg, hiReg, val uint16) (err error) {
 func SetFPGAHBLK(rm Regmap, hblk uint16) error { return FPGAWrite16(rm, fpgaHBLK0, fpgaHBLK1, hblk) }
 func SetFPGAVBLK(rm Regmap, vblk uint16) error { return FPGAWrite16(rm, fpgaVBLK0, fpgaVBLK1, vblk) }
 
-// SetFPGAOutputWidth programs the FX3 output bit width: FPGA reg 0xa bit0 = ADC enable
-// (always 1), bit4 = output width (1 = 16-bit RAW16, 0 = 8-bit RAW8).
+// SetFPGAOutputWidth programs the FX3 output bit width: FPGA reg 0xa bit4 = output width
+// (1 = 16-bit RAW16, 0 = 8-bit RAW8). Bit0 (ADC_BIT, the readout ADC width) belongs to the
+// sensor profile (its InitFPGA/SetROI choose it per readout mode) and is left untouched.
 func SetFPGAOutputWidth(rm Regmap, raw16 bool) error {
-	v := uint16(0x01) // bit0 = ADC
+	v := uint16(0)
 	if raw16 {
-		v |= 0x10 // bit4 = 1 → 16-bit output
+		v = 0x10 // bit4 = 1 → 16-bit output
 	}
-	return FPGAWriteBits(rm, 0x0a, 0x11, v)
+	return FPGAWriteBits(rm, 0x0a, 0x10, v)
 }
 
 // SetFPGABinDataLen programs the per-frame DMA word count: a 32-bit little-endian value to

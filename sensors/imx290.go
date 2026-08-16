@@ -1,11 +1,13 @@
-// Captures full 1936×1096 16-bit frames. At 0.2 s the driver writes HMAX 0x0662 / VMAX
-// 0x0008e0 / SHS 1 / gain 0. The ≥1 s FPGA trigger-mode band (reg0 bit7) is required —
-// without it the free-running sensor delivers a partial frame caught mid-readout.
+// IMX290: captures full 1936×1096 16-bit frames. At 0.2 s the driver writes HMAX 0x0662 / VMAX
+// 0x0008e0 / SHS 1 / gain 0. The ≥1 s FPGA trigger-mode band (reg0 bit7) is required; without
+// it the free-running sensor delivers a partial frame caught mid-readout.
 //
 // Unverified: absolute exposure-time accuracy; the HMAX floor (not exercised at full-frame,
-// which is bandwidth-limited); the high-speed and binned readout modes. Every captured frame
-// carries a 4-byte "7e 5a 01 00" start marker that capture.go does not strip (it searches for
-// 0xBB00AA11) — likely this camera's frame header.
+// which is bandwidth-limited); the high-speed and binned readout modes. Captured frames were
+// observed to start with a 4-byte "7e 5a 01 00" word, the FX3 DDR frame marker that
+// repairFX3DMAMarkers (capture.go) edge-replicates on sensors with FX3DMAMarkers set; the 290
+// profile leaves that flag off pending confirmation.
+
 package sensors
 
 import . "github.com/mikefsq/astrocam"
@@ -88,8 +90,9 @@ const (
 // after the table loop.
 //
 // FPGA-side bringup (FPGAReset, 20 ms delay, SetFPGAAsMaster/FPGAStop/EnableFPGADDR/
-// SetFPGAADCWidthOutputWidth/SetFPGAGain) is in imx290InitFPGA. The mid-init SendCMD(0xAF) and
-// trailing SendCMD(0xAE) bank-select are Camera-level (Camera.Init around InitFPGA).
+// SetFPGAADCWidthOutputWidth/SetFPGAGain) is in imx290InitFPGA. The SDK's mid-init SendCMD(0xAF)
+// and trailing SendCMD(0xAE) bank-select are not replayed (Camera.Init sends 0xAF once, as the
+// up-front quiesce).
 var imx290Init = []RegVal{
 	// --- reglist table: verbatim reg/val16 pairs, 47 entries in file order. Opaque Sony
 	// PLL/analog settings. reg 0xffff = InitDelayReg sentinel (delay = val ms). ---
@@ -116,11 +119,12 @@ var imx290Init = []RegVal{
 	{Reg: 0x3005, Val: 0x01}, // ADBIT = 12-bit
 	{Reg: 0x303a, Val: 0x08},
 	{Reg: 0x3007, Val: 0x40}, // WINMODE
-	// (FPGAReset + 20 ms + SendCMD(0xAF) happen here — see imx290InitFPGA / Camera.Init)
+	// (FPGAReset + 20 ms happen here, see imx290InitFPGA; the SDK's SendCMD(0xAF) is not replayed)
 	{Reg: 0x3002, Val: 0x01}, // XMSTA master stop during init
 	{Reg: 0x304b, Val: 0x00},
 }
 
+// IMX290 is the Sony IMX290 STARVIS profile (ZWO ASI290 family).
 var IMX290 = Sensor{
 	Name:     "IMX290", // ASI290 family; Sony IMX290 STARVIS (mono die; MC adds a CFA)
 	GainMax:  imx290GainMax,
@@ -142,6 +146,7 @@ var IMX290 = Sensor{
 	SetGain:     imx290SetGain,
 	SetExposure: imx290SetExposure,
 	SetOffset:   imx290SetOffset,
+	GetOffset:   imx290GetOffset,
 	SetROI:      imx290SetROI,
 	StreamStop:  func(rm Regmap) error { return rm.WriteReg(imx290RegStandby, 1) }, // standby on
 	StreamStart: func(rm Regmap) error { return rm.WriteReg(imx290RegStandby, 0) }, // standby off
@@ -161,7 +166,7 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	rm := ctl.Rm()
 	arm := func(full bool) error {
 		if full {
-			if err := ctl.VendorCmd(0xAA); err != nil {
+			if err := ctl.VendorCmd(FX3StreamStop); err != nil {
 				return err
 			}
 			if err := SetFPGABit(rm, 0x00, 0x10, true); err != nil { // FPGAStop: reg0 bit4
@@ -172,7 +177,7 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 			return err
 		}
 		if full {
-			if err := ctl.VendorCmd(0xA9); err != nil {
+			if err := ctl.VendorCmd(FX3StreamStart); err != nil {
 				return err
 			}
 		}
@@ -196,7 +201,7 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	defer func() {
 		_ = SetFPGABit(rm, 0x00, 0x10, true) // FPGAStop: reg0 bit4
 		_ = rm.WriteReg(imx290RegStandby, 1) // standby (sensor stop)
-		_ = ctl.VendorCmd(0xAA)
+		_ = ctl.VendorCmd(FX3StreamStop)
 		_ = ctl.ResetEndpoint()
 	}()
 	_ = ctl.ResetEndpoint()
@@ -233,7 +238,7 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		return 0, err
 	}
 	// Read with the retry ladder from the 290 object's WorkingFunc (0003_CCameraS290MM_Mini.o
-	// .text+0xf80) — the fix for the tiny-ROI intermittent short read (REVIEW 2.13):
+	// .text+0xf80), which covers the tiny-ROI intermittent short read:
 	//
 	//   trigger-mode short   -> checked FIRST (before the retry counter, like the object): if
 	//                           FPGA reg 0x23 bit2 says the triggered frame is still buffered,
@@ -290,9 +295,9 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 			time.Sleep(50 * time.Millisecond)
 			_ = SetFPGABit(rm, 0x00, 0x10, true) // StopSensorStreaming: FPGAStop (reg0 bit4)
 			_ = rm.WriteReg(imx290RegStandby, 1) //   + standby (sensor stop)
-			_ = ctl.VendorCmd(0xAA)
+			_ = ctl.VendorCmd(FX3StreamStop)
 			time.Sleep(10 * time.Millisecond)
-			_ = ctl.VendorCmd(0xA9)
+			_ = ctl.VendorCmd(FX3StreamStart)
 			_ = rm.WriteReg(imx290RegStandby, 0) // StartSensorStreaming: standby off
 			time.Sleep(50 * time.Millisecond)
 			_ = SetFPGABit(rm, 0x00, 0x10, false) //   + FPGAStart
@@ -308,15 +313,15 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 }
 
 // imx290InitFPGA is the FPGA-side bringup InitCamera performs after the Sony init writes,
-// using the FX3 register numbers. FPGASetBits/FPGAClearBits/FPGAWriteBits (imx174.go) do the
+// using the FX3 register numbers. FPGASetBits/FPGAClearBits/FPGAWriteBits (fps.go) do the
 // read-modify-write of the FPGA mode registers.
 //
 //	FPGAReset                          reg0 bit0 -> 0
-//	(20 ms delay; SendCMD(0xAF) — Camera-level)
+//	(20 ms delay; the SDK's SendCMD(0xAF) here is not replayed)
 //	SetFPGAAsMaster(1)                 reg0 bit5 = 1
 //	FPGAStop                           reg0 bit4 = 1
 //	EnableFPGADDR(0)                   reg0xa bit6 = 1 (DDR disabled)
-//	SetFPGAADCWidthOutputWidth(1, 0)   reg0xa bit0 = 1 (adc), bit4 = 0 (output) — x2
+//	SetFPGAADCWidthOutputWidth(1, 0)   reg0xa bit0 = 1 (adc), bit4 = 0 (output), x2
 //	SetFPGAGain(0x80,0x80,0x80,0x80)   FPGA 0x0c-0x0f, strobed by reg 1
 //	WriteFPGAREG(0x1a, 0x04)           direct FPGA register write (InitCamera)
 //
@@ -324,7 +329,7 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 // Set here from the live ReadoutMode: with bit4 = 0 the ASI290 streams a complete half-size
 // RAW8 frame (1936×1096×1 = 2121856 B) and the RAW16 read reports a short frame; bit4 = 1 gives
 // full RAW16. SetCMOSClk()'s sensor 0x3009 clock-select write is imx290WriteClockSel, issued at
-// the tail of SetExposure/SetROI like the object (REVIEW 2.6).
+// the tail of SetExposure/SetROI like the object.
 func imx290InitFPGA(rm Regmap, subtype int) error {
 	_ = subtype                                           // 290MM_Mini has no <0x12 / >=0x12 split in this path
 	if err := FPGAClearBits(rm, 0x00, 0x01); err != nil { // FPGAReset
@@ -413,7 +418,7 @@ var imx290Shutter = ShutterModel{
 }
 
 // imx290ClockFloor returns the pixel clock + HMAX floor for the live readout mode: the 10-bit
-// high-speed pair (37124/245) when mode.HighSpeed, else normal RAW16 (18562/261).
+// high-speed pair (37124/196) when mode.HighSpeed, else normal RAW16 (18562/203).
 func imx290ClockFloor(rm Regmap) (clock, floor int) {
 	if ModeOf(rm).HighSpeed {
 		return imx290ClkKHzHS, imx290HMAXFloorHS
@@ -470,9 +475,8 @@ func imx290SetExposure(rm Regmap, d time.Duration) error {
 //
 // The object calls it from SetExp, SetResolution, InitCamera and SetHighSpeedMode; the
 // driver mirrors the first two (init writes 0x3009=0x01 in the reglist, and a HighSpeed
-// toggle takes effect at the next SetExposure/SetROI by design). This closes the "no code
-// writes the 290's clock-select register" seam (REVIEW 2.6): the host math switched clocks
-// (imx290ClockFloor) while the sensor stayed on its init clock.
+// toggle takes effect at the next SetExposure/SetROI by design). Without this write the host
+// math would switch clocks (imx290ClockFloor) while the sensor stayed on its init clock.
 func imx290WriteClockSel(rm Regmap) error {
 	cur, err := rm.ReadReg(imx290RegGainMode)
 	if err != nil {
@@ -483,6 +487,22 @@ func imx290WriteClockSel(rm Regmap) error {
 		v |= 0x01 // 12-bit normal clock (18562); high-speed (37124) runs FRSEL 0
 	}
 	return rm.WriteReg(imx290RegGainMode, v)
+}
+
+// imx290SetOffset — SetBrightness (ASI Brightness / black level): offset written 16-bit
+// little-endian to sensor 0x300a (low) / 0x300b (high), no scaling.
+// imx290GetOffset reads the offset back from 0x300a (low) / 0x300b (high).
+func imx290GetOffset(rm Regmap) (int, error) {
+	v, err := ReadRegLE(rm, []uint16{0x300a, 0x300b})
+	return int(v), err
+}
+
+func imx290SetOffset(rm Regmap, offset int) error {
+	v := uint16(offset)
+	if err := rm.WriteReg(0x300b, (v>>8)&0xff); err != nil {
+		return err
+	}
+	return rm.WriteReg(0x300a, v&0xff)
 }
 
 // imx290SetROI programs the readout window: SetStartPos (ROI start X -> 0x3040/0x3041,
@@ -499,16 +519,6 @@ func imx290WriteClockSel(rm Regmap) error {
 // Finally SetFPGAHMAX throttles the readout to USB bandwidth (FPGA 0x13/0x14, strobed);
 // ProgramHMAX computes the value from the window geometry + the live ReadoutMode (USB speed /
 // output depth / FPS%).
-// imx290SetOffset — SetBrightness (ASI Brightness / black level): offset written 16-bit
-// little-endian to sensor 0x300a (low) / 0x300b (high), no scaling.
-func imx290SetOffset(rm Regmap, offset int) error {
-	v := uint16(offset)
-	if err := rm.WriteReg(0x300b, (v>>8)&0xff); err != nil {
-		return err
-	}
-	return rm.WriteReg(0x300a, v&0xff)
-}
-
 func imx290SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if bin < 1 {
 		bin = 1

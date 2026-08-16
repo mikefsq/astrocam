@@ -4,7 +4,7 @@
 // via WinUsb_ControlTransfer and bulk-IN frame reads via overlapped WinUsb_ReadPipe, bounded
 // by the pipe's transfer-timeout policy.
 //
-// The camera must be bound to the generic WinUSB (or libusbK) kernel driver — rebind with
+// The camera must be bound to the generic WinUSB (or libusbK) kernel driver; rebind with
 // Zadig. ZWO's own installer binds their proprietary ASICAMUSB3.sys, which the WinUSB API
 // cannot open; the bind is exclusive, so ZWO's native software won't see the camera until
 // reverted in Device Manager. The device is matched by VID/PID in its device-interface path
@@ -107,14 +107,18 @@ const (
 	winDrainTimeout    = 5 * time.Second
 )
 
+// errWinTransportClosed is returned by a transfer attempted after Close released the WinUSB
+// handle, instead of calling into a freed handle.
+var errWinTransportClosed = errors.New("astrocam: transport closed")
+
 // errWinTransportBroken marks a device whose aborted overlapped reads never completed: the
 // kernel may still own outstanding buffers, so all further I/O is refused (the buffers are
 // pinned in winLeakedIO). Only a device reset by the OS / process restart recovers.
-var errWinTransportBroken = errors.New("asicam: transport broken (undrainable overlapped I/O)")
+var errWinTransportBroken = errors.New("astrocam: transport broken (undrainable overlapped I/O)")
 
 // winLeakedIO pins buffers (and their OVERLAPPEDs/events) that could not be drained after an
-// abort — the kernel can still DMA into them at any time, so they must never be reused or
-// collected. Deliberately package-level and never cleared.
+// abort: the kernel can still DMA into them at any time, so they must never be reused or
+// collected. Package-level and never cleared, on purpose.
 var (
 	winLeakedIOMu sync.Mutex
 	winLeakedIO   []any
@@ -124,10 +128,16 @@ var (
 type winusbDevice struct {
 	handle syscall.Handle // file handle
 	winusb uintptr        // WINUSB_INTERFACE_HANDLE
+	// closeMu is the Close interlock (as on linux/darwin): every public I/O holds it shared for
+	// the duration of the transfer, Close takes it exclusively, so Close waits for in-flight I/O
+	// and a transfer after Close returns errWinTransportClosed instead of using the freed
+	// handle. Lock order: closeMu (shared) BEFORE ioMu.
+	closeMu sync.RWMutex
+	closed  bool // under closeMu
 	// ioMu serializes every USB I/O the FX3 must not see interleaved: all control transfers
 	// and a whole-frame BulkRead hold it, so a control transfer can't land on the bridge
 	// mid-readout and wedge the un-buffered USB2 path. ReadFrameStream (the USB3/DDR path)
-	// stays unlocked — it needs the worker's concurrent FPGABufReload. See transport_linux.go
+	// stays unlocked; it needs the worker's concurrent FPGABufReload. See transport_linux.go
 	// (usbfsDevice.ioMu) for the full rationale.
 	ioMu sync.Mutex
 	// inMaxPacket is the bulk-IN pipe's max packet size (USB3 SuperSpeed ≥1024, USB2 HighSpeed 512),
@@ -138,7 +148,7 @@ type winusbDevice struct {
 	broken atomic.Bool
 	// readAborted is the ReadAborter latch (level-triggered): while set, in-flight frame
 	// reads abort their pipe I/O and return the short prefix, and new frame reads fail fast
-	// — so StopExposure's master-stop writes are never stuck behind a read holding ioMu.
+	// so StopExposure's master-stop writes are never stuck behind a read holding ioMu.
 	// Set by AbortRead (StopExposure), cleared by ArmRead (StartExposure/StartVideo).
 	readAborted atomic.Bool
 }
@@ -146,6 +156,20 @@ type winusbDevice struct {
 // AbortRead / ArmRead implement ReadAborter (see transport.go).
 func (d *winusbDevice) AbortRead() { d.readAborted.Store(true) }
 func (d *winusbDevice) ArmRead()   { d.readAborted.Store(false) }
+
+// enter gates every public I/O method: fail fast on a closed or poisoned device, and hold the
+// Close interlock (shared) for the duration of the I/O. The returned release runs when done.
+func (d *winusbDevice) enter() (release func(), err error) {
+	if d.broken.Load() {
+		return nil, errWinTransportBroken
+	}
+	d.closeMu.RLock()
+	if d.closed {
+		d.closeMu.RUnlock()
+		return nil, errWinTransportClosed
+	}
+	return d.closeMu.RUnlock, nil
+}
 
 // winNode is one WinUSB device-interface path with its parsed VID/PID.
 type winNode struct {
@@ -228,12 +252,13 @@ func pathLocation(path string) uint32 {
 	return h
 }
 
-// OpenWinUSB finds the first WinUSB-bound device matching vid/pid and opens it.
-func OpenWinUSB(vid, pid uint16) (*winusbDevice, error) {
+// openWinUSB finds the first WinUSB-bound device matching vid/pid and opens it (OpenHost is
+// the public entry).
+func openWinUSB(vid, pid uint16) (*winusbDevice, error) {
 	for _, n := range scanWinUSB(vid, pid) {
 		return openPath(n.path)
 	}
-	return nil, fmt.Errorf("asicam: no WinUSB device for %04x:%04x (bind it with WinUSB / libusbK via Zadig)", vid, pid)
+	return nil, fmt.Errorf("astrocam: no WinUSB device for %04x:%04x (bind it with WinUSB / libusbK via Zadig)", vid, pid)
 }
 
 // interfacePath fetches the device-interface path (SetupDiGetDeviceInterfaceDetailW
@@ -261,12 +286,12 @@ func openPath(path string) (*winusbDevice, error) {
 	}
 	h, _, _ := procCreateFile.Call(uintptr(unsafe.Pointer(p)), genericReadWrite, fileShareRW, 0, openExisting, fileFlagOverlapped, 0)
 	if h == ^uintptr(0) {
-		return nil, fmt.Errorf("asicam: CreateFile %q failed", path)
+		return nil, fmt.Errorf("astrocam: CreateFile %q failed", path)
 	}
 	d := &winusbDevice{handle: syscall.Handle(h)}
 	if r, _, _ := procWinUsbInit.Call(h, uintptr(unsafe.Pointer(&d.winusb))); r == 0 {
 		procCloseHandle.Call(h)
-		return nil, fmt.Errorf("asicam: WinUsb_Initialize failed")
+		return nil, fmt.Errorf("astrocam: WinUsb_Initialize failed")
 	}
 	// Negotiated link speed from the bulk-IN pipe's max packet size (USB3 SuperSpeed bulk = 1024,
 	// USB2 HighSpeed = 512), so a USB3 camera on a HighSpeed link (or through a Cynthion) uses the
@@ -312,9 +337,11 @@ type winusbSetupPacket struct {
 }
 
 func (d *winusbDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, data []byte) (int, error) {
-	if d.broken.Load() {
-		return 0, errWinTransportBroken
+	release, err := d.enter()
+	if err != nil {
+		return 0, err
 	}
+	defer release()
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
 	pkt := winusbSetupPacket{RequestType: reqType, Request: bRequest, Value: wValue, Index: wIndex, Length: uint16(len(data))}
@@ -325,7 +352,7 @@ func (d *winusbDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, d
 	}
 	r, _, _ := procWinUsbControl.Call(d.winusb, *(*uintptr)(unsafe.Pointer(&pkt)), bufPtr, uintptr(len(data)), uintptr(unsafe.Pointer(&transferred)), 0)
 	if r == 0 {
-		return 0, fmt.Errorf("asicam: WinUsb_ControlTransfer failed")
+		return 0, fmt.Errorf("astrocam: WinUsb_ControlTransfer failed")
 	}
 	return int(transferred), nil
 }
@@ -350,10 +377,10 @@ func (d *winusbDevice) setPipeTimeout(timeoutMs uint32) {
 // error returns non-nil. Default WinUSB (no RAW_IO) returns on a short packet, so n may be
 // < len(buf).
 //
-// Two hard rules of the overlapped dance (finding 3.6): (a) the ReadPipe return must be
-// checked — a synchronous failure never arms the OVERLAPPED, and reading a zero OVERLAPPED
+// Two hard rules of the overlapped dance: (a) the ReadPipe return must be
+// checked: a synchronous failure never arms the OVERLAPPED, and reading a zero OVERLAPPED
 // via GetOverlappedResult reports STATUS_SUCCESS with 0 bytes, i.e. a dead device as a clean
-// empty frame; (b) the wait must be on the transfer's OWN event — without an hEvent the wait
+// empty frame; (b) the wait must be on the transfer's OWN event: without an hEvent the wait
 // lands on the file handle, which ANY completing I/O on the device signals (a concurrent TEC
 // poll), returning while this read is still in flight against the caller's buffer.
 func (d *winusbDevice) readChunk(buf []byte, timeoutMs uint32) (int, error) {
@@ -366,7 +393,7 @@ func (d *winusbDevice) readChunk(buf []byte, timeoutMs uint32) (int, error) {
 	d.setPipeTimeout(timeoutMs)
 	ev, _, _ := procCreateEvent.Call(0, 1, 0, 0) // manual-reset, unsignaled, unnamed
 	if ev == 0 {
-		return 0, fmt.Errorf("asicam: CreateEvent failed")
+		return 0, fmt.Errorf("astrocam: CreateEvent failed")
 	}
 	// Heap-allocate the OVERLAPPED: the kernel writes it asynchronously after ReadPipe
 	// returns, and a stack copy can move under a growing goroutine stack.
@@ -375,13 +402,13 @@ func (d *winusbDevice) readChunk(buf []byte, timeoutMs uint32) (int, error) {
 	if r == 0 {
 		if errno, ok := callErr.(syscall.Errno); !ok || errno != errIOPending {
 			procCloseHandle.Call(ev)
-			return 0, fmt.Errorf("asicam: WinUsb_ReadPipe failed: %v", callErr)
+			return 0, fmt.Errorf("astrocam: WinUsb_ReadPipe failed: %v", callErr)
 		}
 	}
 	// Wait on THIS transfer's event in ≤500 ms slices so an AbortRead (StopExposure) can
 	// break the wait; the pipe's transfer-timeout policy bounds the transfer itself (the
 	// driver cancels and completes the op with ERROR_SEM_TIMEOUT). On abort, cancel via
-	// WinUsb_AbortPipe and still wait for the completion — the kernel owns buf/ov until
+	// WinUsb_AbortPipe and still wait for the completion; the kernel owns buf/ov until
 	// then; an undrainable abort pins them and poisons the transport (leak-don't-free).
 	for {
 		if w, _, _ := procWaitForSingle.Call(ev, 500); w == waitObject0 {
@@ -394,7 +421,7 @@ func (d *winusbDevice) readChunk(buf []byte, timeoutMs uint32) (int, error) {
 				winLeakedIOMu.Lock()
 				winLeakedIO = append(winLeakedIO, buf, ov)
 				winLeakedIOMu.Unlock()
-				return 0, errWinTransportBroken // event leaked too — signaled at (eventual) completion
+				return 0, errWinTransportBroken // event leaked too; signaled at (eventual) completion
 			}
 			break
 		}
@@ -413,7 +440,7 @@ func (d *winusbDevice) readChunk(buf []byte, timeoutMs uint32) (int, error) {
 			return int(transferred), nil // bounded read elapsed: no (more) data this round
 		}
 	}
-	return int(transferred), fmt.Errorf("asicam: ReadPipe failed: %v", callErr)
+	return int(transferred), fmt.Errorf("astrocam: ReadPipe failed: %v", callErr)
 }
 
 // winOvSlot is one armed overlapped read of the prequeued batch: its OVERLAPPED + event and
@@ -428,25 +455,27 @@ type winOvSlot struct {
 // ReadFrameStreamPrequeued reads one frame the way the ASI SDK's capture thread does
 // (PrequeuedFrameStreamer): a batch of overlapped reads covering the frame exactly (1 MiB
 // slices, last = the remainder), armed on the pipe BEFORE the frame arrives so the transfer
-// overlaps the sensor readout and the pipe never idles — the one-chunk-at-a-time
+// overlaps the sensor readout and the pipe never idles; the one-chunk-at-a-time
 // ReadFrameStream leaves inter-transfer gaps that shear a USB2 HighSpeed frame. A window of
 // winPrequeuedWindow reads is kept armed; each fully-filled slot arms the next slice.
 //
 // Gates mirror the usbfs implementation: `total` bounds the whole read, and `idle` gates only
 // AFTER the first byte has arrived (a quiet integration must not trip it). Returns the
 // in-order contiguous prefix; a short slot (the FX3 frame-end short packet) or a gate expiry
-// ends the read, with everything still in flight aborted and drained before returning — on a
+// ends the read, with everything still in flight aborted and drained before returning; on a
 // drain timeout the frame buffer is pinned forever and the transport poisoned, because the
 // kernel still owns it. Holds ioMu for the whole frame (the USB2 control-interleave wedge gate).
 func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
-	if d.broken.Load() {
-		return 0, errWinTransportBroken
+	release, err := d.enter()
+	if err != nil {
+		return 0, err
 	}
+	defer release()
 	if d.readAborted.Load() {
-		return 0, nil // aborted before arming — don't take ioMu at all
+		return 0, nil // aborted before arming: don't take ioMu at all
 	}
 	d.ioMu.Lock()
 	defer d.ioMu.Unlock()
@@ -463,7 +492,7 @@ func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 		slots[i].buf = buf[lo:hi]
 	}
 
-	// The driver-side transfer timeout must outlast the host gates below — the host reaps
+	// The driver-side transfer timeout must outlast the host gates below; the host reaps
 	// with its own total/idle windows and aborts explicitly.
 	totalMs := total.Milliseconds()
 	if totalMs <= 0 {
@@ -474,7 +503,7 @@ func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 	arm := func(i int) error {
 		ev, _, _ := procCreateEvent.Call(0, 1, 0, 0)
 		if ev == 0 {
-			return fmt.Errorf("asicam: CreateEvent failed")
+			return fmt.Errorf("astrocam: CreateEvent failed")
 		}
 		slots[i].ev = ev
 		slots[i].ov = &overlapped{HEvent: syscall.Handle(ev)}
@@ -485,7 +514,7 @@ func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 			if errno, ok := callErr.(syscall.Errno); !ok || errno != errIOPending {
 				procCloseHandle.Call(ev)
 				slots[i].ev = 0
-				return fmt.Errorf("asicam: WinUsb_ReadPipe failed: %v", callErr)
+				return fmt.Errorf("astrocam: WinUsb_ReadPipe failed: %v", callErr)
 			}
 		}
 		slots[i].armed = true
@@ -493,7 +522,7 @@ func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 	}
 
 	// abortAndDrain cancels everything still in flight and waits for every armed slot to
-	// complete — the kernel writes the buffer and OVERLAPPED at completion time, so returning
+	// complete: the kernel writes the buffer and OVERLAPPED at completion time, so returning
 	// earlier hands the caller memory the kernel still owns. On a drain timeout it pins the
 	// whole batch and poisons the transport instead of returning that memory to the caller.
 	drained := true
@@ -518,7 +547,7 @@ func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 			winLeakedIOMu.Lock()
 			winLeakedIO = append(winLeakedIO, buf, slots)
 			winLeakedIOMu.Unlock()
-			return // leak the events too — the kernel signals them at (eventual) completion
+			return // leak the events too; the kernel signals them at (eventual) completion
 		}
 		for i := range slots {
 			if slots[i].ev != 0 {
@@ -602,7 +631,7 @@ func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 					return got, nil
 				}
 			}
-			return got, fmt.Errorf("asicam: ReadPipe failed: %v", callErr)
+			return got, fmt.Errorf("astrocam: ReadPipe failed: %v", callErr)
 		}
 		if int(transferred) < len(slots[i].buf) {
 			// Short slot = the FX3 frame-end short packet: the prefix is the frame.
@@ -613,7 +642,7 @@ func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 			runtime.KeepAlive(slots)
 			return got, nil
 		}
-		// Slot fully filled — keep the window covered.
+		// Slot fully filled: keep the window covered.
 		if next < nslots {
 			if err := arm(next); err == nil {
 				next++
@@ -633,15 +662,20 @@ func (d *winusbDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 }
 
 // BulkRead reads one frame from the bulk-IN endpoint into buf, in fixed maxBulkChunk reads
-// into a scratch buffer copied to a running watermark — so the read time-bounds (default
+// into a scratch buffer copied to a running watermark, so the read time-bounds (default
 // WinUSB blocks forever) and assembles the frame contiguously across the FX3's mid-frame
 // short packets, which a single whole-frame ReadPipe would stop on.
 func (d *winusbDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	release, err := d.enter()
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	if d.readAborted.Load() {
-		return 0, nil // aborted before arming — don't take ioMu at all
+		return 0, nil // aborted before arming: don't take ioMu at all
 	}
 	d.ioMu.Lock() // hold for the whole frame so no control transfer interleaves (USB2 wedge gate)
 	defer d.ioMu.Unlock()
@@ -679,6 +713,11 @@ func (d *winusbDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	release, err := d.enter()
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	if d.readAborted.Load() {
 		return 0, nil // aborted before the first transfer
 	}
@@ -721,13 +760,30 @@ func (d *winusbDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 // ResetEndpoint clears/aborts the bulk-IN pipe (WinUsb_ResetPipe) so a stale pipe state
 // from a prior aborted read can't fail the next transfer.
 func (d *winusbDevice) ResetEndpoint(ep uint8) error {
+	release, err := d.enter()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if r, _, _ := procWinUsbResetPipe.Call(d.winusb, uintptr(ep)); r == 0 {
-		return fmt.Errorf("asicam: WinUsb_ResetPipe(0x%02x) failed", ep)
+		return fmt.Errorf("astrocam: WinUsb_ResetPipe(0x%02x) failed", ep)
 	}
 	return nil
 }
 
+// Close waits for in-flight I/O (the closeMu interlock; every I/O is deadline-bounded), then
+// releases the WinUSB interface and the file handle. Idempotent. On a broken transport
+// (undrainable overlapped I/O) the handles are leaked: the kernel may still complete into them.
 func (d *winusbDevice) Close() error {
+	d.closeMu.Lock()
+	defer d.closeMu.Unlock()
+	if d.closed {
+		return nil
+	}
+	d.closed = true
+	if d.broken.Load() {
+		return errWinTransportBroken
+	}
 	procWinUsbFree.Call(d.winusb)
 	procCloseHandle.Call(uintptr(d.handle))
 	return nil
@@ -735,7 +791,7 @@ func (d *winusbDevice) Close() error {
 
 // OpenHost opens the default USB backend for this platform (Windows: WinUSB).
 func OpenHost(vid, pid uint16) (Transport, error) {
-	d, err := OpenWinUSB(vid, pid)
+	d, err := openWinUSB(vid, pid)
 	if err != nil {
 		return nil, err
 	}
@@ -753,7 +809,7 @@ func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 	return out, nil
 }
 
-// OpenLocation opens the WinUSB device whose path hashes to loc (from a DeviceInfo) — binds
+// OpenLocation opens the WinUSB device whose path hashes to loc (from a DeviceInfo): it binds
 // the exact unit chosen from Enumerate when several identical cameras are attached.
 func OpenLocation(vid uint16, loc uint32) (Transport, error) {
 	for _, n := range scanWinUSB(vid, 0) {
@@ -761,7 +817,7 @@ func OpenLocation(vid uint16, loc uint32) (Transport, error) {
 			return openPath(n.path)
 		}
 	}
-	return nil, fmt.Errorf("asicam: no WinUSB device at location 0x%08x for vid %04x (unplugged or moved)", loc, vid)
+	return nil, fmt.Errorf("astrocam: no WinUSB device at location 0x%08x for vid %04x (unplugged or moved)", loc, vid)
 }
 
 type overlapped struct {

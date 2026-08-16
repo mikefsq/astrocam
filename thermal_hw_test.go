@@ -33,13 +33,13 @@ func TestReadTempDecode(t *testing.T) {
 		lo, hi byte
 		want   float64
 	}{
-		{0x88, 0x19, 25.5},   // raw 0x198 = 408 → 25.5
-		{0x00, 0x00, 0.0},    // zero
-		{0xC0, 0xF3, -12.25}, // raw 0xF3C → sign-extended −196 → −12.25
+		{0x88, 0x19, 25.5},    // raw 0x198 = 408 → 25.5
+		{0x00, 0x00, 0.0},     // zero
+		{0xC0, 0xF3, -12.25},  // raw 0xF3C → sign-extended −196 → −12.25
 		{0xF0, 0xFF, -0.0625}, // raw 0xFFF → −1 → −1/16 (sign extension of the smallest step)
 	}
 	for _, c := range cases {
-		th := &camThermal{t: &thermalFakeTransport{temp: [2]byte{c.lo, c.hi}}}
+		th := &camThermal{t: &thermalFakeTransport{temp: [2]byte{c.lo, c.hi}}, cmds: ZWO.Cmds}
 		got, err := th.ReadTemp()
 		if err != nil {
 			t.Fatalf("ReadTemp(%02x %02x): %v", c.lo, c.hi, err)
@@ -62,7 +62,7 @@ func TestReadHumidityDecode(t *testing.T) {
 		{0xFF, 0xFF, 100}, // raw 0xFFFF → ~119 → clamped to 100
 	}
 	for _, c := range cases {
-		th := &camThermal{t: &thermalFakeTransport{hum: [2]byte{c.lo, c.hi}}}
+		th := &camThermal{t: &thermalFakeTransport{hum: [2]byte{c.lo, c.hi}}, cmds: ZWO.Cmds}
 		got, err := th.ReadHumidity()
 		if err != nil {
 			t.Fatalf("ReadHumidity(%02x %02x): %v", c.lo, c.hi, err)

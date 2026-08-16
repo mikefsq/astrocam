@@ -14,6 +14,7 @@
 //	SetExp            (SHS 24-bit 0x3020..0x3022, VMAX via SetFPGAVMAX; +18/+17 math)
 //	SetBrightness     (offset -> 0x300a/0x300b, 16-bit LE, no scaling)
 //	the capture worker (sensor stream gate: standby 0x3000 = 1 stop / 0 start)
+
 package sensors
 
 import . "github.com/mikefsq/astrocam"
@@ -51,9 +52,9 @@ const (
 	imx462LongExpUs = 1_000_000     // ≥ 1 s enters FPGA trigger mode (reg0 bit7)
 
 	// Die/mode readout facts the shared engine (fps.go / shutter.go) is parameterized by.
-	imx462FullWidth   = 1936 // MaxWidth (ASI462MC reports 1936×1096, same array as the 290)
-	imx462FullHeight  = 1096
-	imx462ClkKHz      = 18562 // RAW16 pixel clock (INCK/2); RAW8 would be 37124
+	imx462FullWidth  = 1936 // MaxWidth (ASI462MC reports 1936×1096, same array as the 290)
+	imx462FullHeight = 1096
+	imx462ClkKHz     = 18562 // RAW16 pixel clock (INCK/2); RAW8 would be 37124
 	// HMAX floor = the ASI SDK's REG_FRAME_LENGTH_PKG_MIN (CCameraS462MC SetFPSPerc reads
 	// .data+0x10). HMAX = max(bandwidth candidate, floor)·100/FPSPercent. The candidate is
 	// link-switched — MAX_DATASIZE (.data+0) is written by SetOutput16Bits: USB3→360715,
@@ -81,7 +82,7 @@ const (
 // imx462Init is InitCamera's sensor-write sequence: the 73-entry reglist
 // ([reg:u16le][val:u16le], reg 0xffff = delay ms), then the explicit
 // sensor-reg tail the function issues after the table loop. The FPGA-side
-// bringup is in imx462InitFPGA; SendCMD(0xAF/0xAE) is Camera-level.
+// bringup is in imx462InitFPGA; the SDK's SendCMD(0xAF/0xAE) is not replayed.
 var imx462Init = []RegVal{
 	// --- reglist table (verbatim, file order) ---
 	{Reg: 0x3003, Val: 0x01}, {Reg: 0xffff, Val: 20}, // delay 20 ms
@@ -112,20 +113,22 @@ var imx462Init = []RegVal{
 	{Reg: 0x3005, Val: 0x01}, // ADBIT = 12-bit
 	{Reg: 0x303a, Val: 0x08},
 	{Reg: 0x3007, Val: 0x40}, // WINMODE
-	// (FPGAReset + SendCMD(0xAF) here in the SDK — see imx462InitFPGA / Camera.Init)
+	// (FPGAReset here, see imx462InitFPGA; the SDK's SendCMD(0xAF) at this point is not replayed)
 	{Reg: 0x3002, Val: 0x01}, // XMSTA master stop during init
 	{Reg: 0x304b, Val: 0x00},
 }
 
+// IMX462 is the Sony IMX462 STARVIS profile (ZWO ASI462, PlayerOne Mars/Ceres 462).
 var IMX462 = Sensor{
 	Name:     "IMX462", // ASI462 / Ceres 462M; Sony IMX462 STARVIS (mono die; MC adds a CFA)
 	GainMax:  imx462GainMax,
 	ExpMinUs: imx462ExpMinUs,
 	ExpMaxUs: imx462ExpMaxUs,
-	// ASI Brightness / black level. Default 100 matches the SDK (ASIInitCamera applies
-	// Brightness=100 on the ASI462). The offset→DN mapping is floor 41/71/141 in 12-bit at
-	// offsets 0/30/100.
-	OffsetMax: 240, OffsetDef: 100,
+	// ASI Brightness / black level. Default 30 matches the SDK (its ASIInitCamera applies
+	// Brightness 30 on the ASI462, per the SDK log and its persisted ASIconfig.xml; the 100 in
+	// that file is DestBrightness, the auto-exposure target). The offset→DN mapping is floor
+	// 41/71/141 in 12-bit at offsets 0/30/100.
+	OffsetMax: 500, OffsetDef: 30, // caps max 500 (ASIGetControlCaps, SDK 1.41)
 	Info: CameraInfo{
 		MaxWidth:  imx462FullWidth, // active pixels
 		MaxHeight: imx462FullHeight,
@@ -139,6 +142,7 @@ var IMX462 = Sensor{
 	SetGain:     imx462SetGain,
 	SetExposure: imx462SetExposure,
 	SetOffset:   imx462SetOffset,
+	GetOffset:   imx462GetOffset,
 	SetROI:      imx462SetROI,
 	StreamStop:  func(rm Regmap) error { return rm.WriteReg(imx462RegStandby, 1) }, // standby on (the capture worker)
 	StreamStart: func(rm Regmap) error { return rm.WriteReg(imx462RegStandby, 0) }, // standby off
@@ -154,7 +158,7 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	longExp := exposure >= imx462LongExpUs*time.Microsecond // ≥ 1 s — matches SetExposure's trigger band
 	arm := func(full bool) error {
 		if full {
-			if err := ctl.VendorCmd(0xAA); err != nil {
+			if err := ctl.VendorCmd(FX3StreamStop); err != nil {
 				return err
 			}
 			if err := SetFPGABit(rm, 0x00, 0x10, true); err != nil { // FPGAStop: reg0 bit4
@@ -165,7 +169,7 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 			return err
 		}
 		if full {
-			if err := ctl.VendorCmd(0xA9); err != nil {
+			if err := ctl.VendorCmd(FX3StreamStart); err != nil {
 				return err
 			}
 		}
@@ -219,7 +223,7 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	defer func() {
 		_ = SetFPGABit(rm, 0x00, 0x10, true) // FPGAStop: reg0 bit4
 		_ = rm.WriteReg(imx462RegStandby, 1) // standby (sensor stop)
-		_ = ctl.VendorCmd(0xAA)
+		_ = ctl.VendorCmd(FX3StreamStop)
 		_ = ctl.ResetEndpoint()
 	}()
 	_ = ctl.ResetEndpoint()
@@ -399,8 +403,8 @@ func imx462SetGain(rm Regmap, gain int) error {
 //
 // The object calls it from SetExp, SetResolution, InitCamera and SetHighSpeedMode; the
 // driver mirrors the first two (init writes 0x3009=0x01 in the reglist, and a HighSpeed
-// toggle takes effect at the next SetExposure/SetROI by design). This closes the one-way
-// FRSEL clear (REVIEW 2.6): normal captures after a high-speed session get bit0 back.
+// toggle takes effect at the next SetExposure/SetROI by design). Rewriting FRSEL at every tail
+// means normal captures after a high-speed session get bit0 back.
 func imx462WriteClockSel(rm Regmap) error {
 	cur, err := rm.ReadReg(imx462RegGainMode)
 	if err != nil {
@@ -474,6 +478,12 @@ func imx462SetExposure(rm Regmap, d time.Duration) error {
 }
 
 // imx462SetOffset — SetBrightness: offset 16-bit LE to 0x300a/0x300b, no scaling.
+// imx462GetOffset reads the offset back from 0x300a (low) / 0x300b (high).
+func imx462GetOffset(rm Regmap) (int, error) {
+	v, err := ReadRegLE(rm, []uint16{0x300a, 0x300b})
+	return int(v), err
+}
+
 func imx462SetOffset(rm Regmap, offset int) error {
 	v := uint16(offset)
 	if err := rm.WriteReg(0x300b, (v>>8)&0xff); err != nil {

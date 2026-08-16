@@ -51,7 +51,7 @@ func (c *Camera) LoadDefectMap(fullW, fullH int) (*DefectMap, error) {
 	return parseDefectMap(blob, length, fullW, fullH, c.Color()), nil
 }
 
-// parseDefectMap decompresses an "ASID" blob (header included) into a DefectMap — the
+// parseDefectMap decompresses an "ASID" blob (header included) into a DefectMap, the
 // pure parsing half of LoadDefectMap, split out so it is testable without flash I/O.
 func parseDefectMap(blob []byte, length, fullW, fullH int, color bool) *DefectMap {
 	m := &DefectMap{W: fullW, H: fullH, Color: color}
@@ -83,8 +83,8 @@ func parseDefectMap(blob []byte, length, fullW, fullH int, color bool) *DefectMa
 func decompressASID(blob []byte, length, npix int) []byte {
 	bitmap := make([]byte, (npix+7)/8)
 	base := 0
-	// Both bytes of an entry must sit inside the declared payload: x9+9 < length, not
-	// x9+8 — the latter admitted a 2-byte entry straddling an odd payload end.
+	// Both bytes of an entry must sit inside the declared payload (x9+9 < length), so a
+	// 2-byte entry can never straddle an odd payload end.
 	for x9 := 0; x9+9 < length && x9+9 < len(blob); x9 += 2 {
 		b0, b1 := blob[x9+8], blob[x9+9]
 		if b0 == 0 && b1 == 0 {
