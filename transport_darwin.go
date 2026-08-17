@@ -1,22 +1,15 @@
 //go:build darwin
 
-// macOS USB transport over IOKit's IOUSBLib (the IOUSBHost stack). The one backend that
-// needs cgo — there is no pure-Go path to IOKit on macOS.
+// macOS USB transport over IOKit's IOUSBLib. This backend needs cgo: macOS has no pure-Go path
+// to IOKit.
 //
-// Scope: control transfers + three bulk read paths — BulkRead (asi_read_frame_async,
-// post-N-and-wait, for small USB2 frames), the FrameStreamer windowed pump
-// (asi_read_frame_stream, ReadPipeAsync on a dedicated CFRunLoop) that streams large USB3
-// frames, keeping a window of transfers cycling and copying contiguously so a short packet
-// at a burst boundary can't leave a gap, and the PrequeuedFrameStreamer batch
-// (asi_read_frame_prequeued) that arms the whole frame before it arrives — the SDK's
-// async-transfer model, what a USB2 link needs to not shear free-run frames. Stall detection
-// is time-based on real data (not ZLP count) so the FX3's held final partial-buffer tail
-// still completes.
+// Four bulk-read paths: BulkRead (asi_read_frame_async) for USB2, ReadFrameStreamPrequeued
+// (asi_read_frame_prequeued), ReadFrameStream (asi_read_frame_stream) for USB3, and StartStream
+// (asicam_stream), the same window kept resident across a video burst.
 //
-// Teardown safety: every batch/session is heap state; if an aborted transfer cannot be
-// drained the state (and any caller buffer the kernel may still DMA into) is leaked, the
-// transport is poisoned (errTransportBroken), and Close leaks the handle rather than
-// releasing an interface with I/O still in flight.
+// An aborted transfer that cannot be drained leaks its batch state and any caller buffer the
+// kernel may still DMA into, poisons the transport (errTransportBroken), and makes Close leak
+// the handle.
 
 package astrocam
 
@@ -33,12 +26,11 @@ package astrocam
 #include <pthread.h>
 #include <dispatch/dispatch.h>
 
-// Forward-declared: asi_now_ms is defined further down but called by the read pumps above it.
-// Modern clang treats a call to an undeclared function as an error (C99+), so declare it up front.
+// asi_now_ms is defined further down and called by the read pumps above it; clang rejects a
+// call to an undeclared function (C99+).
 static int64_t asi_now_ms(void);
 
-// asicam_diag carries where-did-it-fail info out of asi_open so the Go side can
-// turn the otherwise-opaque failure into a precise message.
+// asicam_diag carries where asi_open failed so the Go side can report a specific message.
 typedef struct {
     int matched;       // # of VID/PID matches the iterator returned
     int openKR;        // IOReturn of USBDeviceOpen on a matched device (0 if never failed)
@@ -52,14 +44,59 @@ typedef struct {
     IOUSBDeviceInterface**    dev;
     IOUSBInterfaceInterface** intf;
     UInt8 inPipe;
-    // read_abort is the ReadAborter latch (level-triggered, set/cleared from Go): the frame-
-    // read reap loops poll it each slice and abort the pipe, so a StopExposure breaks a
-    // blocked read within ~100 ms instead of waiting out its gates.
-    volatile int read_abort;
+    // abort_gen is the ReadAborter latch: a generation AbortRead bumps, not a level it sets.
+    // Each frame read snapshots it at entry and the reap loops abort the pipe once it no longer
+    // matches. A clearable flag loses the abort when ArmRead lands inside the loops' 100 ms poll
+    // slice: on an ASI6200MC a 5 ms gap between AbortRead and ArmRead left the read running its
+    // full 10 s timeout. A bumped generation cannot be un-seen.
+    volatile int32_t abort_gen;
+    // rd_first is set by the one-shot read's callback on the first completion carrying data, so
+    // BulkReadQuiet can end the quiet window when the frame arrives early.
+    volatile int rd_first;
 } asicam_dev;
 
-static void asi_set_read_abort(asicam_dev* d, int v) { __sync_lock_test_and_set(&d->read_abort, v); }
-#define ASI_READ_ABORT(d) __sync_fetch_and_add(&(d)->read_abort, 0)
+// asi_abort_reads bumps the generation (ReadAborter AbortRead). There is no clear: ArmRead only
+// drops the Go-side entry latch, which is what fails a later read fast.
+static void asi_abort_reads(asicam_dev* d) { __sync_add_and_fetch(&d->abort_gen, 1); }
+static int32_t asi_abort_gen(asicam_dev* d) { return __sync_fetch_and_add(&d->abort_gen, 0); }
+// ASI_ABORTED is true once an abort has been requested since this read snapshotted gen0.
+#define ASI_ABORTED(d, gen0) (asi_abort_gen(d) != (gen0))
+static int asi_rd_first(asicam_dev* d) { return __sync_fetch_and_add(&d->rd_first, 0); }
+static void asi_rd_first_clear(asicam_dev* d) { __sync_lock_test_and_set(&d->rd_first, 0); }
+
+// The completion callback publishes a slot's done flag after its len/kr, and the reap loops read
+// it on the caller's thread with no lock in between. Apple silicon may make plain stores to
+// different addresses visible out of order, so done is a release store and every reader an
+// acquire load, which carries len/kr with it.
+#define ASI_DONE_SET(s)   __atomic_store_n(&(s)->done, 1, __ATOMIC_RELEASE)
+#define ASI_DONE_CLEAR(s) __atomic_store_n(&(s)->done, 0, __ATOMIC_RELAXED)
+#define ASI_DONE(s)       __atomic_load_n(&(s)->done, __ATOMIC_ACQUIRE)
+
+// Runloop-thread bring-up shared by the read pumps and the resident session. A kCFRunLoopEntry
+// observer signals `ready` from inside the running loop, never before CFRunLoopRun: CFRunLoopStop
+// against a loop that is not running is a no-op, so a caller that stopped the loop between the
+// signal and the run would join a thread that never exits. A source that cannot be created
+// signals ready with srcErr set.
+static void asi_rl_entry_cb(CFRunLoopObserverRef obs, CFRunLoopActivity act, void* info) {
+    dispatch_semaphore_signal((dispatch_semaphore_t)info);
+}
+static void asi_rl_serve(asicam_dev* d, CFRunLoopRef* rlOut, dispatch_semaphore_t ready, IOReturn* srcErr) {
+    CFRunLoopRef rl = CFRunLoopGetCurrent();
+    *rlOut = rl;
+    CFRunLoopSourceRef src = NULL;
+    *srcErr = (*d->intf)->CreateInterfaceAsyncEventSource(d->intf, &src);
+    if (*srcErr != kIOReturnSuccess) { dispatch_semaphore_signal(ready); return; }
+    CFRunLoopAddSource(rl, src, kCFRunLoopDefaultMode);
+    CFRunLoopObserverContext ctx = { 0, (void*)ready, NULL, NULL, NULL };
+    CFRunLoopObserverRef obs = CFRunLoopObserverCreate(kCFAllocatorDefault, kCFRunLoopEntry,
+                                                       false, 0, asi_rl_entry_cb, &ctx);
+    if (obs) CFRunLoopAddObserver(rl, obs, kCFRunLoopDefaultMode);
+    else dispatch_semaphore_signal(ready); // no observer: the pre-run signal, the old behavior
+    CFRunLoopRun(); // spins until CFRunLoopStop (all transfers reaped)
+    if (obs) { CFRunLoopRemoveObserver(rl, obs, kCFRunLoopDefaultMode); CFRelease(obs); }
+    CFRunLoopRemoveSource(rl, src, kCFRunLoopDefaultMode);
+    CFRelease(src);
+}
 
 static IOUSBDeviceInterface** device_interface(io_service_t svc) {
     IOCFPlugInInterface** plugin = NULL; SInt32 score;
@@ -118,9 +155,9 @@ static int open_interface(IOUSBDeviceInterface** dev, IOUSBInterfaceInterface***
     return rc;
 }
 
-// open_svc opens one already-matched USB device service and claims its bulk
-// interface, filling out + diag. Returns 0 on success (keeps dev + intf), else <0.
-// Factored out of asi_open so both PID-matched and location-matched opens share it.
+// open_svc opens one already-matched USB device service and claims its bulk interface,
+// filling out + diag. Returns 0 on success (keeps dev + intf), else <0. Shared by asi_open
+// and asi_open_location.
 static int open_svc(io_service_t svc, asicam_dev* out, asicam_diag* diag) {
     IOUSBDeviceInterface** dev = device_interface(svc);
     if (!dev) return -3;
@@ -142,11 +179,11 @@ static int open_svc(io_service_t svc, asicam_dev* out, asicam_diag* diag) {
     }
     out->dev = dev; out->intf = intf; out->inPipe = inPipe;
     diag->inPipe = inPipe;
-    return 0; // success — keep dev + intf
+    return 0; // success: keep dev + intf
 }
 
 // reg_u32 / reg_str read a property off a USB device's IORegistry entry without opening the
-// device — the OS cached idProduct, locationID and the USB product-name string at
+// device: the OS cached idProduct, locationID and the USB product-name string at
 // enumeration, so listing costs no bus traffic.
 static int reg_u32(io_service_t svc, CFStringRef key, uint32_t* out) {
     CFTypeRef v = IORegistryEntryCreateCFProperty(svc, key, kCFAllocatorDefault, 0);
@@ -173,13 +210,12 @@ typedef struct {
     char name[64];
 } asicam_devinfo;
 
-// asi_enumerate lists every VID-matched USB device (no open, no PID filter — the Go side
+// asi_enumerate lists every VID-matched USB device (no open, no PID filter; the Go side
 // filters to known camera PIDs). Fills up to max entries; returns the total found (may
 // exceed max, so the caller can detect truncation), or <0 on failure.
 static int asi_enumerate(uint16_t vid, asicam_devinfo* out, int max) {
-    // Match every USB device and filter by reading idVendor, rather than putting idVendor in
-    // the match dictionary: on the IOUSBHost stack a class + idVendor-only dictionary matches
-    // nothing (idVendor+idProduct does, the open path), so we iterate all and compare here.
+    // Match every USB device and filter by reading idVendor: on the IOUSBHost stack a class +
+    // idVendor-only match dictionary matches nothing (idVendor+idProduct does, the open path).
     CFMutableDictionaryRef match = IOServiceMatching(kIOUSBDeviceClassName);
     if (!match) return -1;
 
@@ -233,10 +269,9 @@ static int asi_open(uint16_t vid, uint16_t pid, asicam_dev* out, asicam_diag* di
 }
 
 // asi_open_location opens the VID-matched device at a specific USB location id (the stable
-// per-port key from asi_enumerate) — opens the exact one of several identical cameras.
+// per-port key from asi_enumerate): one chosen unit of several identical cameras.
 static int asi_open_location(uint16_t vid, uint32_t loc, asicam_dev* out, asicam_diag* diag) {
-    // Match all USB devices and filter by idVendor + locationID in code (see
-    // asi_enumerate for why idVendor-only matching is avoided).
+    // Match all USB devices and filter by idVendor + locationID in code (see asi_enumerate).
     CFMutableDictionaryRef match = IOServiceMatching(kIOUSBDeviceClassName);
     if (!match) return -1;
 
@@ -259,10 +294,10 @@ static int asi_open_location(uint16_t vid, uint32_t loc, asicam_dev* out, asicam
 }
 
 static int asi_control(asicam_dev* d, uint8_t reqType, uint8_t req, uint16_t val,
-        uint16_t idx, void* data, uint16_t len, uint32_t* done) {
+        uint16_t idx, void* data, uint16_t len, uint32_t* done, IOReturn* outKr) {
     // DeviceRequestTO (not DeviceRequest): a bounded timeout so a wedged control transfer
-    // can't hang the whole capture, plus a few retries so one transient USB glitch on an
-    // init/arm register write doesn't kill the capture.
+    // cannot hang the capture, plus a few retries so one transient USB glitch on an init/arm
+    // register write does not kill it.
     IOUSBDevRequestTO r;
     r.bmRequestType = reqType;
     r.bRequest = req;
@@ -276,70 +311,69 @@ static int asi_control(asicam_dev* d, uint8_t reqType, uint8_t req, uint16_t val
     for (int attempt = 0; attempt < 4; attempt++) {
         r.wLenDone = 0;
         kr = (*d->dev)->DeviceRequestTO(d->dev, &r);
-        if (kr == kIOReturnSuccess) { if (done) *done = r.wLenDone; return 0; }
+        if (kr == kIOReturnSuccess) { if (done) *done = r.wLenDone; if (outKr) *outKr = kr; return 0; }
+        // A device that is gone or not answering will not come back inside three more tries; the
+        // retries only buy a wedged control plane four 1 s timeouts before anything is reported,
+        // and every attempt re-issues a request the device may already have acted on.
+        if (kr == kIOReturnNoDevice || kr == kIOReturnNotResponding) break;
         usleep(2000); // 2 ms before retrying a transient failure
     }
     if (done) *done = r.wLenDone;
+    if (outKr) *outKr = kr; // the caller reports which failure this was
     return -1;
 }
 
-// Async multi-transfer bulk read, driven from a dedicated, always-spinning CFRunLoop
-// thread. A pthread runs CFRunLoopRun() continuously so completions are serviced the
-// instant they fire (a wait-mode FPGA paces its readout on the host servicing the pipe).
-//
-// Lifecycle: the thread creates the interface async event source on its runloop and
-// signals `ready`; the caller then submits N transfers (completions fire on the thread);
-// the completion callback counts down and, when all N are in, signals `finished` and
-// stops the runloop. On timeout we AbortPipe (which completes the rest), then reset the
-// endpoint so the next capture starts from a quiescent pipe.
+// Async multi-transfer bulk read, driven from a dedicated CFRunLoop thread. A wait-mode FPGA
+// paces its readout on the host servicing the pipe, so the thread runs CFRunLoopRun()
+// continuously and completions are serviced as they fire.
 typedef struct asi_rd asi_rd;
-typedef struct { volatile int done; uint32_t len; IOReturn kr; asi_rd* rd; } aslot;
+typedef struct { int done; uint32_t len; IOReturn kr; asi_rd* rd; } aslot; // done: ASI_DONE* only
 struct asi_rd {
     aslot* slots;
     int n;
     CFRunLoopRef rl;
     dispatch_semaphore_t comp; // V'd once per completion (success, error, or abort)
+    asicam_dev* d;
 };
 
 static void asi_async_cb(void* refcon, IOReturn result, void* arg0) {
     aslot* s = (aslot*)refcon;
     s->len = (uint32_t)(uintptr_t)arg0;
     s->kr = result;
-    s->done = 1;
+    if (s->len > 0 && s->rd->d) __sync_lock_test_and_set(&s->rd->d->rd_first, 1);
+    ASI_DONE_SET(s);
     // One signal per completion; the reader counts them down and only then stops the runloop,
     // so every callback runs before the runloop thread exits and rd is freed.
     dispatch_semaphore_signal(s->rd->comp);
 }
 
 typedef struct {
-    asicam_dev* d; asi_rd* rd; dispatch_semaphore_t ready;
-    CFRunLoopSourceRef src; IOReturn srcErr;
+    asicam_dev* d; asi_rd* rd; dispatch_semaphore_t ready; IOReturn srcErr;
 } asi_rd_thr;
 
 static void* asi_rd_run(void* arg) {
     asi_rd_thr* t = (asi_rd_thr*)arg;
-    t->rd->rl = CFRunLoopGetCurrent();
-    t->srcErr = (*t->d->intf)->CreateInterfaceAsyncEventSource(t->d->intf, &t->src);
-    if (t->srcErr == kIOReturnSuccess)
-        CFRunLoopAddSource(t->rd->rl, t->src, kCFRunLoopDefaultMode);
-    dispatch_semaphore_signal(t->ready); // runloop + source ready; caller may submit now
-    if (t->srcErr == kIOReturnSuccess) {
-        CFRunLoopRun(); // spins continuously until CFRunLoopStop (all transfers done)
-        CFRunLoopRemoveSource(t->rd->rl, t->src, kCFRunLoopDefaultMode);
-        CFRelease(t->src);
-    }
+    asi_rl_serve(t->d, &t->rd->rl, t->ready, &t->srcErr);
     return NULL;
 }
 
-// rc 0 = ok; -2..-5 = setup failure (nothing in flight); -6 = transfers ABANDONED after an
-// abort: the kernel may still DMA into buf and a late completion can still be delivered
-// through a future event source on this interface (IOKit queues it on the interface's async
-// port), so the batch state is leaked on purpose and the CALLER must pin buf and poison
-// the transport.
+// A hard pipe error is any completion status other than success, underrun, our own abort, or the
+// driver's per-transfer timeout. The reap loops read those four as a short read and report a
+// stalled pipe or a vanished device to Go.
+#define ASI_HARD_KR(kr) ((kr) != kIOReturnSuccess && (kr) != kIOReturnUnderrun && \
+                         (kr) != kIOReturnAborted && (kr) != kIOUSBTransactionTimeout)
+
+// rc 0 = ok; -2..-5 = setup failure (nothing in flight); -6 = transfers abandoned after an
+// abort, so the batch state is leaked and the caller must pin buf and poison the transport (the
+// kernel may still DMA into buf, and IOKit can still deliver a late completion through a future
+// event source on this interface); -7 = a hard pipe error, its IOReturn in *outKr and the good
+// prefix in *outLen. A stalled pipe reported as rc 0 with a short count is indistinguishable
+// from an idle stall, and the retry ladders would re-arm against a dead device.
 static int asi_read_frame_async(asicam_dev* d, void* buf, uint32_t bufSize,
-                                uint32_t chunk, uint32_t timeoutMs, uint32_t* outLen) {
-    *outLen = 0;
+                                uint32_t chunk, uint32_t timeoutMs, uint32_t* outLen, IOReturn* outKr) {
+    *outLen = 0; *outKr = kIOReturnSuccess;
     if (!d->inPipe) return -2;
+    int32_t gen0 = asi_abort_gen(d); // any abort after this point is ours to honor
     if (chunk == 0) chunk = 1 << 20;
     int n = (int)((bufSize + chunk - 1) / chunk);
 
@@ -350,11 +384,13 @@ static int asi_read_frame_async(asicam_dev* d, void* buf, uint32_t bufSize,
     rd->slots = (aslot*)calloc(n, sizeof(aslot));
     if (!rd->slots) { free(rd); return -5; }
     rd->n = n;
+    rd->d = d;
     rd->comp = dispatch_semaphore_create(0);
     for (int i = 0; i < n; i++) rd->slots[i].rd = rd;
+    __sync_lock_test_and_set(&d->rd_first, 0);
 
     dispatch_semaphore_t ready = dispatch_semaphore_create(0);
-    asi_rd_thr ta = { d, rd, ready, NULL, kIOReturnSuccess };
+    asi_rd_thr ta = { d, rd, ready, kIOReturnSuccess };
     pthread_t th;
     if (pthread_create(&th, NULL, asi_rd_run, &ta) != 0) {
         free(rd->slots); dispatch_release(rd->comp); free(rd); dispatch_release(ready);
@@ -368,10 +404,9 @@ static int asi_read_frame_async(asicam_dev* d, void* buf, uint32_t bufSize,
         return -3;
     }
 
-    // Submit all transfers; their completions fire on the dedicated runloop thread. Track how
-    // many are actually in flight: a synchronous submit failure does not schedule a callback,
-    // so it must not be counted (else the drain below waits forever for a completion that
-    // never comes).
+    // Submit all transfers; completions fire on the runloop thread. Count only the ones in
+    // flight: a synchronous submit failure schedules no callback, and counting it would make
+    // the drain below wait forever.
     int inflight = 0;
     for (int i = 0; i < n; i++) {
         uint32_t off = (uint32_t)i * chunk;
@@ -381,43 +416,46 @@ static int asi_read_frame_async(asicam_dev* d, void* buf, uint32_t bufSize,
         if (kr == kIOReturnSuccess) {
             inflight++;
         } else {
-            rd->slots[i].done = 1; rd->slots[i].kr = kr;
+            rd->slots[i].kr = kr; ASI_DONE_SET(&rd->slots[i]);
         }
     }
 
-    // Drain every outstanding completion before tearing down: count completions down one by
-    // one in 100 ms slices so the read_abort latch (StopExposure) is seen promptly; on the
-    // overall deadline or an abort request, AbortPipe (which completes the rest as aborted)
-    // and keep draining with a 2 s per-completion grace. Only once inflight hits 0 do we stop
-    // the runloop and join, so no callback can outlive rd. (Mirrors asi_read_frame_stream.)
+    // Drain every outstanding completion before tearing down, testing the abort latch and the
+    // deadline after every wake, a completion as much as a timeout. A flowing readout completes a
+    // 1 MiB transfer every few tens of ms, so a loop that checks the latch only on the timeout
+    // slice never acts on it: on an ASI6200MC an AbortRead 500 ms into a 2.5 s read was ignored
+    // and all 64 MiB arrived. The runloop stops and joins only once inflight hits 0, so no
+    // callback can outlive rd.
     int64_t deadline = asi_now_ms() + (int64_t)timeoutMs + 500;
     int aborted = 0;
     while (inflight > 0) {
         if (dispatch_semaphore_wait(rd->comp, dispatch_time(DISPATCH_TIME_NOW, 100000000LL)) == 0) {
             inflight--;
-            if (aborted) deadline = asi_now_ms() + 2000; // fresh grace per drained completion
-            continue;
+            if (aborted) { deadline = asi_now_ms() + 2000; continue; } // fresh grace per drained completion
         }
-        if (!aborted && (ASI_READ_ABORT(d) || asi_now_ms() > deadline)) {
+        if (!aborted && (ASI_ABORTED(d, gen0) || asi_now_ms() > deadline)) {
             (*d->intf)->AbortPipe(d->intf, d->inPipe);
             aborted = 1;
             deadline = asi_now_ms() + 2000;
             continue;
         }
-        if (aborted && asi_now_ms() > deadline) break; // genuinely wedged even after the abort
+        if (aborted && asi_now_ms() > deadline) break; // wedged even after the abort
     }
     CFRunLoopStop(rd->rl);
     pthread_join(th, NULL);
 
-    // Bytes transferred, in order, up to and including the frame-terminating short transfer.
-    // A bulk-IN returning fewer bytes than requested completes with kIOReturnUnderrun, not
-    // kIOReturnSuccess — the FX3 ends a frame with a short packet, so the final sub-chunk
-    // legitimately underruns; its bytes are real pixel data and must be counted, then stop.
-    // Only a slot that never completed, or failed with a non-underrun error, truncates.
+    // Bytes transferred, in order, up to and including the frame-terminating short transfer. A
+    // bulk-IN returning fewer bytes than requested completes with kIOReturnUnderrun, and the FX3
+    // ends a frame with a short packet, so the final sub-chunk underruns and its bytes are real
+    // pixel data.
     uint32_t total = 0;
+    IOReturn hardKr = kIOReturnSuccess;
     for (int i = 0; i < n; i++) {
-        if (!rd->slots[i].done) break;
-        if (rd->slots[i].kr != kIOReturnSuccess && rd->slots[i].kr != kIOReturnUnderrun) break;
+        if (!ASI_DONE(&rd->slots[i])) break;
+        if (rd->slots[i].kr != kIOReturnSuccess && rd->slots[i].kr != kIOReturnUnderrun) {
+            if (ASI_HARD_KR(rd->slots[i].kr)) hardKr = rd->slots[i].kr;
+            break;
+        }
         total += rd->slots[i].len;
         uint32_t off = (uint32_t)i * chunk;
         uint32_t req = (off + chunk <= bufSize) ? chunk : (bufSize - off);
@@ -431,21 +469,21 @@ static int asi_read_frame_async(asicam_dev* d, void* buf, uint32_t bufSize,
     free(rd->slots);
     dispatch_release(rd->comp);
     free(rd);
+    if (hardKr != kIOReturnSuccess) { *outKr = hardKr; return -7; } // pipe error, prefix in *outLen
     return 0;
 }
 
-// asi_read_frame_prequeued reads one frame the way the ASI SDK capture thread does: the whole
-// frame's transfers (chunk-sized, last = the remainder) are queued on the pipe BEFORE the
-// frame arrives, so the transfer overlaps the sensor readout and the pipe never idles — the
-// one-at-a-time windowed read leaves gaps that shear a USB2 HighSpeed frame. Gates: totalMs
-// bounds the whole read; idleMs gates only AFTER the first byte (a quiet integration ahead of
-// the first completion must not trip it). Completions land in submission order on a single
-// bulk pipe, so *outLen is the in-order contiguous prefix. rc as asi_read_frame_async
-// (-6 = abandoned; caller pins buf + poisons transport).
+// asi_read_frame_prequeued queues the whole frame's transfers (chunk-sized, last = the
+// remainder) before the frame arrives, so the transfer overlaps the sensor readout and the pipe
+// never idles. A one-at-a-time windowed read leaves gaps that shear a USB2 HighSpeed frame.
+// totalMs bounds the whole read; idleMs gates only after the first byte, so a quiet integration
+// cannot trip it. Completions land in submission order, so *outLen is the contiguous prefix. rc
+// as asi_read_frame_async.
 static int asi_read_frame_prequeued(asicam_dev* d, void* buf, uint32_t bufSize, uint32_t chunk,
-                                    uint32_t idleMs, uint32_t totalMs, uint32_t* outLen) {
-    *outLen = 0;
+                                    uint32_t idleMs, uint32_t totalMs, uint32_t* outLen, IOReturn* outKr) {
+    *outLen = 0; *outKr = kIOReturnSuccess;
     if (!d->inPipe) return -2;
+    int32_t gen0 = asi_abort_gen(d); // any abort after this point is ours to honor
     if (chunk == 0) chunk = 1 << 20;
     int n = (int)((bufSize + chunk - 1) / chunk);
 
@@ -454,11 +492,13 @@ static int asi_read_frame_prequeued(asicam_dev* d, void* buf, uint32_t bufSize, 
     rd->slots = (aslot*)calloc(n, sizeof(aslot));
     if (!rd->slots) { free(rd); return -5; }
     rd->n = n;
+    rd->d = d;
     rd->comp = dispatch_semaphore_create(0);
     for (int i = 0; i < n; i++) rd->slots[i].rd = rd;
+    __sync_lock_test_and_set(&d->rd_first, 0);
 
     dispatch_semaphore_t ready = dispatch_semaphore_create(0);
-    asi_rd_thr ta = { d, rd, ready, NULL, kIOReturnSuccess };
+    asi_rd_thr ta = { d, rd, ready, kIOReturnSuccess };
     pthread_t th;
     if (pthread_create(&th, NULL, asi_rd_run, &ta) != 0) {
         free(rd->slots); dispatch_release(rd->comp); free(rd); dispatch_release(ready);
@@ -484,7 +524,7 @@ static int asi_read_frame_prequeued(asicam_dev* d, void* buf, uint32_t bufSize, 
         if (kr == kIOReturnSuccess) {
             inflight++;
         } else {
-            rd->slots[i].done = 1; rd->slots[i].kr = kr;
+            rd->slots[i].kr = kr; ASI_DONE_SET(&rd->slots[i]);
         }
     }
 
@@ -502,10 +542,10 @@ static int asi_read_frame_prequeued(asicam_dev* d, void* buf, uint32_t bufSize, 
             if (asi_now_ms() - abortAt > 5000) break; // wedged even after the abort
             continue;
         }
-        // Advance over freshly-completed slots: note data arrivals for the idle gate; a
-        // short, underrun or errored slot is the end of the contiguous frame — abort the
-        // rest (they'd otherwise sit armed until their driver timeout).
-        while (cursor < n && rd->slots[cursor].done) {
+        // Advance over freshly completed slots: note data arrivals for the idle gate; a
+        // short, underrun or errored slot ends the contiguous frame, so abort the rest (they
+        // would otherwise sit armed until their driver timeout).
+        while (cursor < n && ASI_DONE(&rd->slots[cursor])) {
             if (rd->slots[cursor].len > 0) { gotFirst = 1; lastData = asi_now_ms(); }
             uint32_t off = (uint32_t)cursor * chunk;
             uint32_t req = (off + chunk <= bufSize) ? chunk : (bufSize - off);
@@ -517,18 +557,22 @@ static int asi_read_frame_prequeued(asicam_dev* d, void* buf, uint32_t bufSize, 
         }
         if (!aborted) {
             int64_t nowv = asi_now_ms();
-            int stall = gotFirst ? (nowv - lastData > (int64_t)idleMs)
+            int stall = gotFirst ? (nowv - lastData > (int64_t)idleMs || nowv - start > (int64_t)totalMs)
                                  : (nowv - start   > (int64_t)totalMs);
-            if (ASI_READ_ABORT(d) || stall) { (*d->intf)->AbortPipe(d->intf, d->inPipe); aborted = 1; abortAt = nowv; }
+            if (ASI_ABORTED(d, gen0) || stall) { (*d->intf)->AbortPipe(d->intf, d->inPipe); aborted = 1; abortAt = nowv; }
         }
     }
     CFRunLoopStop(rd->rl);
     pthread_join(th, NULL);
 
     uint32_t total = 0;
+    IOReturn hardKr = kIOReturnSuccess;
     for (int i = 0; i < n; i++) {
-        if (!rd->slots[i].done) break;
-        if (rd->slots[i].kr != kIOReturnSuccess && rd->slots[i].kr != kIOReturnUnderrun) break;
+        if (!ASI_DONE(&rd->slots[i])) break;
+        if (rd->slots[i].kr != kIOReturnSuccess && rd->slots[i].kr != kIOReturnUnderrun) {
+            if (ASI_HARD_KR(rd->slots[i].kr)) hardKr = rd->slots[i].kr;
+            break;
+        }
         total += rd->slots[i].len;
         uint32_t off = (uint32_t)i * chunk;
         uint32_t req = (off + chunk <= bufSize) ? chunk : (bufSize - off);
@@ -542,36 +586,37 @@ static int asi_read_frame_prequeued(asicam_dev* d, void* buf, uint32_t bufSize, 
     free(rd->slots);
     dispatch_release(rd->comp);
     free(rd);
+    if (hardKr != kIOReturnSuccess) { *outKr = hardKr; return -7; } // pipe error, prefix in *outLen
     return 0;
 }
 
 // ---- Continuous windowed stream read (USB3 large frames) -------------------
 //
-// asi_read_frame_async posts ceil(size/chunk) transfers once and waits for all to settle;
-// on a bursty USB3 stream the trailing transfers complete empty when an intermediate short
-// packet lands, returning a truncated frame. This keeps a small window of transfers cycling
-// on the pipe, resubmitting each as it completes, until the whole frame is in.
-//
-// A single bulk-IN pipe completes transfers in submission order, so completions are reaped
-// FIFO; each completed chunk is copied to a contiguous watermark in the frame buffer (not a
-// fixed chunk*offset), keeping the frame gap-free even when a chunk returns short at a USB
-// burst boundary. It stops only when the whole frame is in, on an idle stall (no completion
-// within idleMs — the caller then kicks the FPGA and calls again for the remainder), or
-// after totalMs. Returns contiguous bytes in *outLen.
+// A small window of transfers cycles on the pipe, each resubmitted as it completes. Completions
+// are reaped FIFO and copied to a contiguous watermark rather than a fixed chunk*offset, which
+// keeps the frame gap-free when a chunk returns short at a USB burst boundary. Posting all
+// transfers once, as asi_read_frame_async does, truncates a bursty USB3 frame: the trailing
+// transfers complete empty when an intermediate short packet lands. The read stops with the whole
+// frame in, on an idle stall (the caller kicks the FPGA and calls again for the remainder), or
+// after totalMs.
 #define ASI_SWIN 8
 typedef struct asi_sd asi_sd;
-typedef struct { volatile int done; uint32_t len; IOReturn kr; asi_sd* sd; int idx; char* scratch; uint64_t seq; } sslot;
+typedef struct { int done; uint32_t len; IOReturn kr; asi_sd* sd; int idx; char* scratch; uint64_t seq; int armed; uint32_t req; } sslot; // done: ASI_DONE* only; req = bytes this submission asked for
 struct asi_sd {
     sslot slots[ASI_SWIN];
     int window;
     dispatch_semaphore_t comp;            // V'd once per completion
-    int q[ASI_SWIN * 4]; volatile int qh, qt; pthread_mutex_t qlk; // completed-slot FIFO
-    CFRunLoopRef rl; dispatch_semaphore_t ready; CFRunLoopSourceRef src; IOReturn srcErr;
+    // Completed-slot FIFO, read only by asi_read_frame_stream (the resident session scans its
+    // slots by sequence number instead and never pops). The indices are unsigned so the
+    // session's write-only qt wraps defined rather than overflowing a signed int, which it
+    // would reach after 2^31 completions of an uninterrupted stream.
+    int q[ASI_SWIN * 4]; volatile uint32_t qh, qt; pthread_mutex_t qlk;
+    CFRunLoopRef rl; dispatch_semaphore_t ready; IOReturn srcErr;
     asicam_dev* d;
 };
 static void asi_stream_cb(void* refcon, IOReturn result, void* arg0) {
     sslot* s = (sslot*)refcon; asi_sd* sd = s->sd;
-    s->len = (uint32_t)(uintptr_t)arg0; s->kr = result; s->done = 1;
+    s->len = (uint32_t)(uintptr_t)arg0; s->kr = result; ASI_DONE_SET(s);
     pthread_mutex_lock(&sd->qlk);
     sd->q[sd->qt % (ASI_SWIN * 4)] = s->idx; sd->qt++;
     pthread_mutex_unlock(&sd->qlk);
@@ -579,16 +624,7 @@ static void asi_stream_cb(void* refcon, IOReturn result, void* arg0) {
 }
 static void* asi_sd_run(void* arg) {
     asi_sd* sd = (asi_sd*)arg;
-    sd->rl = CFRunLoopGetCurrent();
-    sd->srcErr = (*sd->d->intf)->CreateInterfaceAsyncEventSource(sd->d->intf, &sd->src);
-    if (sd->srcErr == kIOReturnSuccess)
-        CFRunLoopAddSource(sd->rl, sd->src, kCFRunLoopDefaultMode);
-    dispatch_semaphore_signal(sd->ready);
-    if (sd->srcErr == kIOReturnSuccess) {
-        CFRunLoopRun();
-        CFRunLoopRemoveSource(sd->rl, sd->src, kCFRunLoopDefaultMode);
-        CFRelease(sd->src);
-    }
+    asi_rl_serve(sd->d, &sd->rl, sd->ready, &sd->srcErr);
     return NULL;
 }
 static int64_t asi_now_ms(void) {
@@ -600,17 +636,17 @@ static int64_t asi_now_ms(void) {
 // still DMA into the (leaked) scratch buffers and a late completion can still dereference the
 // (leaked) session state, so nothing is freed and the caller must poison the transport.
 static int asi_read_frame_stream(asicam_dev* d, void* buf, uint32_t bufSize, uint32_t chunk,
-                                 uint32_t idleMs, uint32_t totalMs, uint32_t* outLen) {
-    *outLen = 0;
+                                 uint32_t idleMs, uint32_t totalMs, uint32_t* outLen, IOReturn* outKr) {
+    *outLen = 0; *outKr = kIOReturnSuccess;
     if (!d->inPipe) return -2;
+    int32_t gen0 = asi_abort_gen(d); // any abort after this point is ours to honor
     if (chunk == 0) chunk = 1 << 20;
     uint32_t nchunks = (bufSize + chunk - 1) / chunk;
     int window = ASI_SWIN;
     if ((uint32_t)window > nchunks) window = (int)nchunks;
 
     // Heap-allocate the session state (see asi_read_frame_async): a late completion
-    // dereferences it via its refcon, so it must outlive this call when a transfer is
-    // abandoned.
+    // dereferences it via its refcon.
     asi_sd* sd = (asi_sd*)calloc(1, sizeof(asi_sd));
     if (!sd) return -5;
     sd->window = window; sd->d = d;
@@ -643,27 +679,51 @@ static int asi_read_frame_stream(asicam_dev* d, void* buf, uint32_t bufSize, uin
 
     uint32_t received = 0; // contiguous bytes confirmed into buf
     int inflight = 0;
-    // Prime the window: each slot reads a full chunk into its own scratch buffer.
+    IOReturn primeKr = kIOReturnSuccess;
+    // Prime the window. Each slot is sized to what the frame still needs at its offset. A
+    // full-chunk request for the frame's tail pulls in the head of the next free-run frame, and
+    // the copy below discards anything past bufSize, so every later frame comes up short by that
+    // much. outstanding tracks the bytes in-flight transfers have spoken for, so a re-arm cannot
+    // over-request either.
+    uint32_t outstanding = 0;
     for (int i = 0; i < window; i++) {
-        sd->slots[i].done = 0;
-        IOReturn kr = (*d->intf)->ReadPipeAsyncTO(d->intf, d->inPipe, sd->slots[i].scratch, chunk,
+        uint32_t off = (uint32_t)i * chunk;
+        uint32_t want = (off < bufSize && bufSize - off < chunk) ? bufSize - off : chunk;
+        ASI_DONE_CLEAR(&sd->slots[i]);
+        sd->slots[i].req = want;
+        IOReturn kr = (*d->intf)->ReadPipeAsyncTO(d->intf, d->inPipe, sd->slots[i].scratch, want,
                           totalMs, totalMs, (IOAsyncCallback1)asi_stream_cb, &sd->slots[i]);
-        if (kr != kIOReturnSuccess) break;
+        if (kr != kIOReturnSuccess) { primeKr = kr; break; }
         inflight++;
+        outstanding += want;
+    }
+    // An empty window is fatal: the reap loop runs no pass and the read returns rc 0 with 0
+    // bytes, which the caller reads as an idle stall and answers by re-arming into the same
+    // failure. A partially primed window still works.
+    if (inflight == 0) {
+        if (sd->rl) CFRunLoopStop(sd->rl);
+        pthread_join(th, NULL);
+        for (int i = 0; i < window; i++) free(sd->slots[i].scratch);
+        dispatch_release(sd->comp); dispatch_release(sd->ready);
+        pthread_mutex_destroy(&sd->qlk); free(sd);
+        *outKr = primeKr;
+        return -7;
     }
 
-    // Stall detection is time-based on real data, not zero-length-packet count: when the FX3
-    // holds the frame's final partial DMA buffer it emits a burst of zero-length packets (fast
-    // on USB2), so a count guard trips long before the tail commits (via FPGABufReload or the
-    // next free-run frame). Give up only after idleMs with no actual bytes; a ZLP blocks ~one
-    // packet time on the semaphore, so this doesn't busy-spin.
+    // Stall detection is time-based on real data, not zero-length-packet count. The FX3 emits a
+    // burst of ZLPs while it holds the frame's final partial DMA buffer, so a count guard trips
+    // long before the tail commits through FPGABufReload or the next free-run frame. A ZLP blocks
+    // about one packet time on the semaphore, so waiting out idleMs does not busy-spin.
     int64_t sliceNs = (int64_t)idleMs * 1000000LL;
     if (sliceNs > 100000000LL) sliceNs = 100000000LL; // wake at least every 100 ms to re-check
     int64_t lastReal = asi_now_ms();
+    int64_t start = lastReal;
+    IOReturn hardKr = kIOReturnSuccess;
     while (received < bufSize && inflight > 0) {
-        if (ASI_READ_ABORT(d)) break; // StopExposure broke the read; the teardown below drains
+        if (ASI_ABORTED(d, gen0)) break; // abort latched; the teardown below drains
+        if (asi_now_ms() - start > (int64_t)totalMs) break; // whole-read bound
         if (dispatch_semaphore_wait(sd->comp, dispatch_time(DISPATCH_TIME_NOW, sliceNs)) != 0) {
-            if (asi_now_ms() - lastReal > (int64_t)idleMs) break; // no real data for the idle window
+            if (asi_now_ms() - lastReal > (int64_t)idleMs) break; // no data for the idle window
             continue;
         }
         pthread_mutex_lock(&sd->qlk);
@@ -671,23 +731,34 @@ static int asi_read_frame_stream(asicam_dev* d, void* buf, uint32_t bufSize, uin
         pthread_mutex_unlock(&sd->qlk);
         inflight--;
         sslot* s = &sd->slots[slot];
-        if (s->kr != kIOReturnSuccess && s->kr != kIOReturnUnderrun) break; // hard error
+        if (outstanding >= s->req) outstanding -= s->req; else outstanding = 0;
+        if (s->kr != kIOReturnSuccess && s->kr != kIOReturnUnderrun) { // stall or pipe error
+            if (ASI_HARD_KR(s->kr)) hardKr = s->kr;
+            break;
+        }
         uint32_t take = s->len;
         if (take > bufSize - received) take = bufSize - received;
         if (take) {
             memcpy((char*)buf + received, s->scratch, take); received += take;
             lastReal = asi_now_ms();
         } else if (asi_now_ms() - lastReal > (int64_t)idleMs) {
-            break; // only zero-length packets for the whole idle window = a real stall
+            break; // only zero-length packets for the whole idle window = a stall
         }
         if (received < bufSize) {
-            // A zero-length completion is the FX3's inter-buffer / frame-boundary marker, not
-            // end-of-frame: the tail of the last partial 1-MiB DMA buffer is still to come
-            // (FPGABufReload, or the next free-run frame, commits it). Keep cycling.
-            s->done = 0;
-            IOReturn kr = (*d->intf)->ReadPipeAsyncTO(d->intf, d->inPipe, s->scratch, chunk,
-                              totalMs, totalMs, (IOAsyncCallback1)asi_stream_cb, s);
-            if (kr == kIOReturnSuccess) inflight++;
+            // A zero-length completion is the FX3's inter-buffer marker, not end-of-frame: the
+            // tail of the last partial 1-MiB DMA buffer still has to come, committed by
+            // FPGABufReload or the next free-run frame. A ZLP does not advance received, so its
+            // slot re-arms at once and the window never runs dry while bytes are owed.
+            uint32_t left = bufSize - received;
+            uint32_t want = (left > outstanding) ? left - outstanding : 0;
+            if (want > chunk) want = chunk;
+            if (want > 0) {
+                ASI_DONE_CLEAR(s);
+                s->req = want;
+                IOReturn kr = (*d->intf)->ReadPipeAsyncTO(d->intf, d->inPipe, s->scratch, want,
+                                  totalMs, totalMs, (IOAsyncCallback1)asi_stream_cb, s);
+                if (kr == kIOReturnSuccess) { inflight++; outstanding += want; }
+            }
         }
     }
 
@@ -704,34 +775,72 @@ static int asi_read_frame_stream(asicam_dev* d, void* buf, uint32_t bufSize, uin
     *outLen = received;
 
     if (inflight > 0) return -6; // abandoned: leak sd + scratches, skip the pipe clear
+    if (hardKr != kIOReturnSuccess) { *outKr = hardKr; }
 
     (*d->intf)->ClearPipeStallBothEnds(d->intf, d->inPipe);
     for (int i = 0; i < window; i++) free(sd->slots[i].scratch);
     dispatch_release(sd->comp); dispatch_release(sd->ready);
     pthread_mutex_destroy(&sd->qlk);
     free(sd);
+    if (hardKr != kIOReturnSuccess) return -7; // pipe error, prefix in *outLen
     return 0;
 }
 
 // ---- Persistent stream session (video / planetary burst) -------------------------
-// asi_read_frame_stream above sets up the window, spawns the CFRunLoop thread, reads one
-// frame, and tears it all down — a fixed per-frame cost (~tens of ms) that dominates when
-// frames are small. The session below keeps that machinery resident across a whole burst:
-// asi_stream_start primes it once, asi_stream_next pulls exactly one frame (bufSize bytes)
-// out of the continuously-cycling window — copying across chunk boundaries and re-arming
-// each slot as it drains — and asi_stream_stop aborts and frees. The window never stops, so
-// the FX3 stream stays saturated and small frames read at the sensor's true rate.
+//
+// Building the window is cheap: 0.14 ms per read on an ASI6200MC, scratch allocation included,
+// the same at a 512x512 ROI as at the full 122 MB frame. Stopping is what costs. A read that
+// tears the window down leaves the pipe idle until the next one primes it, and the FX3 stream
+// drains in that gap. The session keeps the window cycling across frames instead, which holds
+// the stream saturated and reads small frames at the sensor's rate: 23.4 fps against 0.9 fps for
+// arm-per-frame on that camera.
 typedef struct {
     asi_sd   sd;
     pthread_t th;
     uint32_t chunk;
     uint32_t totalMs;
+    uint32_t xferMs;     // driver-side per-transfer timeout (totalMs + margin)
     uint64_t next_seq;   // segment to consume next (in-order watermark)
     uint64_t submit_seq; // segment number for the next submission
     uint32_t seg_off;    // bytes already consumed from the current next_seq segment
     int      started;
     int      held;       // slot handed out by next_zc, awaiting release (-1 = none)
+    int      desynced;   // a Next returned mid-frame; the segment stream no longer aligns
+    int      unclaimed;  // completion signals consumed while waiting, not yet matched to a recycled slot
 } asicam_stream;
+
+// Semaphore accounting for a resident session. A caller waiting for a completion consumes one
+// signal (unclaimed++); recycling a done slot claims its completion (unclaimed--, or one signal
+// if none was consumed for it yet). Signals never accumulate over a burst, a fresh completion is
+// never discarded, and stop polls the armed slots rather than counting signals.
+static void asi_stream_claim(asicam_stream* s) {
+    if (s->unclaimed > 0) { s->unclaimed--; return; }
+    dispatch_semaphore_wait(s->sd.comp, dispatch_time(DISPATCH_TIME_NOW, 100 * 1000000LL));
+}
+// asi_stream_rearm resubmits a recycled slot for the next segment; armed marks it as owned by
+// the kernel until its callback runs. The driver-side timeout is xferMs, not totalMs: it bounds
+// one transfer's own wait for data, and the reap in asi_stream_next owns the caller's idle gate.
+static void asi_stream_rearm(asicam_stream* s, sslot* cur) {
+    asi_sd* sd = &s->sd;
+    ASI_DONE_CLEAR(cur); cur->seq = s->submit_seq; cur->armed = 1;
+    IOReturn kr = (*sd->d->intf)->ReadPipeAsyncTO(sd->d->intf, sd->d->inPipe, cur->scratch, s->chunk,
+            s->xferMs, s->xferMs, (IOAsyncCallback1)asi_stream_cb, cur);
+    if (kr == kIOReturnSuccess)
+        s->submit_seq++;
+    else
+        cur->armed = 0; // dead slot: no completion will come; stop must not wait for it
+}
+
+// asi_stream_live reports whether the session can still produce anything. armed stays set from
+// submission through completion and clears only when a re-arm fails, so a slot counts until it
+// is retired. An empty window can never deliver a completion, so Next would return an idle stall
+// on every call against a finished session. Checked only when Next is about to wait.
+static int asi_stream_live(asicam_stream* s) {
+    asi_sd* sd = &s->sd;
+    for (int i = 0; i < sd->window; i++)
+        if (sd->slots[i].armed || ASI_DONE(&sd->slots[i])) return 1;
+    return 0;
+}
 
 static void asi_stream_free(asicam_stream* s) {
     asi_sd* sd = &s->sd;
@@ -758,136 +867,174 @@ static asicam_stream* asi_stream_start(asicam_dev* d, uint32_t chunk, uint32_t t
         if (!sd->slots[i].scratch) { asi_stream_free(s); return NULL; }
     }
     s->chunk = chunk; s->totalMs = totalMs;
+    // The driver bounds each transfer's own wait for data from when that transfer reaches the
+    // head of the pipe, not from when it was queued: on an ASI6200MC with 8 slots armed and a
+    // 101 ms frame period, transfers survived a 160 ms timeout and failed at 150 ms. One frame
+    // period is what has to fit, and the margin keeps a frame period that nearly fills totalMs
+    // off the knife edge.
+    s->xferMs = totalMs + 1000;
     if (pthread_create(&s->th, NULL, asi_sd_run, sd) != 0) { asi_stream_free(s); return NULL; }
     dispatch_semaphore_wait(sd->ready, DISPATCH_TIME_FOREVER);
     if (sd->srcErr != kIOReturnSuccess) { pthread_join(s->th, NULL); asi_stream_free(s); return NULL; }
     // Prime the window: every slot reads a full chunk, tagged with its stream-segment number.
+    int armed = 0;
     for (int i = 0; i < sd->window; i++) {
-        sd->slots[i].done = 0; sd->slots[i].seq = s->submit_seq;
+        ASI_DONE_CLEAR(&sd->slots[i]); sd->slots[i].seq = s->submit_seq; sd->slots[i].armed = 1;
         IOReturn kr = (*d->intf)->ReadPipeAsyncTO(d->intf, d->inPipe, sd->slots[i].scratch, chunk,
-                          totalMs, totalMs, (IOAsyncCallback1)asi_stream_cb, &sd->slots[i]);
-        if (kr != kIOReturnSuccess) break;
+                          s->xferMs, s->xferMs, (IOAsyncCallback1)asi_stream_cb, &sd->slots[i]);
+        if (kr != kIOReturnSuccess) { sd->slots[i].armed = 0; break; }
         s->submit_seq++;
+        armed++;
     }
     s->held = -1;
     s->started = 1;
+    // A partially primed window still streams, with less pipelining. An empty one never will, so
+    // every Next would idle out against a live-but-silent session. Fail the start instead.
+    if (armed == 0) {
+        s->started = 0; // nothing to abort or wait for
+        if (sd->rl) CFRunLoopStop(sd->rl);
+        pthread_join(s->th, NULL);
+        asi_stream_free(s);
+        return NULL;
+    }
     return s;
 }
 
-// asi_stream_next_zc is the zero-copy variant: instead of memcpy'ing a frame into a caller
-// buffer, it returns a pointer to the window scratch buffer that already holds the next
-// whole frame, and holds that slot (does not recycle it) until asi_stream_release. Valid
-// only when chunk == one frame (sub-MiB ROI), so the frame is contiguous in one scratch.
-// *outBuf = scratch; returns the frame length, 0 on idle stall, -1 on a hard error. The
-// caller must consume *outBuf before calling release (which re-arms the slot and overwrites it).
-static int asi_stream_next_zc(asicam_stream* s, char** outBuf, uint32_t idleMs) {
-    asi_sd* sd = &s->sd;
-    int64_t lastReal = asi_now_ms();
-    const int64_t sliceNs = 50 * 1000000LL;
-    for (;;) {
-        pthread_mutex_lock(&sd->qlk);
-        sslot* cur = NULL;
-        for (int i = 0; i < sd->window; i++)
-            if (sd->slots[i].done && sd->slots[i].seq == s->next_seq) { cur = &sd->slots[i]; break; }
-        pthread_mutex_unlock(&sd->qlk);
-        if (cur) {
-            if (cur->kr != kIOReturnSuccess && cur->kr != kIOReturnUnderrun) return -1;
-            if (cur->len == 0) { // ZLP frame-boundary marker: skip it, recycle, keep going
-                s->next_seq++;
-                cur->done = 0; cur->seq = s->submit_seq;
-                if ((*sd->d->intf)->ReadPipeAsyncTO(sd->d->intf, sd->d->inPipe, cur->scratch, s->chunk,
-                        s->totalMs, s->totalMs, (IOAsyncCallback1)asi_stream_cb, cur) == kIOReturnSuccess)
-                    s->submit_seq++;
-                continue;
-            }
-            *outBuf = cur->scratch;
-            s->held = cur->idx;
-            return (int)cur->len;
-        }
-        while (dispatch_semaphore_wait(sd->comp, DISPATCH_TIME_NOW) == 0) {}
-        if (dispatch_semaphore_wait(sd->comp, dispatch_time(DISPATCH_TIME_NOW, sliceNs)) != 0) {
-            if (asi_now_ms() - lastReal > (int64_t)idleMs) return 0;
-        }
-    }
-}
-
-// asi_stream_release recycles the slot handed out by the last asi_stream_next_zc — re-arms
-// it for the next segment and advances the in-order watermark. No-op if nothing is held.
+// asi_stream_release recycles the slot handed out by the last asi_stream_next_zc: it re-arms the
+// slot for the next segment and advances the in-order watermark. No-op if nothing is held.
+//
+// Both next entry points call it first. A held slot sits at the watermark, so asi_stream_next
+// would otherwise drain and re-arm it while `held` still named it, and the caller's later release
+// would re-arm an already armed slot (two transfers into one scratch) and step the watermark past
+// a sequence number no slot carries. The session then stalls one window later, not at once: on an
+// ASI6200MC 6 more frames read fine and every Next after that idled out.
 static void asi_stream_release(asicam_stream* s) {
     asi_sd* sd = &s->sd;
     if (s->held < 0) return;
     sslot* cur = &sd->slots[s->held];
     s->held = -1;
     s->next_seq++;
-    cur->done = 0; cur->seq = s->submit_seq;
-    if ((*sd->d->intf)->ReadPipeAsyncTO(sd->d->intf, sd->d->inPipe, cur->scratch, s->chunk,
-            s->totalMs, s->totalMs, (IOAsyncCallback1)asi_stream_cb, cur) == kIOReturnSuccess)
-        s->submit_seq++;
+    asi_stream_claim(s);
+    asi_stream_rearm(s, cur);
 }
 
-// asi_stream_next copies exactly one frame (bufSize bytes) out of the resident stream,
-// strictly in segment order, re-submitting each slot the moment it is fully drained. A
-// chunk may straddle frame boundaries (seg_off remembers the partial remainder for the
-// next call), so small frames pack several to a chunk with no extra reads. Returns bytes
-// copied (== bufSize on success), 0/short on an idle stall, -1 on a hard pipe error.
-static int asi_stream_next(asicam_stream* s, void* buf, uint32_t bufSize, uint32_t idleMs) {
+// asi_stream_next_zc returns a pointer to the window scratch holding the next whole frame and
+// holds that slot until asi_stream_release. It applies only when chunk == one frame (sub-MiB
+// ROI), so the frame is contiguous in one scratch. Returns the frame length, 0 on an idle stall,
+// -1 on a hard error with its IOReturn in *outKr. The caller must consume *outBuf before the next
+// call, which recycles the slot and overwrites it.
+static int asi_stream_next_zc(asicam_stream* s, char** outBuf, uint32_t idleMs, IOReturn* outKr) {
     asi_sd* sd = &s->sd;
+    *outKr = kIOReturnSuccess;
+    asi_stream_release(s); // a slot still held from the last call (see asi_stream_release)
+    int64_t lastReal = asi_now_ms();
+    const int64_t sliceNs = 50 * 1000000LL;
+    for (;;) {
+        pthread_mutex_lock(&sd->qlk);
+        sslot* cur = NULL;
+        for (int i = 0; i < sd->window; i++)
+            if (ASI_DONE(&sd->slots[i]) && sd->slots[i].seq == s->next_seq) { cur = &sd->slots[i]; break; }
+        pthread_mutex_unlock(&sd->qlk);
+        if (cur) {
+            if (ASI_HARD_KR(cur->kr)) { *outKr = cur->kr; return -1; }
+            if (cur->len == 0) { // ZLP frame-boundary marker: skip it, recycle, keep going
+                s->next_seq++;
+                asi_stream_claim(s);
+                asi_stream_rearm(s, cur);
+                continue;
+            }
+            *outBuf = cur->scratch;
+            s->held = cur->idx;
+            return (int)cur->len;
+        }
+        if (!asi_stream_live(s)) return -1; // window died: no completion can ever arrive
+        // Wait for one completion (its signal is claimed when that slot is recycled).
+        if (dispatch_semaphore_wait(sd->comp, dispatch_time(DISPATCH_TIME_NOW, sliceNs)) == 0) {
+            s->unclaimed++;
+        } else if (asi_now_ms() - lastReal > (int64_t)idleMs) {
+            return 0;
+        }
+    }
+}
+
+// asi_stream_next copies one frame (bufSize bytes) out of the resident stream in segment order,
+// re-submitting each slot once it is fully drained. A chunk may straddle frame boundaries, and
+// seg_off remembers the partial remainder for the next call, so small frames pack several to a
+// chunk. Returns bytes copied, 0 or short on an idle stall, -1 on a hard pipe error, -2 once
+// desynced.
+//
+// A short return means the idle window elapsed part way through a frame. Nothing can realign the
+// segment watermark afterwards: the FX3 emits ZLPs at inter-buffer boundaries as well as frame
+// boundaries, and the session aligns in the first place only by starting just after the sensor
+// arms. The session latches `desynced`, and the caller must close it and start a new one.
+//
+// Only ASI_HARD_KR ends the session. A driver per-transfer timeout or our own abort carries real
+// pixel data, since the rest of that frame has already landed in the following slot, so its slot
+// drains and recycles like any other segment. Dropping those completions misaligns the segment
+// stream for good.
+static int asi_stream_next(asicam_stream* s, void* buf, uint32_t bufSize, uint32_t idleMs, IOReturn* outKr) {
+    asi_sd* sd = &s->sd;
+    *outKr = kIOReturnSuccess;
+    if (s->desynced) return -2; // a previous call ended mid-frame; Close and StartStream to realign
+    asi_stream_release(s); // a slot still held from a next_zc (see asi_stream_release)
     uint32_t copied = 0;
     int64_t lastReal = asi_now_ms();
-    const int64_t sliceNs = 50 * 1000000LL; // 50 ms re-check cadence
+    const int64_t sliceNs = 50 * 1000000LL; // idle re-check cadence
     while (copied < bufSize) {
         int progressed = 0;
         for (;;) {
             pthread_mutex_lock(&sd->qlk);
             sslot* cur = NULL;
             for (int i = 0; i < sd->window; i++)
-                if (sd->slots[i].done && sd->slots[i].seq == s->next_seq) { cur = &sd->slots[i]; break; }
+                if (ASI_DONE(&sd->slots[i]) && sd->slots[i].seq == s->next_seq) { cur = &sd->slots[i]; break; }
             pthread_mutex_unlock(&sd->qlk);
             if (!cur) break;
-            if (cur->kr != kIOReturnSuccess && cur->kr != kIOReturnUnderrun) return -1;
+            if (ASI_HARD_KR(cur->kr)) { *outKr = cur->kr; return -1; }
             uint32_t avail = cur->len - s->seg_off;
             uint32_t take = avail; if (take > bufSize - copied) take = bufSize - copied;
             if (take) {
                 memcpy((char*)buf + copied, cur->scratch + s->seg_off, take);
                 copied += take; s->seg_off += take; progressed = 1; lastReal = asi_now_ms();
             }
-            if (s->seg_off >= cur->len) { // segment fully consumed — recycle the slot
+            if (s->seg_off >= cur->len) { // segment fully consumed: recycle the slot
                 s->seg_off = 0; s->next_seq++;
-                cur->done = 0; cur->seq = s->submit_seq;
-                if ((*sd->d->intf)->ReadPipeAsyncTO(sd->d->intf, sd->d->inPipe, cur->scratch, s->chunk,
-                        s->totalMs, s->totalMs, (IOAsyncCallback1)asi_stream_cb, cur) == kIOReturnSuccess)
-                    s->submit_seq++;
+                asi_stream_claim(s);
+                asi_stream_rearm(s, cur);
             }
             if (copied >= bufSize) break;
         }
         if (copied >= bufSize) break;
-        // Need more bytes: drain any stale signals, then block for a fresh completion so the
-        // semaphore count can't run away over a long burst (which would busy-spin and defeat
-        // the stall guard). The 50 ms slice + outer re-check covers a drain/block race.
-        while (dispatch_semaphore_wait(sd->comp, DISPATCH_TIME_NOW) == 0) {}
-        if (dispatch_semaphore_wait(sd->comp, dispatch_time(DISPATCH_TIME_NOW, sliceNs)) != 0) {
-            if (!progressed && asi_now_ms() - lastReal > (int64_t)idleMs) break; // genuine stall
+        if (!asi_stream_live(s)) return -1; // window died: no completion can ever arrive
+        // Need more bytes: wait for one completion, then re-scan at once (no drain, so a
+        // completion landing between the scan and the wait is never discarded).
+        if (dispatch_semaphore_wait(sd->comp, dispatch_time(DISPATCH_TIME_NOW, sliceNs)) == 0) {
+            s->unclaimed++;
+        } else if (!progressed && asi_now_ms() - lastReal > (int64_t)idleMs) {
+            break; // stall
         }
     }
+    // Short and off a frame boundary: the watermark has passed bytes the caller never got a whole
+    // frame from, so latch rather than hand back offset frames.
+    if (copied < bufSize && (copied > 0 || s->seg_off > 0)) s->desynced = 1;
     return (int)copied;
 }
 
-// rc 0 = ok; -6 = a transfer could not be drained after the abort: the kernel may still DMA
-// into a scratch buffer and a late completion can still dereference the session, so the whole
-// session is leaked (not freed) and the caller must poison the transport.
+// rc 0 = ok; -6 = the kernel still owns a transfer after the abort, so the whole session leaks
+// and the caller must poison the transport. Completion is judged per armed slot against a
+// deadline, not by counting signals.
 static int asi_stream_stop(asicam_stream* s) {
     if (!s) return 0;
     asi_sd* sd = &s->sd;
     if (s->started) {
         (*sd->d->intf)->AbortPipe(sd->d->intf, sd->d->inPipe);
-        for (int g = 0; g < sd->window + 4; g++)
-            if (dispatch_semaphore_wait(sd->comp, dispatch_time(DISPATCH_TIME_NOW, 500000000LL)) != 0) break;
-        // Freeing is safe only once every slot's completion has actually run (the semaphore
-        // drain above can exit early on residual counts): an undone slot means the kernel
-        // still owns its scratch buffer.
-        int undone = 0;
-        for (int i = 0; i < sd->window; i++)
-            if (!sd->slots[i].done) { undone = 1; break; }
+        int undone = 1;
+        for (int64_t t0 = asi_now_ms(); asi_now_ms() - t0 < 3000; ) {
+            undone = 0;
+            for (int i = 0; i < sd->window; i++)
+                if (sd->slots[i].armed && !ASI_DONE(&sd->slots[i])) { undone = 1; break; }
+            if (!undone) break;
+            dispatch_semaphore_wait(sd->comp, dispatch_time(DISPATCH_TIME_NOW, 5 * 1000000LL)); // 5 ms
+        }
         if (sd->rl) CFRunLoopStop(sd->rl);
         pthread_join(s->th, NULL);
         if (undone) return -6; // abandoned: leak the session, skip the pipe clear
@@ -926,17 +1073,24 @@ import (
 	"unsafe"
 )
 
-// errClosed is returned by a transfer attempted after Close has freed the handle,
-// instead of dereferencing the dangling t.d (a SIGSEGV inside the C library).
+// errClosed is returned by a transfer attempted after Close has freed the handle.
 var errClosed = errors.New("astrocam: transport closed")
 
-// errTransportBroken marks a device whose aborted transfers never completed (C rc -6): the
-// kernel may still DMA into outstanding buffers, so all further I/O (including the final
-// interface release) is refused. Only unplugging the device / process exit recovers.
+// errTransportBroken marks a device whose aborted transfers never completed (C rc -6; see
+// darwinDevice.broken).
 var errTransportBroken = errors.New("astrocam: transport broken (abandoned in-flight transfers)")
 
-// darwinLeakedIO pins Go buffers the kernel may still DMA into (a read returned rc -6):
-// they must never be reused or collected. Package-level and never cleared, on purpose.
+// errStreamBusy is returned by StartStream while another session holds the bulk pipe: one byte
+// stream cannot feed two windows (see StartStream).
+var errStreamBusy = errors.New("astrocam: a stream session is already open on this device")
+
+// ErrStreamDesynced is returned by a session Next after an earlier Next ended part way through a
+// frame. The segment stream cannot be realigned in place, so the caller must Close the session
+// and StartStream again rather than abandon the capture.
+var ErrStreamDesynced = errors.New("astrocam: stream session desynced by a short read; close and restart it")
+
+// darwinLeakedIO pins Go buffers the kernel may still DMA into (a read returned rc -6); they
+// must never be reused or collected. Never cleared.
 var (
 	darwinLeakedIOMu sync.Mutex
 	darwinLeakedIO   [][]byte
@@ -953,30 +1107,39 @@ type darwinDevice struct {
 	d    *C.asicam_dev
 	diag C.asicam_diag
 
-	// ioMu serializes EP0 control transfers (the IOUSBLib handle isn't safe for concurrent
-	// DeviceRequestTO) and a whole-frame BulkRead, so a control transfer can't interleave with
-	// the readout and wedge the un-buffered USB2 path. ReadFrameStream (the USB3/DDR path)
-	// stays unlocked; it needs the worker's concurrent FPGABufReload. See transport_linux.go
-	// (usbfsDevice.ioMu) for the full rationale.
+	// ioMu serializes gated EP0 control transfers against the whole-frame reads BulkRead,
+	// BulkReadQuiet (after its quiet window) and ReadFrameStreamPrequeued, so a control transfer
+	// cannot interleave with a readout and wedge the un-buffered USB2 path. ReadFrameStream (the
+	// USB3 DDR path) skips it, since that path needs the worker's concurrent FPGABufReload, and
+	// ControlOutUngated bypasses it. Lock order: closeMu (shared) before ioMu.
 	ioMu sync.Mutex
 
-	// closeMu guards the handle's lifetime against the transfers that use it. Every operation
-	// that touches t.d takes it as a reader (so a readout plus a TEC tick run concurrently);
-	// Close takes it as the writer, so it cannot free t.d while a transfer is mid-flight, and a
-	// transfer started after Close sees closed and returns errClosed instead of dereferencing
-	// freed memory.
+	// closeMu is the Close interlock: every operation touching t.d holds it shared, and Close
+	// takes it exclusively, so Close cannot free t.d under a transfer.
 	closeMu sync.RWMutex
 	closed  bool
 
-	// broken latches when an aborted read could not be drained (C rc -6): the kernel still
-	// owns outstanding buffers, so every subsequent transfer fails fast and Close leaks the
-	// handle instead of releasing an interface with I/O in flight.
+	// dMu guards t.d against Close's free for the ReadAborter calls alone. Those cannot use
+	// closeMu: a frame read holds it shared for seconds, a concurrent Close parks on the
+	// exclusive lock, and Go's RWMutex then queues every new reader behind the waiting writer.
+	// AbortRead would block on the read it exists to break (measured: a 2.5 s read, AbortRead
+	// blocked 2.1 s, all 64 MiB delivered). A plain mutex has no writer preference, and Close
+	// holds it only across the free. Lock order: dMu is a leaf, taken alone.
+	dMu    sync.Mutex
+	dFreed bool // set under dMu immediately before asi_close/free
+
+	// broken latches when an aborted read could not be drained (C rc -6). The kernel still owns
+	// outstanding buffers, so every later transfer fails fast and Close leaks the handle. Only a
+	// replug or process exit recovers.
 	broken atomic.Bool
 
-	// readAborted mirrors the C-side read_abort latch (ReadAborter) for the Go-side entry
-	// fail-fast: while set, new frame reads return (0, nil) without arming anything; the
-	// C reap loops poll the C flag to break a read already blocked in cgo.
+	// readAborted is the Go-side entry latch of ReadAborter: while set, new frame reads return
+	// (0, nil) without taking ioMu. Breaking a read already blocked in cgo is abort_gen's job.
 	readAborted atomic.Bool
+	// readActive counts frame reads in flight, including open stream sessions. On a USB2 link the
+	// IN control path paces itself while it is non-zero.
+	readActive atomic.Int32
+	inPace     inPacer
 
 	// streamMu guards the open resident-session registry (locked after closeMu). Close stops
 	// leftover sessions before releasing the interface their pump threads reference.
@@ -984,8 +1147,8 @@ type darwinDevice struct {
 	streams  map[*darwinStream]struct{}
 }
 
-// forfeit pins buf forever and poisons the transport: an abandoned transfer means the kernel
-// can still DMA into it at any time.
+// forfeit pins buf in darwinLeakedIO and poisons the transport: an abandoned transfer means
+// the kernel can still DMA into buf.
 func (t *darwinDevice) forfeit(buf []byte) {
 	t.broken.Store(true)
 	darwinLeakedIOMu.Lock()
@@ -993,12 +1156,11 @@ func (t *darwinDevice) forfeit(buf []byte) {
 	darwinLeakedIOMu.Unlock()
 }
 
-// openIOUSBHost finds the first device matching vid/pid via IOKit, opens it, and
-// claims its bulk interface (OpenHost is the public entry). On failure it reports where it
-// stopped.
+// openIOUSBHost finds the first device matching vid/pid via IOKit, opens it, and claims its
+// bulk interface (OpenHost is the public entry). On failure it reports where it stopped.
 func openIOUSBHost(vid, pid uint16) (*darwinDevice, error) {
 	dev := (*C.asicam_dev)(C.calloc(1, C.size_t(unsafe.Sizeof(C.asicam_dev{}))))
-	t := &darwinDevice{d: dev}
+	t := &darwinDevice{d: dev, inPace: inPacer{min: usb2InPace}}
 	if rc := C.asi_open(C.uint16_t(vid), C.uint16_t(pid), dev, &t.diag); rc != 0 {
 		C.free(unsafe.Pointer(dev))
 		return nil, openError(vid, pid, &t.diag)
@@ -1036,7 +1198,7 @@ func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 // identical cameras are attached.
 func OpenLocation(vid uint16, loc uint32) (Transport, error) {
 	dev := (*C.asicam_dev)(C.calloc(1, C.size_t(unsafe.Sizeof(C.asicam_dev{}))))
-	t := &darwinDevice{d: dev}
+	t := &darwinDevice{d: dev, inPace: inPacer{min: usb2InPace}}
 	if rc := C.asi_open_location(C.uint16_t(vid), C.uint32_t(loc), dev, &t.diag); rc != 0 {
 		C.free(unsafe.Pointer(dev))
 		if t.diag.matched == 0 {
@@ -1099,15 +1261,19 @@ func (t *darwinDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, d
 	}
 	t.ioMu.Lock()
 	defer t.ioMu.Unlock()
+	if reqType&0x80 != 0 && t.readActive.Load() > 0 && !t.SuperSpeed() {
+		t.inPace.wait() // a USB2 readout in flight: pace EP0 reads (usb2InPace)
+	}
 	var done C.uint32_t
 	var ptr unsafe.Pointer
 	if len(data) > 0 {
 		ptr = unsafe.Pointer(&data[0])
 	}
+	var kr C.IOReturn
 	rc := C.asi_control(t.d, C.uint8_t(reqType), C.uint8_t(bRequest), C.uint16_t(wValue), C.uint16_t(wIndex),
-		ptr, C.uint16_t(len(data)), &done)
+		ptr, C.uint16_t(len(data)), &done, &kr)
 	if rc != 0 {
-		return 0, fmt.Errorf("astrocam: control transfer (req 0x%02x) failed", bRequest)
+		return 0, fmt.Errorf("astrocam: control transfer (req 0x%02x) failed: IOReturn 0x%08x", bRequest, uint32(kr))
 	}
 	return int(done), nil
 }
@@ -1121,30 +1287,48 @@ func (t *darwinDevice) ControlIn(bRequest uint8, wValue, wIndex uint16, data []b
 	return t.control(0xC0, bRequest, wValue, wIndex, data)
 }
 
-// AbortRead / ArmRead implement ReadAborter (see transport.go): the Go latch handles the
-// entry fail-fast, and the C-side read_abort flag breaks a read already blocked inside a
-// cgo call; its reap loops poll the flag every ≤100 ms and abort the pipe.
+// AbortRead breaks a read in flight. The Go latch fails later reads fast, and the C-side
+// generation breaks a read already blocked inside a cgo call. It gates on dMu, not closeMu, so an
+// abort is never parked behind a Close waiting for the read it has to break.
 func (t *darwinDevice) AbortRead() {
 	t.readAborted.Store(true)
-	t.closeMu.RLock()
-	defer t.closeMu.RUnlock()
-	if !t.closed {
-		C.asi_set_read_abort(t.d, 1)
+	t.dMu.Lock()
+	defer t.dMu.Unlock()
+	if !t.dFreed {
+		C.asi_abort_reads(t.d)
 	}
 }
 
+// ArmRead drops the entry latch and leaves the C generation alone. A read in flight has
+// snapshotted its own generation, so a re-arm cannot cancel that read's abort.
 func (t *darwinDevice) ArmRead() {
 	t.readAborted.Store(false)
-	t.closeMu.RLock()
-	defer t.closeMu.RUnlock()
-	if !t.closed {
-		C.asi_set_read_abort(t.d, 0)
-	}
 }
 
+// BulkRead reads one whole frame with asi_read_frame_async (all transfers posted up front,
+// 1 MiB each). Gates: closeMu shared, ioMu for the whole frame. Returns (0, nil) on abort,
+// an error on a timeout with no data, and the contiguous prefix otherwise.
 func (t *darwinDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) {
+	return t.bulkRead(buf, 0, timeout)
+}
+
+// BulkReadQuiet implements QuietBulkReader: the transfers are armed at once (the GPIF never
+// streams without a reader), but ioMu is taken only when `quiet` elapses or the first data
+// completion lands, whichever comes first, so TEC polls, telemetry and ST4 pulses flow during a
+// host-timed integration. quiet 0 is BulkRead.
+func (t *darwinDevice) BulkReadQuiet(buf []byte, quiet, timeout time.Duration) (int, error) {
+	return t.bulkRead(buf, quiet, timeout)
+}
+
+// bulkRead is the one-shot batch read (asi_read_frame_async, all transfers armed up front) with
+// an optional quiet window before the ioMu gate. Gates: closeMu shared, ioMu for the frame
+// (after quiet). Returns (0, nil) on abort, (n, nil) on a short prefix.
+func (t *darwinDevice) bulkRead(buf []byte, quiet, timeout time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
+	}
+	if len(buf) > maxFrameBytes {
+		return 0, fmt.Errorf("astrocam: frame read of %d bytes exceeds the %d-byte limit", len(buf), maxFrameBytes)
 	}
 	t.closeMu.RLock()
 	defer t.closeMu.RUnlock()
@@ -1155,47 +1339,109 @@ func (t *darwinDevice) BulkRead(buf []byte, timeout time.Duration) (int, error) 
 		return 0, errTransportBroken
 	}
 	if t.readAborted.Load() {
-		return 0, nil // read-abort latched (StopExposure): fail fast, don't take ioMu
+		return 0, nil // abort latched: fail fast without taking ioMu
 	}
-	t.ioMu.Lock() // hold for the whole frame so no control transfer interleaves (USB2 wedge gate)
-	defer t.ioMu.Unlock()
+	t.readActive.Add(1)
+	defer t.readActive.Add(-1)
 	ms := timeout.Milliseconds()
 	if ms <= 0 {
-		ms = 2000
+		ms = defaultTimeoutBound.Milliseconds()
 	}
-	// asi_read_frame_async submits ceil(len(buf)/chunk) transfers across the buffer, drains
-	// them in order, and tears the pipe down cleanly. 1 MiB matches the SDK's xferLen.
-	const chunk = 1 << 20 // 1 MiB per transfer
-	var n C.uint32_t
-	rc := C.asi_read_frame_async(t.d, unsafe.Pointer(&buf[0]), C.uint32_t(len(buf)),
-		C.uint32_t(chunk), C.uint32_t(ms), &n)
-	if rc == -6 {
-		t.forfeit(buf) // the kernel still owns buf; pin it and poison the transport
-		return int(n), errTransportBroken
+	const chunk = 1 << 20 // 1 MiB per transfer (SDK xferLen)
+	type readRes struct {
+		n  C.uint32_t
+		rc C.int
+		kr C.IOReturn
 	}
-	if rc != 0 {
-		return 0, fmt.Errorf("astrocam: async bulk read setup failed (rc %d)", int(rc))
-	}
-	if n == 0 {
-		if t.readAborted.Load() {
-			return 0, nil // aborted mid-read: a clean short prefix, not a timeout failure
+	finish := func(r readRes) (int, error) {
+		if r.rc == -6 {
+			t.forfeit(buf) // the kernel still owns buf
+			return int(r.n), errTransportBroken
 		}
-		return 0, fmt.Errorf("astrocam: async bulk read got no data (timeout)")
+		if r.rc == -7 { // stalled pipe or vanished device, with whatever arrived first
+			return int(r.n), fmt.Errorf("astrocam: bulk pipe error IOReturn 0x%08x during a frame read", uint32(r.kr))
+		}
+		if r.rc != 0 {
+			return 0, fmt.Errorf("astrocam: async bulk read setup failed (rc %d)", int(r.rc))
+		}
+		// A read that produced nothing is a short prefix, not a failure. All three backends
+		// report (0, nil), and the sensor workers count zero reads and escalate to a pipe reset
+		// and a re-arm. An error here would take a worker out of its ladder on this backend
+		// alone.
+		return int(r.n), nil
 	}
-	return int(n), nil
+	if quiet <= 0 {
+		t.ioMu.Lock() // whole-frame gate (see ioMu)
+		defer t.ioMu.Unlock()
+		var n C.uint32_t
+		var kr C.IOReturn
+		rc := C.asi_read_frame_async(t.d, unsafe.Pointer(&buf[0]), C.uint32_t(len(buf)),
+			C.uint32_t(chunk), C.uint32_t(ms), &n, &kr)
+		return finish(readRes{n, rc, kr})
+	}
+	// Quiet window: the C read runs ungated on its own thread, and the gate closes at quiet
+	// elapsed or first data. The first-data flag is cleared before the read starts, so the
+	// previous read's flag cannot close the window at once.
+	C.asi_rd_first_clear(t.d)
+	done := make(chan readRes, 1)
+	go func() {
+		var n C.uint32_t
+		var kr C.IOReturn
+		rc := C.asi_read_frame_async(t.d, unsafe.Pointer(&buf[0]), C.uint32_t(len(buf)),
+			C.uint32_t(chunk), C.uint32_t(ms), &n, &kr)
+		done <- readRes{n, rc, kr}
+	}()
+	deadline := time.Now().Add(quiet)
+	for {
+		select {
+		case r := <-done:
+			return finish(r) // finished inside the quiet window (abort, or a fast frame)
+		default:
+		}
+		if time.Now().After(deadline) || C.asi_rd_first(t.d) != 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.ioMu.Lock() // gate for the readout
+	r := <-done
+	t.ioMu.Unlock()
+	return finish(r)
 }
 
-// ReadFrameStream reads one whole frame with the continuous windowed pump
-// (asi_read_frame_stream): a small window of transfers kept cycling on EP 0x81 until
-// len(buf) bytes are in, copied contiguously so a short packet at a USB burst boundary
-// can't leave a gap. idle bounds a per-completion stall (the caller recovers and reads the
-// remainder); total bounds the whole read. Returns the contiguous bytes received, which
-// may be < len(buf) on a stall, leaving the caller to continue into buf[n:]. Satisfies
-// FrameStreamer.
+// ControlOutUngated issues an ST4 pulse edge without ioMu, so it does not queue behind a frame
+// read holding the gate. ST4 only: ioMu exists to keep EP0 reads out of a readout. A write on the
+// same interface handle alongside an in-flight bulk read is what the DDR path already does with
+// its FPGABufReload pulses.
+func (t *darwinDevice) ControlOutUngated(bRequest uint8, wValue, wIndex uint16) error {
+	t.closeMu.RLock()
+	defer t.closeMu.RUnlock()
+	if t.closed {
+		return errClosed
+	}
+	if t.broken.Load() {
+		return errTransportBroken
+	}
+	var done C.uint32_t
+	var kr C.IOReturn
+	rc := C.asi_control(t.d, 0x40, C.uint8_t(bRequest), C.uint16_t(wValue), C.uint16_t(wIndex), nil, 0, &done, &kr)
+	if rc != 0 {
+		return fmt.Errorf("astrocam: control transfer (req 0x%02x) failed: IOReturn 0x%08x", bRequest, uint32(kr))
+	}
+	return nil
+}
+
+// ReadFrameStream reads one whole frame with the windowed pump. idle bounds a per-completion
+// stall, after which the caller reads the remainder into buf[n:]; total bounds the whole read. A
+// stall or abort returns the contiguous prefix with a nil error, a hard pipe error the prefix
+// with an error. Gates: closeMu shared only.
 func (t *darwinDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if len(buf) > maxFrameBytes {
+		return 0, fmt.Errorf("astrocam: frame read of %d bytes exceeds the %d-byte limit", len(buf), maxFrameBytes)
+	}
 	t.closeMu.RLock()
 	defer t.closeMu.RUnlock()
 	if t.closed {
@@ -1205,25 +1451,31 @@ func (t *darwinDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 		return 0, errTransportBroken
 	}
 	if t.readAborted.Load() {
-		return 0, nil // read-abort latched (StopExposure): fail fast
+		return 0, nil // abort latched: fail fast
 	}
+	t.readActive.Add(1)
+	defer t.readActive.Add(-1)
 	idleMs := idle.Milliseconds()
 	if idleMs <= 0 {
-		idleMs = 800
+		idleMs = defaultIdleBound.Milliseconds()
 	}
 	totalMs := total.Milliseconds()
 	if totalMs <= 0 {
-		totalMs = 5000
+		totalMs = defaultTotalBound.Milliseconds()
 	}
 	const chunk = 1 << 20 // 1 MiB per transfer (SDK xferLen)
 	var n C.uint32_t
+	var kr C.IOReturn
 	rc := C.asi_read_frame_stream(t.d, unsafe.Pointer(&buf[0]), C.uint32_t(len(buf)),
-		C.uint32_t(chunk), C.uint32_t(idleMs), C.uint32_t(totalMs), &n)
+		C.uint32_t(chunk), C.uint32_t(idleMs), C.uint32_t(totalMs), &n, &kr)
 	if rc == -6 {
-		// The abandoned transfers land in C-side scratch (leaked there), not buf: no pin
-		// needed, but the pipe can no longer be trusted.
+		// The abandoned transfers target C-side scratch (leaked there), not buf, so no pin;
+		// the pipe is poisoned all the same.
 		t.broken.Store(true)
 		return int(n), errTransportBroken
+	}
+	if rc == -7 {
+		return int(n), fmt.Errorf("astrocam: bulk pipe error IOReturn 0x%08x during a frame read", uint32(kr))
 	}
 	if rc != 0 {
 		return 0, fmt.Errorf("astrocam: windowed stream read setup failed (rc %d)", int(rc))
@@ -1231,15 +1483,16 @@ func (t *darwinDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 	return int(n), nil
 }
 
-// ReadFrameStreamPrequeued reads one frame the way the ASI SDK's capture thread does
-// (PrequeuedFrameStreamer): the whole frame's transfers are queued on the pipe before the
-// frame arrives so the read overlaps the sensor readout, which a USB2 HighSpeed link needs
-// to not shear free-run frames. `total` bounds the whole read; `idle` gates only after the
-// first byte. Holds ioMu for the whole frame (the USB2 control-interleave wedge gate), like
-// BulkRead and unlike ReadFrameStream (the USB3/DDR path that needs concurrent FPGABufReload).
+// ReadFrameStreamPrequeued queues the whole frame's transfers before the frame arrives, so the
+// read overlaps the sensor readout. This is the USB2 path. total bounds the whole read; idle
+// gates only after the first byte. A stall or abort returns the contiguous prefix with a nil
+// error. Gates: closeMu shared, ioMu for the whole frame.
 func (t *darwinDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
+	}
+	if len(buf) > maxFrameBytes {
+		return 0, fmt.Errorf("astrocam: frame read of %d bytes exceeds the %d-byte limit", len(buf), maxFrameBytes)
 	}
 	t.closeMu.RLock()
 	defer t.closeMu.RUnlock()
@@ -1250,25 +1503,31 @@ func (t *darwinDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 		return 0, errTransportBroken
 	}
 	if t.readAborted.Load() {
-		return 0, nil // read-abort latched (StopExposure): fail fast, don't take ioMu
+		return 0, nil // abort latched: fail fast without taking ioMu
 	}
+	t.readActive.Add(1)
+	defer t.readActive.Add(-1)
 	t.ioMu.Lock()
 	defer t.ioMu.Unlock()
 	idleMs := idle.Milliseconds()
 	if idleMs <= 0 {
-		idleMs = 800
+		idleMs = defaultIdleBound.Milliseconds()
 	}
 	totalMs := total.Milliseconds()
 	if totalMs <= 0 {
-		totalMs = 5000
+		totalMs = defaultTotalBound.Milliseconds()
 	}
 	const chunk = 1 << 20 // 1 MiB per transfer (SDK xferLen)
 	var n C.uint32_t
+	var kr C.IOReturn
 	rc := C.asi_read_frame_prequeued(t.d, unsafe.Pointer(&buf[0]), C.uint32_t(len(buf)),
-		C.uint32_t(chunk), C.uint32_t(idleMs), C.uint32_t(totalMs), &n)
+		C.uint32_t(chunk), C.uint32_t(idleMs), C.uint32_t(totalMs), &n, &kr)
 	if rc == -6 {
-		t.forfeit(buf) // the kernel still owns buf; pin it and poison the transport
+		t.forfeit(buf) // the kernel still owns buf
 		return int(n), errTransportBroken
+	}
+	if rc == -7 {
+		return int(n), fmt.Errorf("astrocam: bulk pipe error IOReturn 0x%08x during a frame read", uint32(kr))
 	}
 	if rc != 0 {
 		return 0, fmt.Errorf("astrocam: prequeued frame read setup failed (rc %d)", int(rc))
@@ -1276,19 +1535,17 @@ func (t *darwinDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 	return int(n), nil
 }
 
-// darwinStream is a resident windowed-stream session (the video/burst path): the C
-// pump stays primed across frames so the per-frame setup cost is paid once. Its methods
-// guard against the transport closing under them (closeMu readers), but the session itself
-// is single-consumer: Next/NextZC/Release/Close must not race each other.
+// darwinStream is a resident windowed-stream session for the video and burst path. The session
+// is single-consumer: Next, NextZC, Release and Close must not race each other.
 type darwinStream struct {
 	t *darwinDevice
 	s *C.asicam_stream
 }
 
-// StartStream opens a persistent windowed stream and primes it. frameBytes is informational
-// (each Next call passes the actual buffer); total is the per-transfer timeout. The session
-// is registered on the device so a transport Close stops it before releasing the interface
-// its pump thread and in-flight transfers reference.
+// StartStream opens a persistent windowed stream and primes it. total sets the driver-side
+// per-transfer timeout and so has to cover one frame period, not the whole burst. The session is
+// registered on the device, so a transport Close stops it before releasing the interface its pump
+// thread references. Gates: closeMu shared.
 func (t *darwinDevice) StartStream(frameBytes int, total time.Duration) (FrameStream, error) {
 	t.closeMu.RLock()
 	defer t.closeMu.RUnlock()
@@ -1300,7 +1557,7 @@ func (t *darwinDevice) StartStream(frameBytes int, total time.Duration) (FrameSt
 	}
 	totalMs := total.Milliseconds()
 	if totalMs <= 0 {
-		totalMs = 5000
+		totalMs = defaultTotalBound.Milliseconds()
 	}
 	// Chunk = one frame for sub-MiB frames (each transfer lands a whole frame, no cross-chunk
 	// straddle, lowest latency); 1 MiB for large frames the window pipelines.
@@ -1308,24 +1565,51 @@ func (t *darwinDevice) StartStream(frameBytes int, total time.Duration) (FrameSt
 	if frameBytes > 0 && frameBytes < chunk {
 		chunk = frameBytes
 	}
-	s := C.asi_stream_start(t.d, C.uint32_t(chunk), C.uint32_t(totalMs))
-	if s == nil {
-		return nil, fmt.Errorf("astrocam: stream session start failed")
-	}
-	st := &darwinStream{t: t, s: s}
+	// One session per device. Two windows on the same bulk pipe compete for one byte stream:
+	// each session's transfers take whatever segments arrive next, so both read torn frames and
+	// neither can tell. The slot is reserved before arming, so two concurrent StartStream calls
+	// cannot both pass the check.
 	t.streamMu.Lock()
+	if len(t.streams) > 0 {
+		t.streamMu.Unlock()
+		return nil, errStreamBusy
+	}
 	if t.streams == nil {
 		t.streams = map[*darwinStream]struct{}{}
 	}
+	st := &darwinStream{t: t}
 	t.streams[st] = struct{}{}
 	t.streamMu.Unlock()
+
+	s := C.asi_stream_start(t.d, C.uint32_t(chunk), C.uint32_t(totalMs))
+	if s == nil {
+		t.streamMu.Lock()
+		delete(t.streams, st)
+		t.streamMu.Unlock()
+		return nil, fmt.Errorf("astrocam: stream session start failed")
+	}
+	st.s = s
+	t.readActive.Add(1) // a session is a read in flight until it closes
 	return st, nil
 }
 
-// Next pulls exactly one frame (len(buf) bytes) from the resident stream.
+// maxFrameBytes bounds a single read. The C layer takes lengths as uint32_t and reports counts as
+// int, so anything past 2 GiB truncates on the way in or comes back negative. Every sensor here
+// tops out around 122 MB.
+const maxFrameBytes = 1<<31 - 1
+
+// Next pulls one frame (len(buf) bytes) from the resident stream. Gates: closeMu shared.
+//
+// A short count with a nil error means the idle window elapsed part way through a frame. Nothing
+// can resync the session: the watermark has moved past the dropped bytes, and the FX3's ZLPs mark
+// inter-buffer boundaries as well as frame ones. Every later Next returns ErrStreamDesynced until
+// the session is closed and a new one started.
 func (st *darwinStream) Next(buf []byte, idle time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
+	}
+	if len(buf) > maxFrameBytes {
+		return 0, fmt.Errorf("astrocam: stream read of %d bytes exceeds the %d-byte limit", len(buf), maxFrameBytes)
 	}
 	st.t.closeMu.RLock()
 	defer st.t.closeMu.RUnlock()
@@ -1337,19 +1621,23 @@ func (st *darwinStream) Next(buf []byte, idle time.Duration) (int, error) {
 	}
 	idleMs := idle.Milliseconds()
 	if idleMs <= 0 {
-		idleMs = 800
+		idleMs = defaultIdleBound.Milliseconds()
 	}
-	n := C.asi_stream_next(st.s, unsafe.Pointer(&buf[0]), C.uint32_t(len(buf)), C.uint32_t(idleMs))
+	var kr C.IOReturn
+	n := C.asi_stream_next(st.s, unsafe.Pointer(&buf[0]), C.uint32_t(len(buf)), C.uint32_t(idleMs), &kr)
+	if n == -2 {
+		return 0, ErrStreamDesynced
+	}
 	if n < 0 {
-		return 0, fmt.Errorf("astrocam: stream read hard error")
+		return 0, fmt.Errorf("astrocam: stream read hard error IOReturn 0x%08x", uint32(kr))
 	}
 	return int(n), nil
 }
 
-// NextZC returns the next frame as a slice that aliases the session's scratch buffer (no
-// copy). Valid only until the next Release call (which re-arms the slot and overwrites the
-// memory), so the caller must consume it before releasing. Returns nil on an idle stall.
-// Use when the stream's chunk == one frame (sub-MiB ROI).
+// NextZC returns the next frame as a slice aliasing the session's scratch buffer. Use it when the
+// stream's chunk == one frame (sub-MiB ROI). An idle stall returns nil, with the same no-resync
+// consequence as Next. The slice is valid until the next call on this session, since Release,
+// Next and NextZC all recycle a held slot. Gates: closeMu shared.
 func (st *darwinStream) NextZC(idle time.Duration) ([]byte, error) {
 	st.t.closeMu.RLock()
 	defer st.t.closeMu.RUnlock()
@@ -1361,12 +1649,13 @@ func (st *darwinStream) NextZC(idle time.Duration) ([]byte, error) {
 	}
 	idleMs := idle.Milliseconds()
 	if idleMs <= 0 {
-		idleMs = 800
+		idleMs = defaultIdleBound.Milliseconds()
 	}
 	var p *C.char
-	n := C.asi_stream_next_zc(st.s, &p, C.uint32_t(idleMs))
+	var kr C.IOReturn
+	n := C.asi_stream_next_zc(st.s, &p, C.uint32_t(idleMs), &kr)
 	if n < 0 {
-		return nil, fmt.Errorf("astrocam: stream read hard error")
+		return nil, fmt.Errorf("astrocam: stream read hard error IOReturn 0x%08x", uint32(kr))
 	}
 	if n == 0 || p == nil {
 		return nil, nil // idle stall
@@ -1398,6 +1687,7 @@ func (st *darwinStream) Close() error {
 	rc := C.asi_stream_stop(st.s)
 	st.s = nil
 	delete(st.t.streams, st)
+	st.t.readActive.Add(-1)
 	if rc != 0 {
 		st.t.broken.Store(true)
 		return errTransportBroken
@@ -1405,10 +1695,8 @@ func (st *darwinStream) Close() error {
 	return nil
 }
 
-// ResetEndpoint clears a stall/flushes the bulk pipe (ClearPipeStallBothEnds). It holds the
-// Close interlock (closeMu reader) like every other transfer, so a worker's teardown reset
-// that lands after Close returns errClosed instead of touching the freed handle. It does not
-// take ioMu.
+// ResetEndpoint clears a stall on the bulk pipe (ClearPipeStallBothEnds). Gates: closeMu
+// shared only; a worker teardown reset that lands after Close returns errClosed.
 func (t *darwinDevice) ResetEndpoint(ep uint8) error {
 	t.closeMu.RLock()
 	defer t.closeMu.RUnlock()
@@ -1418,15 +1706,20 @@ func (t *darwinDevice) ResetEndpoint(ep uint8) error {
 	if t.broken.Load() {
 		return errTransportBroken
 	}
+	// ClearPipeStallBothEnds is a CLEAR_FEATURE on EP0, and EP0 traffic inside a gated USB2
+	// readout parks the FX3 GPIF, so it runs under ioMu as it does on Linux and Windows. Every
+	// caller invokes this between reads, never while holding the gate, so it cannot deadlock.
+	t.ioMu.Lock()
+	defer t.ioMu.Unlock()
 	if kr := C.asi_reset_pipe(t.d); kr != 0 {
 		return fmt.Errorf("astrocam: clear pipe stall IOReturn 0x%08x", uint32(kr))
 	}
 	return nil
 }
 
-// ResetDevice issues a USB bus reset (DeviceResetter), the last-resort recovery. The
-// device loses all state, so a re-Init is required after. It holds the Close interlock
-// (closeMu reader) but NOT ioMu: its job includes recovering a read that still holds ioMu.
+// ResetDevice issues a USB bus reset (DeviceResetter), the last-resort recovery; the device
+// loses all state, so a re-Init is required after. Gates: closeMu shared only; it must run
+// while a stuck read still holds ioMu.
 func (t *darwinDevice) ResetDevice() error {
 	t.closeMu.RLock()
 	defer t.closeMu.RUnlock()
@@ -1442,12 +1735,10 @@ func (t *darwinDevice) ResetDevice() error {
 	return nil
 }
 
-// Close releases the IOKit interfaces and frees the handle. Takes closeMu as the writer, so
-// it blocks until every in-flight transfer has returned and no new one can start (they
-// observe closed and return errClosed). Any resident stream session still open is stopped
-// first; its pump thread and in-flight transfers reference the interface being released.
-// On a broken transport (abandoned transfers) the handle is leaked: releasing
-// the interface would let IOKit complete into freed state. Idempotent.
+// Close releases the IOKit interfaces and frees the handle. It takes closeMu exclusively, so it
+// blocks until every in-flight transfer has returned. Any open stream session is stopped first,
+// since its pump thread references the interface. A broken transport leaks the handle.
+// Idempotent.
 func (t *darwinDevice) Close() error {
 	t.closeMu.Lock()
 	defer t.closeMu.Unlock()
@@ -1462,6 +1753,7 @@ func (t *darwinDevice) Close() error {
 				t.broken.Store(true)
 			}
 			st.s = nil
+			t.readActive.Add(-1)
 		}
 		delete(t.streams, st)
 	}
@@ -1469,8 +1761,13 @@ func (t *darwinDevice) Close() error {
 	if t.broken.Load() {
 		return errTransportBroken // leak t.d: the kernel still owns transfers against it
 	}
+	// dFreed under dMu, so a concurrent ReadAborter call either sets the latch on a live t.d or
+	// sees it gone.
+	t.dMu.Lock()
+	t.dFreed = true
 	C.asi_close(t.d)
 	C.free(unsafe.Pointer(t.d))
+	t.dMu.Unlock()
 	return nil
 }
 

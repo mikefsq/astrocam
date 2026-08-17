@@ -4,14 +4,14 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"testing"
 	"time"
 )
 
-// fakePlant is a first-order thermal model: TEC power pulls the equilibrium
-// temperature below ambient (up to span °C at 100 %), and the plant relaxes toward
-// that equilibrium with time constant tau. It implements Thermal so the cooling
-// loop can be driven with no hardware.
+// fakePlant is a first-order thermal model implementing Thermal: TEC power pulls the equilibrium
+// temperature below ambient (up to span °C at 100 %), and the plant relaxes toward that
+// equilibrium with time constant tau.
 type fakePlant struct {
 	temp, amb, span, tau float64
 	power                float64
@@ -31,8 +31,8 @@ func (p *fakePlant) advance(dt time.Duration) {
 	p.temp += (eq - p.temp) * a
 }
 
-// TestCoolerConverges drives the loop against the plant and checks it reaches and
-// holds a sub-ambient target (the core of the PID + integral steady-state).
+// TestCoolerConverges: the loop reaches and holds a sub-ambient target at a physical holding
+// power.
 func TestCoolerConverges(t *testing.T) {
 	p := &fakePlant{temp: 20, amb: 20, span: 50, tau: 5}
 	c := NewCooler(p, DefaultCoolerConfig())
@@ -70,8 +70,8 @@ func TestCoolerConverges(t *testing.T) {
 	}
 }
 
-// TestCoolerNoHeating: a target above ambient needs no cooling — power must clamp
-// to 0 (the loop never drives the TEC to warm).
+// TestCoolerNoHeating: a target above ambient clamps power to 0 (the loop never drives the TEC
+// to warm).
 func TestCoolerNoHeating(t *testing.T) {
 	p := &fakePlant{temp: 20, amb: 20, span: 50, tau: 5}
 	c := NewCooler(p, DefaultCoolerConfig())
@@ -103,15 +103,19 @@ func TestCoolerSlewLimit(t *testing.T) {
 	}
 }
 
-// rtPlant is a fakePlant that self-advances on each ReadTemp by the wall-clock time
-// since the previous read, so it evolves under a running Cooler.Run goroutine with no
-// manual advance(). A small tau makes it converge in well under a second.
+// rtPlant is a fakePlant that self-advances on each ReadTemp by the wall-clock time since the
+// previous read, so it evolves under a running Cooler.Run goroutine with no manual advance().
+// Its own mutex stands in for the transport's ioMu: the Cooler reads temperature outside its
+// state lock, so the loop's reads and a caller's Temperature() overlap.
 type rtPlant struct {
 	fakePlant
+	mu   sync.Mutex
 	last time.Time
 }
 
 func (p *rtPlant) ReadTemp() (float64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	now := time.Now()
 	if !p.last.IsZero() {
 		p.advance(now.Sub(p.last))
@@ -120,10 +124,34 @@ func (p *rtPlant) ReadTemp() (float64, error) {
 	return p.fakePlant.temp, nil
 }
 
-// TestCoolerRun exercises the regulation GOROUTINE (the cooling-thread equivalent): Run
-// must tick Step against the plant, drive the TEC, cool toward the target, and return
-// promptly when its context is canceled (no leaked goroutine). Convergence accuracy is
-// covered by the Step tests; this is about the thread doing its job and shutting down.
+func (p *rtPlant) SetTECPower(pct float64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fakePlant.SetTECPower(pct)
+}
+
+func (p *rtPlant) SetFan(on bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fakePlant.SetFan(on)
+}
+
+// power and fanOn read the plant's actuator state under the lock, for assertions made while the
+// regulation goroutine may still be running.
+func (p *rtPlant) power() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fakePlant.power
+}
+
+func (p *rtPlant) fanOn() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fakePlant.fan
+}
+
+// TestCoolerRun: Run ticks Step against the plant, drives the TEC, cools toward the target, and
+// returns promptly when its context is canceled.
 func TestCoolerRun(t *testing.T) {
 	p := &rtPlant{fakePlant: fakePlant{temp: 20, amb: 20, span: 50, tau: 0.1}}
 	cfg := DefaultCoolerConfig()
@@ -136,11 +164,11 @@ func TestCoolerRun(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- c.Run(ctx) }()
 
-	time.Sleep(400 * time.Millisecond) // ~80 ticks, ~4 tau — plenty to cool
+	time.Sleep(400 * time.Millisecond) // ~80 ticks, ~4 tau
 	cancel()
 
 	select {
-	case <-done: // Run returned after cancel — clean shutdown, no leak
+	case <-done: // clean shutdown, no leak
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after ctx cancel")
 	}
@@ -153,9 +181,8 @@ func TestCoolerRun(t *testing.T) {
 	}
 }
 
-// TestCoolerRampRate verifies the setpoint slews at RampRate °C/min independent of the
-// tick — the Alpaca-facing cooldown-rate knob. Starting at 0 °C with a 6 °C/min ramp,
-// after one simulated minute the effective target must have moved ~6 °C toward the goal.
+// TestCoolerRampRate: the setpoint slews at RampRate °C/min independent of the tick. Starting at
+// 0 °C with a 6 °C/min ramp, after one simulated minute the effective target has moved ~6 °C.
 func TestCoolerRampRate(t *testing.T) {
 	p := &fakePlant{temp: 0, amb: 20, span: 50, tau: 5}
 	cfg := DefaultCoolerConfig()
@@ -184,8 +211,8 @@ func TestCoolerRampRate(t *testing.T) {
 	}
 }
 
-// TestCoolerRateGuard: a fast transient (rate above RateGuard) is skipped — power
-// is left unchanged that tick.
+// TestCoolerRateGuard: a fast transient (rate above RateGuard) is skipped; power is left
+// unchanged that tick.
 func TestCoolerRateGuard(t *testing.T) {
 	p := &fakePlant{temp: 20, amb: 20, span: 50, tau: 5}
 	cfg := DefaultCoolerConfig()
@@ -205,9 +232,8 @@ func TestCoolerRateGuard(t *testing.T) {
 	}
 }
 
-// flakyPlant wraps fakePlant, failing ReadTemp for the first failN calls (transient) or
-// forever (failN < 0). It records the last TEC power applied so the fail-safe zero is
-// observable.
+// flakyPlant wraps fakePlant, failing ReadTemp for the first failN calls (transient) or forever
+// (failN < 0). It records the last TEC power applied so the fail-safe zero is observable.
 type flakyPlant struct {
 	fakePlant
 	failN int // >0: fail this many ReadTemps then recover; <0: fail forever
@@ -224,9 +250,8 @@ func (p *flakyPlant) ReadTemp() (float64, error) {
 
 var errTransient = fmt.Errorf("transient EP0 error")
 
-// TestCoolerRunSurvivesTransientErrors: a few failed regulation ticks (an EP0 hiccup during a
-// capture-recovery reset) must not kill the loop — the historical bug returned on the FIRST
-// Step error, leaving the TEC energized with CoolerOn() still true.
+// TestCoolerRunSurvivesTransientErrors: a few failed regulation ticks do not stop the loop; it
+// keeps ticking until its context deadline.
 func TestCoolerRunSurvivesTransientErrors(t *testing.T) {
 	p := &flakyPlant{fakePlant: fakePlant{temp: 20, amb: 20, span: 50, tau: 5}, failN: 3}
 	cfg := DefaultCoolerConfig()
@@ -245,8 +270,8 @@ func TestCoolerRunSurvivesTransientErrors(t *testing.T) {
 	}
 }
 
-// TestCoolerRunZeroesTECOnPersistentFailure: when the device is genuinely gone, Run must not
-// leave the TEC driving at its last power — it zeroes the drive (best-effort) and returns.
+// TestCoolerRunZeroesTECOnPersistentFailure: on persistent Step failure Run zeroes the TEC
+// drive and returns an error.
 func TestCoolerRunZeroesTECOnPersistentFailure(t *testing.T) {
 	p := &flakyPlant{fakePlant: fakePlant{temp: 20, amb: 20, span: 50, tau: 5, power: 80}, failN: -1}
 	cfg := DefaultCoolerConfig()
@@ -263,5 +288,72 @@ func TestCoolerRunZeroesTECOnPersistentFailure(t *testing.T) {
 	}
 	if p.power != 0 {
 		t.Errorf("TEC left at %.0f%% after the loop died, want 0 (fail-safe zero)", p.power)
+	}
+}
+
+// writeFailPlant fails SetTECPower on demand, leaving ReadTemp working: the failure mode where
+// the loop learns the temperature but its correction never reaches the TEC.
+type writeFailPlant struct {
+	fakePlant
+	failWrite bool
+}
+
+func (p *writeFailPlant) SetTECPower(pct float64) error {
+	if p.failWrite {
+		return errTransient
+	}
+	return p.fakePlant.SetTECPower(pct)
+}
+
+// TestCoolerFailedDriveDoesNotAdvanceHistory: a tick whose drive write failed applied no
+// correction, so the velocity form's error history must not move on as though it had — the next
+// tick's Kp and Kd terms would be differences against an increment the TEC never received. The
+// temperature history is the other half: lastT belongs to the read, so it has to follow every
+// successful read, or the rate guard measures two ticks of drift over one tick of dt and reads a
+// steady ramp as a transient to skip.
+func TestCoolerFailedDriveDoesNotAdvanceHistory(t *testing.T) {
+	p := &writeFailPlant{fakePlant: fakePlant{temp: 20, amb: 20, span: 50, tau: 1000}}
+	cfg := DefaultCoolerConfig()
+	cfg.RateGuard = 1.0 // °C/s
+	c := NewCooler(p, cfg)
+	c.SetTarget(0)
+
+	if _, err := c.Step(time.Second); err != nil {
+		t.Fatalf("first step: %v", err)
+	}
+	c.mu.Lock()
+	e1, prev1, power1 := c.prevErr, c.prevErr2, c.power
+	c.mu.Unlock()
+
+	// A tick that reads a new temperature but cannot drive the TEC.
+	p.failWrite = true
+	p.temp = 19.5
+	if _, err := c.Step(time.Second); err == nil {
+		t.Fatal("step with a failing drive write reported success")
+	}
+	c.mu.Lock()
+	e2, prev2, power2, lastT := c.prevErr, c.prevErr2, c.power, c.lastT
+	c.mu.Unlock()
+	if e2 != e1 || prev2 != prev1 {
+		t.Errorf("error history moved on a tick that applied nothing: (%.3f,%.3f) -> (%.3f,%.3f)", prev1, e1, prev2, e2)
+	}
+	if power2 != power1 {
+		t.Errorf("power recorded as %.2f%% though the write failed (was %.2f%%)", power2, power1)
+	}
+	if lastT != 19.5 {
+		t.Errorf("lastT = %.2f after reading 19.5: the temperature history skipped a reading", lastT)
+	}
+
+	// The next good tick regulates from that reading rather than skipping on a doubled rate.
+	p.failWrite = false
+	p.temp = 19.0
+	if _, err := c.Step(time.Second); err != nil {
+		t.Fatalf("recovered step: %v", err)
+	}
+	c.mu.Lock()
+	applied := c.power
+	c.mu.Unlock()
+	if applied == power1 {
+		t.Errorf("power unchanged at %.2f%% after recovery: the tick was skipped", applied)
 	}
 }

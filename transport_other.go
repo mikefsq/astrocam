@@ -8,8 +8,7 @@ package astrocam
 import "errors"
 
 // errNoBackend is returned by OpenHost/OpenLocation/Enumerate on platforms without a USB backend
-// (anything but darwin, linux, windows); the package still compiles there for the hardware-free
-// tests and StubTransport.
+// (anything but darwin, linux, windows).
 var errNoBackend = errors.New("astrocam: no USB backend on this platform (darwin, linux, windows only)")
 
 // OpenHost reports that this platform has no USB backend.

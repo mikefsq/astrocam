@@ -1,27 +1,21 @@
-// IMX571 (APS-C, 26 MP) in the ZWO ASI2600 family. Same Exmor/STARVIS-2 die family as the
-// full-frame IMX455, so the two profiles share the same shape; the registers and constants here
-// are the 571's own.
+// Sony IMX571: APS-C 26 MP BSI CMOS, 6224×4168 (ZWO ASI2600 family, PlayerOne Poseidon). Same
+// Exmor/STARVIS-2 family as the IMX455, so the profile has the same shape (two exposure modes,
+// FX3 DDR frame markers, windowed FX3 pump with FPGABufReload tail-flush); the registers and
+// constants are the 571's own. Not hardware-validated; it tracks the hardware-verified IMX455
+// profile. SDK op → profile function:
 //
-// The register model:
-//   - Master/stream gate is WriteSONYREG 0x1ee: 1 = stream-start, 5 = stop.
-//   - Exposure is TWO modes: < 1 s free-run (VMAX = vblank+effHeight, time encoded in SHS); >= 1 s
-//     (> 0xf423f µs) FPGA wait+trigger mode — EnableFPGAWaitMode (reg0 bit6) +
-//     EnableFPGATriggerMode (reg0 bit7) set, VMAX held near one frame, the integration HOST-timed
-//     by the worker via EnableFPGATriggerSignal (FPGA reg 0x0b bit0).
-//   - SHS ENCODING (CRITICAL): the normal free-run path writes (SHS>>1): low = (SHS>>1)&0xff to
-//     0x18, high = (SHS>>9)&0xff to 0x19. (The high-speed/hardware-bin branch instead writes the
-//     FULL SHS with no halve; we are always in the normal free-run path, so SHS>>1 is used.)
-//   - Gain code = 4095·(1 − 10^(−gain/200)) (pow with K = 4095). Five effective ZWO segments split
-//     at -25 / 0 / 100 / 460; the top band quantises to a 60-step coarse stage = ceil((gain−460)/60)
-//     placed in reg 0x40 bits[4:7].
-//   - Window regs: HEIGHT 0x0a/0x0b, WIDTH (×4-aligned +0x18) 0x1dd/0x1de, window-mode 0x1d8 =
-//     4 full / 0 binned; ROI start X 0xa7/0xa8/0xa9, Y 0x08/0x09; 0x07 is the coupled-group apply.
-//   - Optical-black crop SetFPGAVBLK/SetFPGAHBLK take the per-mode FPGA_SKIP_LINE / FPGA_SKIP_CLOUMN
-//     values, rewritten per bin by the mode select.
-//   - Data plane: windowed FX3 pump + FPGABufReload tail-flush + stall recovery; see imx571Worker.
+//	InitCamera                                imx571InitCommon, imx571InitFPGA
+//	InitSensorMode                            imx571SelectMode + the mode tables at the end
+//	Cam_SetResolution                         imx571SetROI (window, mode 0x1d8, OB crop, geometry)
+//	SetStartPos                               imx571SetROI (ROI start)
+//	SetGain                                   imx571SetGain (imx571SetGainZWO / imx571SetGainPOA)
+//	SetExp                                    imx571SetExposure
+//	SetBrightness                             imx571SetOffset
+//	StartSensorStreaming/StopSensorStreaming  StreamStart/StreamStop, imx571Arm
+//	WorkingFunc                               imx571Worker (arm: imx571Arm)
 //
-// PlayerOne shares this die — SetGain/SetOffset/GainCaps/OffsetCaps dispatch on the regmap's VID
-// (ZWO 0x03C3 vs PlayerOne 0xA0A0).
+// PlayerOne drives the same die: SetGain/SetOffset/GainCaps/OffsetCaps dispatch on the regmap's
+// VID (ZWO 0x03C3 vs PlayerOne 0xA0A0).
 
 package sensors
 
@@ -33,32 +27,18 @@ import (
 	"time"
 )
 
-// Sony IMX571 — APS-C BSI CMOS (ZWO ASI2600 family, 26 MP). The WriteSONYREG addresses are
-// small FPGA-bank indices (0x18/0x19 shutter, 0x30..0x33 gain, 0x2f/0x40 conversion gain,
-// 0xa7..0xa9 ROI-X, 0x08/0x09 ROI-Y, 0x0a/0x0b window-HEIGHT, 0x1dd/0x1de window-WIDTH).
-// Register 0x07 is the coupled-group apply.
-//
-// Register map summary:
-//
-//	InitCamera          (reglist_init loop + explicit tail + FPGA bringup)
-//	InitSensorMode      (per-mode table select by bin/depth + V/vblank/skip rewrite)
-//	Cam_SetResolution   (window H 0x0a/0x0b, W 0x1dd/0x1de, mode 0x1d8)
-//	SetStartPos         (ROI X 0xa7/0xa8/0xa9, Y 0x08/0x09)
-//	SetGain             (setup 0x67f, code 0x30..0x33, conv 0x2f/0x40)
-//	SetExp              (shutter SHS>>1 to 0x18/0x19, VMAX via FPGA)
-//	StartSensorStreaming/StopSensorStreaming (master 0x1ee = 1 / 5)
 const (
-	// SetGain — gain code 4095*(1 - 10^(-gain/200)) split across two
-	// 16-bit copies (0x30/0x31 and 0x32/0x33); 0x2f/0x40 pick conversion gain.
+	// SetGain: gain code 4095·(1 - 10^(-gain/200)) as two 16-bit copies (0x30/0x31 and
+	// 0x32/0x33); 0x2f/0x40 select the conversion gain.
 	imx571RegGainSetup = 0x67f // written at the start of a gain update (0 / 0x11)
 	imx571RegGainAL    = 0x30  // analog gain code, low byte  (copy 1)
 	imx571RegGainAH    = 0x31  // analog gain code, high byte (copy 1)
 	imx571RegGainBL    = 0x32  // analog gain code, low byte  (copy 2)
 	imx571RegGainBH    = 0x33  // analog gain code, high byte (copy 2)
 	imx571RegConvLow   = 0x2f  // LCG/HCG conversion-gain select (0/1)
-	imx571RegConvHi    = 0x40  // top-band coarse-stage nibble, bits[4:7] (>460 branch)
+	imx571RegConvHi    = 0x40  // top-band coarse-stage nibble, bits[4:7] (> 460)
 
-	// SetStartPos — X aligned to 16, written nibble-shifted; Y direct.
+	// SetStartPos: X aligned to 16, written nibble-shifted; Y direct.
 	imx571RegApply    = 0x07 // coupled-group apply (written 1 by ROI / res ops)
 	imx571RegStartXEn = 0xa7 // ROI-X enable / mode flag (=1)
 	imx571RegStartXL  = 0xa8 // X start bits [4:12]  (X>>4)
@@ -66,20 +46,20 @@ const (
 	imx571RegStartYL  = 0x08 // (Y start + 0x19/0x1b) low byte
 	imx571RegStartYH  = 0x09 // (Y start + 0x19/0x1b) high byte
 
-	// Cam_SetResolution — output window in OUTPUT (binned) pixels.
+	// Cam_SetResolution: output window in output (binned) pixels.
 	imx571RegWinMode = 0x1d8 // window mode: 4 full / 0 binned
 	imx571RegHeightL = 0x0a  // window HEIGHT low  (effHeight, +2 when binned)
 	imx571RegHeightH = 0x0b  // window HEIGHT high
 	imx571RegWidthL  = 0x1dd // window WIDTH low  ((effWidth ×4-aligned)+0x18, &0xfc)
 	imx571RegWidthH  = 0x1de // window WIDTH high
 
-	// SetExp — shutter SHS, written as two bytes (FPGA holds VMAX). SHS is HALVED (>>1) on the
-	// normal path before the split.
+	// SetExp: shutter SHS, two bytes (the FPGA holds VMAX). The normal path halves SHS (>>1)
+	// before the split; the sensor-binned (2×) branch writes the full SHS.
 	imx571RegSHS0 = 0x18 // SHS low byte  = (SHS>>1)&0xff
 	imx571RegSHS1 = 0x19 // SHS high byte = (SHS>>9)&0xff
 
-	// Master streaming gate (WriteSONYREG 0x1ee): 1 = stream-start, 5 = stop. Init's reglist seeds
-	// it to 1.
+	// Master streaming gate (WriteSONYREG 0x1ee): 1 = stream-start, 5 = stop. Init's reglist
+	// seeds it to 1.
 	imx571RegMaster = 0x1ee
 
 	imx571GainMax    = 0x2bc // 700 (0.1 dB units); SetGain clamp hi
@@ -90,54 +70,49 @@ const (
 	imx571GainStage  = 0x3c  // 60: the top-band coarse-gain step
 
 	imx571StartXAlign = 16   // X start aligned to 16 (mask 0xfffffff0)
-	imx571StartYOff   = 0x19 // Y start += 0x19 before the 0x08/0x09 write (bin 1/2/4)
+	imx571StartYOff   = 0x19 // Y start += 0x19 before the 0x08/0x09 write (bin 1/2)
 	imx571StartYOff3  = 0x1b // Y start += 0x1b for bin 3
 
 	imx571ExpMinUs  = 0x20       // 32 µs: SetExp clamp lo
 	imx571ExpMaxUs  = 0x77359400 // 2,000,000,000 µs: clamp hi
 	imx571LongExpUs = 0xf4240    // 1,000,000 µs: > 0xf423f takes the wait+trigger path
 
-	// Timing model. CalcFrameTime / SetExp compute (free-run band; the >= 1 s trigger band holds
-	// VMAX at one frame with SHS = 20, see imx571SetExposure):
+	// Timing model (CalcFrameTime / SetExp, free-run band; the >= 1 s trigger band holds VMAX
+	// at one frame with SHS = 20, see imx571SetExposure):
 	//
 	//	lineTime_ns = V * 1e6 / clock
 	//	VMAX        = vblank + effHeight        (BLANK_LINE_OFFSET + effH)
 	//	SHS         = VMAX - 1 - lines          (clamp >=1, 17-bit cap 0x1fffe)
 	//	SHS         = SHS>>1                     (normal path)
 	//
-	// V (the HMAX line base) and the vblank (BLANK_LINE_OFFSET) are set PER BIN by the mode select
-	// — see imx571SelectMode. clock = 20000. effHeight = height/bin, except bin4 = height/2 (the
-	// bin-2-geometry reuse).
-	imx571ClockHz   = 20000 // line-time clock divisor — no per-mode branch
+	// V (the HMAX line base) and vblank (BLANK_LINE_OFFSET) are set per bin by the mode select
+	// (imx571SelectMode). clock = 20000. effHeight = the sensor-side readout rows.
+	imx571ClockHz   = 20000 // line-time clock divisor, no per-mode branch
 	imx571SHSOffset = -1    // SHS = VMAX - 1 - lines
 
-	// Per-mode V (line base) and vblank, rewritten by the mode select:
-	//   bin1 V = 0x546 = 1350; bin2/4 V = 0x1ea = 490; bin3 V = 0x0fa = 250.
-	//   BLANK_LINE_OFFSET: bin1=0x30(48), bin2/4=0x1c(28), bin3=0x18(24).
-	imx571VBin1   = 1350 // bin1 line base
-	imx571VBin2   = 490  // bin2 & bin4 line base
-	imx571VBin3   = 250  // bin3 line base
-	imx571VBlank1 = 48   // bin1 vblank (BLANK_LINE_OFFSET)
-	imx571VBlank2 = 28   // bin2 & bin4 vblank
-	imx571VBlank3 = 24   // bin3 vblank
+	// Per-mode V (line base) and vblank (BLANK_LINE_OFFSET), rewritten by the mode select.
+	imx571VBin1   = 1350 // 0x546, bin1
+	imx571VBin2   = 490  // 0x1ea, bin2
+	imx571VBin3   = 250  // 0x0fa, bin3
+	imx571VBlank1 = 48   // 0x30, bin1
+	imx571VBlank2 = 28   // 0x1c, bin2
+	imx571VBlank3 = 24   // 0x18, bin3
 
-	// FPGA optical-black crop — FPGA_SKIP_LINE / FPGA_SKIP_CLOUMN, rewritten per mode and read into
-	// SetFPGAVBLK/SetFPGAHBLK by SetStartPos:
-	//   FPGA_SKIP_LINE:   bin1=0x2d(45), bin2/4=0x19(25), bin3=0x17(23) → SetFPGAVBLK
-	//   FPGA_SKIP_CLOUMN: bin1=0x18(24), bin2/4=0x12(18), bin3=0x0b(11) → SetFPGAHBLK
-	imx571SkipLine1   = 45 // bin1 FPGA_SKIP_LINE → VBLK
-	imx571SkipLine2   = 25 // bin2/4
-	imx571SkipLine3   = 23 // bin3
-	imx571SkipColumn1 = 24 // bin1 FPGA_SKIP_CLOUMN → HBLK
-	imx571SkipColumn2 = 18 // bin2/4
-	imx571SkipColumn3 = 11 // bin3
+	// FPGA optical-black crop: FPGA_SKIP_LINE → SetFPGAVBLK, FPGA_SKIP_CLOUMN → SetFPGAHBLK,
+	// rewritten per mode and applied by SetStartPos.
+	imx571SkipLine1   = 45 // 0x2d, bin1
+	imx571SkipLine2   = 25 // 0x19, bin2/4
+	imx571SkipLine3   = 23 // 0x17, bin3
+	imx571SkipColumn1 = 24 // 0x18, bin1
+	imx571SkipColumn2 = 18 // 0x12, bin2/4
+	imx571SkipColumn3 = 11 // 0x0b, bin3
 
-	imx571FullWidth  = 6224 // output width at full-frame bin 1 (= MaxWidth)
-	imx571FullHeight = 4168 // output rows at full-frame bin 1 (= MaxHeight)
+	imx571FullWidth  = 6224 // output width at full-frame bin 1
+	imx571FullHeight = 4168 // output rows at full-frame bin 1
 )
 
-// imx571InitCommon is the common (mode-independent) first stage of InitCamera: the reglist_init
-// table (54 entries; reg=0xffff is a delay of val ms) followed by the explicit WriteSONYREG tail.
+// imx571InitCommon is the mode-independent first stage of InitCamera: the 54-entry reglist_init
+// table (reg 0xffff = delay of val ms) then the explicit WriteSONYREG tail.
 var imx571InitCommon = []RegVal{
 	// --- reglist_init: reg/val16 pairs ---
 	{Reg: 0x01ee, Val: 0x01}, {Reg: 0x0000, Val: 0x04}, {Reg: 0xffff, Val: 0x0a}, // delay 10 ms
@@ -164,14 +139,13 @@ var imx571InitCommon = []RegVal{
 }
 
 // imx571Init is the streaming default: the common init followed by the bin-1 16-bit per-mode
-// table (the two-stage init — InitCamera then InitSensorMode). Only the bin-1 16-bit mode is
-// wired as the default; the other tables are applied by SetROI per bin.
+// table (InitCamera then InitSensorMode); the other tables are applied by SetROI per bin.
 var imx571Init = append(append([]RegVal{}, imx571InitCommon...), imx571ModeFull16...)
 
-// IMX571 is the Sony IMX571 APS-C profile (ZWO ASI2600 family, PlayerOne Poseidon). It tracks
-// the hardware-validated IMX455 profile; the 571 itself is not yet hardware-validated.
+// IMX571 is the Sony IMX571 APS-C profile (ZWO ASI2600 family, PlayerOne Poseidon). Not
+// hardware-validated; it tracks the hardware-verified IMX455 profile.
 var IMX571 = Sensor{
-	Name:     "IMX571", // ASI2600MC Pro; Sony IMX571 APS-C BSI (color, RGGB)
+	Name:     "IMX571", // Sony IMX571 APS-C BSI
 	GainMax:  imx571GainMax,
 	ExpMinUs: imx571ExpMinUs,
 	ExpMaxUs: imx571ExpMaxUs,
@@ -181,9 +155,9 @@ var IMX571 = Sensor{
 		PixelUm:   3.76,
 		BitDepth:  16,
 		Bayer:     "RGGB",            // MC = color
-		Bins:      []int{1, 2, 3, 4}, // 1/2/3/4× decoded (per-mode tables + V/vblank/skip)
+		Bins:      []int{1, 2, 3, 4}, // host-binned by default (SDK default); hardware 2/3 (4 = 2×2) via SetHardwareBin
 	},
-	// ASI Brightness / black level. Caps: 0..240, def 1.
+	// ASI Brightness / black level: 0..240, default 1.
 	OffsetMax:   240,
 	OffsetDef:   1,
 	Init:        imx571Init,
@@ -195,10 +169,10 @@ var IMX571 = Sensor{
 	GetOffset:   imx571GetOffset,
 	OffsetCaps:  imx571OffsetCaps,
 	SetROI:      imx571SetROI,
-	// Master/stream gate, tracking the hardware-verified IMX455 shape: StopSensorStreaming =
-	// 0x1ee←5 + CamSetStandby(1) (reg0 bit0); StartSensorStreaming = 0x1ee←1 + CamSetWakeup(1)
-	// (reg0 bit2) + 10 ms + CamSetStandby(0). The worker's inline stop/start encode the same
-	// sequence; these hooks serve StopExposure and the StartVideo arm.
+	// Master/stream gate (the IMX455 shape): StopSensorStreaming = 0x1ee←5 + CamSetStandby(1)
+	// (reg0 bit0); StartSensorStreaming = 0x1ee←1 + CamSetWakeup(1) (reg0 bit2) + 10 ms +
+	// CamSetStandby(0). Used by StopExposure and the StartVideo arm; imx571Arm has the same
+	// sequence inline.
 	StreamStop: func(rm Regmap) error {
 		if err := rm.WriteReg(imx571RegMaster, 5); err != nil { // 0x1ee = 5 (stop)
 			return err
@@ -215,34 +189,44 @@ var IMX571 = Sensor{
 		time.Sleep(10 * time.Millisecond)  // usleep(0x2710)
 		return rm.WriteRegBits(0, 0, 0, 0) // CamSetStandby(0): reg0 bit0 = 0
 	},
-	Arm:    imx571Arm,    // the object's arm (StartVideo / free-run streaming use it too)
-	Worker: imx571Worker, // rich arm + windowed stream read
+	Arm:    imx571Arm,    // shared by the worker and StartVideo / free-run streaming
+	Worker: imx571Worker, // arm + windowed stream read
 
 	FX3DMAMarkers: true, // FX3 bridge framing (0x5A7E/0x3CF0 marker words)
+	// Hardware readout modes: the bin-2 and bin-3 12-bit tables (InitSensorMode); the SDK's
+	// bin 4 is the bin-2 table over 2w×2h with the host binning 2× more, which the Camera
+	// derives from this list.
+	HWBins: []int{2, 3},
+	// SetStartPos masks: X to 16; Y to 2 at bin 1, 4 at bin 2, 6 at bin 3.
+	ROIStartAlign: func(bin int) (int, int) {
+		switch bin {
+		case 2:
+			return 16, 4
+		case 3:
+			return 16, 6
+		}
+		return 16, 2
+	},
 }
 
-// imx571Worker is the host-timed single-shot capture. The sensor gate goes through the 0x1ee
-// master register via the StartSensorStreaming/StopSensorStreaming helpers (which also toggle
-// CamSetWakeup reg0 bit2 / CamSetStandby reg0 bit0). For the >= 1 s bands SetExp arms trigger
-// MODE (reg0 bit6/bit7); this worker drives the trigger SIGNAL (EnableFPGATriggerSignal, FPGA
-// reg 0x0b bit0) whose 1->0 edge releases the frame. The SetExp trigger MODE bits are only safe
-// WITH this worker.
+// imx571Worker is the host-timed single-shot capture worker (the IMX455 shape). The sensor gate
+// is the 0x1ee master register via StartSensorStreaming/StopSensorStreaming (which also toggle
+// CamSetWakeup reg0 bit2 / CamSetStandby reg0 bit0). At >= 1 s SetExp arms trigger mode (reg0
+// bit6/bit7); the worker drives the trigger signal (EnableFPGATriggerSignal, FPGA reg 0x0b
+// bit0), whose 1->0 edge releases the frame; the SetExp trigger-mode bits are only safe with
+// this worker. The very-long-band multi-exposure accumulation cycle is not reproduced:
+// single-shot only.
 //
-//	arm:    SendCMD(0xAA)·StopSensorStreaming·SendCMD(0xA9)·StartSensorStreaming·
+//	arm:    imx571Arm (SendCMD(0xAA)·StopSensorStreaming·SendCMD(0xA9)·StartSensorStreaming)·
 //	        ResetEndPoint(0x81)
-//	expose: EnableFPGATriggerSignal(1) · host-time (>= 1 s only) · EnableFPGATriggerSignal(0)
-//	read:   continuous windowed pump (ctl.StreamFrame) + FPGABufReload tail-flush, FPGAStop/
-//	        usleep/FPGAStart on stall
-//
-// StartSensorStreaming = FPGAStop · 0x1ee=1 · CamSetWakeup(1) · usleep(10ms) · CamSetStandby(0)
-// · FPGAStart. StopSensorStreaming = FPGAStop · 0x1ee=5 · CamSetStandby(1). The arm tracks the
-// hardware-verified IMX455 worker (no per-capture device reset, no extra settle); the 571 is
-// unverified on hardware. The very-long-band multi-exposure accumulation cycle is NOT
-// reproduced — single-shot only.
+//	expose: >= 1 s only: EnableFPGATriggerSignal(1)·hold the exposure·(0)
+//	read:   continuous windowed pump (ctl.StreamFrame) with a 20 ms FPGABufReload ticker;
+//	        FPGAStop/usleep/FPGAStart on stall
+//	stop:   StopSensorStreaming·SendCMD(0xAA)·ResetEndPoint (WorkingFunc exit)
 func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 
-	// Sensor reg-0 read-modify-write (ReadSONYREG 0 -> mask -> WriteSONYREG 0) — the bits
+	// Sensor reg-0 read-modify-write (ReadSONYREG 0 -> mask -> WriteSONYREG 0), the bits
 	// CamSetWakeup/CamSetStandby toggle: standby = reg0 bit0, wakeup = reg0 bit2.
 	regRMW := func(set, clr uint16) error {
 		v, err := rm.ReadReg(0)
@@ -252,14 +236,13 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		return rm.WriteReg(0, (v|set)&^clr)
 	}
 	fpgaStop := func() error { return SetFPGABit(rm, 0x00, 0x10, true) } // reg0 bit4 = 1 (FPGAStop)
-	// FPGABufReload: FPGA reg 0x18 bit0 — commits the frame's final partial DMA buffer.
+	// FPGABufReload: FPGA reg 0x18 bit0, commits the frame's final partial DMA buffer.
 	bufReload := func() error { return SetFPGABit(rm, 0x18, 0x01, true) }
 	// EnableFPGATriggerSignal: FPGA reg 0x0b bit0. In wait+trigger mode (>= 1 s) the host holds
 	// this for the integration time.
 	triggerSignal := func(on bool) error { return SetFPGABit(rm, 0x0b, 0x01, on) }
 
-	// StopSensorStreaming: the 0x1ee master gate under FPGAStop with CamSetStandby(1); the deferred
-	// halt below uses it (the arm is imx571Arm).
+	// StopSensorStreaming: FPGAStop, 0x1ee=5, CamSetStandby(1); the deferred halt uses it.
 	stopStreaming := func() error {
 		if err := fpgaStop(); err != nil {
 			return err
@@ -270,36 +253,34 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		return regRMW(0x01, 0) // CamSetStandby(1): reg0 |= bit0
 	}
 
-	// --- arm (imx571Arm, the IMX455 shape; shared with StartVideo) ---
-	if err := imx571Arm(ctl); err != nil {
-		return 0, err
-	}
-	// Halt the readout on EVERY return — the 2600 object's WorkingFunc exit:
-	// StopSensorStreaming (FPGAStop -> 0x1ee<-5 -> CamSetStandby(1), per
-	// 0080_CCameraS2600MC_Pro.o; stopStreaming() encodes this) then
-	// SendCMD(0xAA) then ResetEndPoint. A sensor left free-running with no reader backs up
-	// the FX3 GPIF. Best-effort: a failed stop must not fail a good frame. VERIFY-HW: ported
-	// from the object (mirrors the hardware-verified 455/6200); no 571 on the bench at port time.
+	// --- arm (imx571Arm) ---
+	// Halt the readout on every return, the arm's own failures included, as WorkingFunc's
+	// exit does (0080_CCameraS2600MC_Pro.o):
+	// StopSensorStreaming, SendCMD(0xAA), ResetEndPoint. A sensor left free-running with no
+	// reader backs up the FX3 GPIF. Best-effort: a failed stop must not fail a good frame. Not
+	// hardware-verified.
 	defer func() {
 		_ = stopStreaming()
 		_ = ctl.VendorCmd(FX3StreamStop)
 		_ = ctl.ResetEndpoint()
 	}()
+	if err := imx571Arm(ctl); err != nil {
+		return 0, err
+	}
 	_ = ctl.ResetEndpoint() // ResetEndPoint(0x81)
 
 	// >= 1 s runs in FPGA wait+trigger mode (SetExp set reg0 bit6/bit7 and held VMAX near one
-	// frame). The integration is HOST-timed: assert the trigger signal, hold for the exposure,
-	// then release so the frame clocks out. Below 1 s is free-run (sensor self-times via SHS).
+	// frame). The integration is host-timed: assert the trigger signal, hold for the exposure,
+	// release so the frame clocks out. Below 1 s is free-run (the sensor self-times via SHS).
 	if exposure >= imx571LongExpUs*time.Microsecond {
 		if err := triggerSignal(true); err != nil {
 			return 0, err
 		}
 		for start := time.Now(); time.Since(start) < exposure; {
 			if ctl.Aborted() {
-				// StopExposure ran: bail, dropping the trigger signal on the way out —
-				// left asserted, the next triggerSignal(true) is a no-edge write and the
-				// FPGA never gates the integration. (Host-side hygiene, not object-derived:
-				// the SDK snap thread never host-aborts mid-integration.)
+				// StopExposure ran: drop the trigger signal on the way out. Left asserted,
+				// the next triggerSignal(true) is a no-edge write and the FPGA never gates
+				// the integration. (The SDK never host-aborts mid-integration.)
 				_ = triggerSignal(false)
 				return 0, errExposureAborted
 			}
@@ -315,22 +296,28 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if target > len(buf) {
 		target = len(buf)
 	}
-	// In the >= 1 s trigger band the integration has ALREADY completed above (host-timed
-	// trigger hold), so the read only spans the readout — exposure-scaled timeouts there
-	// made a stalled readout after a long sub block StopExposure for up to 2·exp+5 s.
+	// In the >= 1 s trigger band the integration completed above, so the read spans only the
+	// readout and the timeouts are not exposure-scaled (otherwise a stalled readout after a long
+	// sub blocks StopExposure for up to 2·exp+5 s).
 	idle := exposure + 2*time.Second
 	total := 2*exposure + 5*time.Second
 	if exposure >= imx571LongExpUs*time.Microsecond {
 		idle = 2 * time.Second
 		total = 15 * time.Second // full-frame readout ceiling incl. USB2 + retries
 	}
-	// Pulse FPGABufReload throughout so the frame's final partial DMA buffer (the bytes past the
-	// last 1-MiB boundary) flushes into a posted transfer; the windowed reader treats the
-	// frame-end ZLP as non-terminal and keeps cycling until the whole frame lands.
+	// On USB3, pulse FPGABufReload throughout so the frame's final partial DMA buffer (the bytes
+	// past the last 1-MiB boundary) flushes into a posted transfer; the windowed reader treats
+	// the frame-end ZLP as non-terminal and keeps cycling until the whole frame lands. On a USB2
+	// link the tail arrives on its own and the pulses wedge the readout (the 455 finding), so
+	// the ticker runs only on USB3.
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		if !ModeOf(rm).USB3 {
+			<-stop
+			return
+		}
 		t := time.NewTicker(20 * time.Millisecond)
 		defer t.Stop()
 		for {
@@ -347,15 +334,16 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	<-done // JOIN: wait for the ticker's last bufReload before returning, so no control transfer
 	// outlives the worker to race the next operation / the TEC loop.
 	if err == nil && n < target && ctl.Aborted() {
-		return n, errExposureAborted // StopExposure broke the read (AbortRead): clean abort, not a stall
+		return n, errExposureAborted // AbortRead: clean abort, not a stall
 	}
 	return n, err
 }
 
-// imx571Arm is the stream arm, tracking imx455Arm: SendCMD(0xAA) · StopSensorStreaming (FPGAStop ·
-// 0x1ee=5 · CamSetStandby(1)) · SendCMD(0xA9) · StartSensorStreaming (FPGAStop · 0x1ee=1 ·
-// CamSetWakeup(1) · 10 ms · CamSetStandby(0) · FPGAStart). The FPGAStop inside StartSensorStreaming
-// is the second stop after 0xA9 the DDR readout needs. Shared by the worker and StartVideo.
+// imx571Arm is the stream arm (the imx455Arm shape), shared by the worker and StartVideo:
+// SendCMD(0xAA) · StopSensorStreaming (FPGAStop · 0x1ee=5 · CamSetStandby(1)) · SendCMD(0xA9) ·
+// StartSensorStreaming (FPGAStop · 0x1ee=1 · CamSetWakeup(1) · 10 ms · CamSetStandby(0) ·
+// FPGAStart). The FPGAStop inside StartSensorStreaming is the second stop after SendCMD(0xA9)
+// the DDR readout requires.
 func imx571Arm(ctl WorkerCtl) error {
 	rm := ctl.Rm()
 	regRMW := func(set, clr uint16) error {
@@ -398,22 +386,18 @@ func imx571Arm(ctl WorkerCtl) error {
 	return fpgaStart()
 }
 
-// imx571InitFPGA is the FPGA-side bringup InitCamera performs after the Sony init tail, using the
-// FX3 register numbers. Shared helpers do the read-modify-writes.
+// imx571InitFPGA is the FPGA bringup InitCamera performs after the Sony init tail, using the FX3
+// register numbers:
 //
 //	FPGAReset                          reg0 bit0 -> 0
-//	(20 ms delay; SendCMD(0xAF) — Camera-level)
-//	FPGADDRTest                        DDR self-test gate — NOT replicated
+//	(20 ms delay; SendCMD(0xAF) is Camera-level)
+//	FPGADDRTest                        DDR self-test gate, not replicated
 //	SetFPGAAsMaster(1)                 reg0 bit5 = 1
 //	FPGAStop                           reg0 bit4 = 1
-//	EnableFPGADDR(ddrFlag)             reg0xa bit6 = !ddr
+//	EnableFPGADDR(ddrFlag)             reg0xa bit6 = !ddr; the 2600 uses DDR, so bit6 = 0
 //	SetFPGAADCWidthOutputWidth(1, 0)   reg0xa bit0 = 1, bit4 = 0
 //	SetFPGABinMode(0)                  reg0x27 low 2 bits = 0
 //	SetFPGAGain(0x80,0x80,0x80,0x80)   FPGA 0x0c-0x0f, strobed by reg 1
-//
-// EnableFPGADDR's argument is the runtime DDR flag set at OpenCamera. The 2600 uses DDR, so
-// DDR-enabled (reg0xa bit6 = 0, the polarity hardware-verified on the IMX455/6200 and shared
-// by every other profile) is assumed. The DDRTest self-test is not reproduced.
 func imx571InitFPGA(rm Regmap, subtype int) error {
 	_ = subtype
 	if err := FPGAClearBits(rm, 0x00, 0x01); err != nil { // FPGAReset: reg0 bit0
@@ -426,11 +410,11 @@ func imx571InitFPGA(rm Regmap, subtype int) error {
 	if err := FPGASetBits(rm, 0x00, 0x10); err != nil { // FPGAStop: reg0 bit4
 		return err
 	}
-	if err := FPGAWriteBits(rm, 0x0a, 0x40, 0x00); err != nil { // EnableFPGADDR(1): reg0xa bit6 = 0 (DDR enabled)
+	if err := FPGAWriteBits(rm, 0x0a, 0x40, 0x00); err != nil { // EnableFPGADDR(1): bit6 = 0 (DDR)
 		return err
 	}
 	// SetFPGAADCWidthOutputWidth(adc=1, outputWidth): reg0xa bit0 = adc, bit4 = output width.
-	// InitCamera passes outputWidth = 0; raise bit4 for RAW16 from the live ReadoutMode (without
+	// InitCamera passes outputWidth = 0; bit4 = 1 for RAW16 from the live ReadoutMode (without
 	// it the FPGA streams a half-size RAW8 frame).
 	adcOut := uint16(0x01) // bit0 = adc
 	if ModeOf(rm).BytesPerPx >= 2 {
@@ -439,7 +423,7 @@ func imx571InitFPGA(rm Regmap, subtype int) error {
 	if err := FPGAWriteBits(rm, 0x0a, 0x11, adcOut); err != nil {
 		return err
 	}
-	if err := FPGAWriteBits(rm, 0x27, 0x03, 0x00); err != nil { // SetFPGABinMode(0): reg0x27 low 2 bits = 0
+	if err := FPGAWriteBits(rm, 0x27, 0x03, 0x00); err != nil { // SetFPGABinMode(0)
 		return err
 	}
 	// SetFPGAGain(0x80×4): FPGA 0x0c-0x0f, committed by the reg-1 strobe (1 before, 0 after).
@@ -454,9 +438,9 @@ func imx571InitFPGA(rm Regmap, subtype int) error {
 	return rm.WriteFPGAReg(0x01, 0)
 }
 
-// imx571GainCaps / imx571OffsetCaps return the advertised range per vendor — the dual of the
-// dispatched SetGain/SetOffset. ZWO: gain -25..700 (0.1 dB), offset 0..240 def 1. PlayerOne: gain
-// 0..550, offset 0..2000 def 20.
+// imx571GainCaps / imx571OffsetCaps return the advertised range per vendor, the dual of the
+// dispatched SetGain/SetOffset. ZWO: gain -25..700 (0.1 dB), offset 0..240 def 1. PlayerOne:
+// gain 0..550, offset 0..2000 def 20.
 func imx571GainCaps(vid uint16) (min, max int) {
 	switch vid {
 	case ZWO.VID:
@@ -479,10 +463,9 @@ func imx571OffsetCaps(vid uint16) (min, max, def int) {
 	}
 }
 
-// imx571SetOffset — SetBrightness (ASI Brightness / black level):
-// value = offset·10 at bin 1, written 16-bit little-endian to sensor 0x42/0x43 and mirrored to
-// 0x44/0x45. imx571SetOffset selects the encoding from the regmap's VID —
-// PlayerOne offset·8, ZWO offset·10; an unrecognized vendor is an error.
+// imx571SetOffset (SetBrightness) selects the vendor encoding from the regmap's VID: ZWO
+// offset·10, PlayerOne offset·8; 16-bit little-endian to sensor 0x42/0x43 mirrored to
+// 0x44/0x45. An unrecognized vendor is an error.
 func imx571SetOffset(rm Regmap, offset int) error {
 	switch rm.VID() {
 	case ZWO.VID:
@@ -511,8 +494,8 @@ func imx571GetOffset(rm Regmap) (int, error) {
 	}
 }
 
-// imx571SetOffsetPOA is PlayerOne's IMX571 black level: offset·8 (vs ZWO's ·10), same
-// 0x42/0x43 mirror 0x44/0x45 block.
+// imx571SetOffsetPOA is PlayerOne's IMX571 black level: offset·8, same 0x42/0x43 mirror
+// 0x44/0x45 block.
 func imx571SetOffsetPOA(rm Regmap, offset int) error {
 	v := uint16(offset * 8)
 	for _, rv := range []RegVal{
@@ -548,11 +531,11 @@ type imx571Mode struct {
 	skipLine, skipColumn int
 }
 
-// imx571SelectMode maps the binning factor to the readout mode (bin 4 reuses the bin-2 table+V).
-// All V/vblank/skip values are the normal (non-strap) constants.
+// imx571SelectMode maps the sensor binning factor to the readout mode. All V/vblank/skip values
+// are the normal (non-strap) constants.
 func imx571SelectMode(bin int) imx571Mode {
 	switch bin {
-	case 2, 4:
+	case 2:
 		return imx571Mode{imx571ModeBin2w12, imx571VBin2, imx571VBlank2, imx571SkipLine2, imx571SkipColumn2}
 	case 3:
 		return imx571Mode{imx571ModeBin3w12, imx571VBin3, imx571VBlank3, imx571SkipLine3, imx571SkipColumn3}
@@ -561,17 +544,8 @@ func imx571SelectMode(bin int) imx571Mode {
 	}
 }
 
-// imx571SetGain — SetGain. Clamps to [-25, 700], writes 0x67f (0, or 0x11 in the
-// negative segment), then the analog code
-//
-//	code = 4095 * (1 - 10^(-gain/200))
-//
-// little-endian to BOTH 0x30/0x31 and 0x32/0x33. The HCG switch is reg 0x2f = 0 (LCG, gain < 100)
-// / 1 (HCG, gain >= 100); the analog code RESETS at that boundary (gain re-based to gain-100).
-// Above 460 the top band quantises to a 60-step coarse stage = ceil((gain-460)/60), placed in
-// 0x40 bits[4:7], and re-bases gain -= 100 + 60·stage.
 // imx571SetGain selects the vendor's gain encoding from the regmap's VID (same die, different
-// per-vendor band structure); an unrecognized vendor is an error (no implicit default).
+// per-vendor band structure); an unrecognized vendor is an error.
 func imx571SetGain(rm Regmap, gain int) error {
 	switch rm.VID() {
 	case ZWO.VID:
@@ -635,7 +609,7 @@ func imx571SetGainPOA(rm Regmap, gain int) error {
 	return nil
 }
 
-// imx571SetGainZWO is ZWO's IMX571 gain encoding. Clamp [-25, 700]; the bands:
+// imx571SetGainZWO is ZWO's IMX571 gain encoding (SetGain). Clamp [-25, 700]; the bands:
 //
 //	gain        seg            0x67f   0x2f   0x40            effGain (code input)
 //	-25..-1     negative       0x11    0      0               gain+25
@@ -643,8 +617,9 @@ func imx571SetGainPOA(rm Regmap, gain int) error {
 //	100..460    HCG            0       1      0               gain-100
 //	461..700    HCG top band   0       1      (stage<<4)&0xff gain-100-60·stage
 //
-// where stage = ceil((gain-460)/60). The code = trunc(4095·(1-10^(-effGain/200))) goes to
-// 0x30/0x31 and the 0x32/0x33 copy.
+// where stage = ceil((gain-460)/60). The HCG switch is reg 0x2f and the analog code resets at
+// that boundary. The code = trunc(4095·(1-10^(-effGain/200))) goes to 0x30/0x31 and the
+// 0x32/0x33 copy.
 func imx571SetGainZWO(rm Regmap, gain int) error {
 	if gain > imx571GainMax {
 		gain = imx571GainMax
@@ -666,7 +641,7 @@ func imx571SetGainZWO(rm Regmap, gain int) error {
 	case gain <= imx571GainHCGHi: // 100..460: HCG on, code resets
 		conv = 1
 		effGain = gain - imx571GainHCGAt
-	default: // 461..700: HCG top band — coarse 60-step stage in 0x40, re-based code.
+	default: // 461..700: HCG top band, coarse 60-step stage in 0x40, re-based code.
 		// stage = ceil((gain-460)/60), computed on the full (gain-460).
 		stage := (gain - imx571GainHCGHi) / imx571GainStage
 		if (gain-imx571GainHCGHi)%imx571GainStage != 0 {
@@ -698,44 +673,35 @@ func imx571SetGainZWO(rm Regmap, gain int) error {
 	return nil
 }
 
-// imx571SetExposure — SetExp / CalcFrameTime. Indexed full-frame rolling-shutter model, the
-// same two-mode structure as the hardware-verified IMX455:
+// imx571SetExposure (SetExp / CalcFrameTime). Indexed full-frame rolling-shutter model, the
+// two-mode structure of the IMX455:
 //
 //	lines       = exposure / lineTime,  lineTime_ns = V * 1e6 / clock
-//	defaultVMAX = vblank + effHeight            (ONE frame; effHeight follows the live ROI)
+//	defaultVMAX = vblank + effHeight            (one frame; effHeight follows the live ROI)
 //	>= 1 s : wait+trigger mode; VMAX = (frameµs+10ms)/line_time + 20 (≈ one frame); SHS = 20.
-//	         The integration is HOST-timed by the worker (EnableFPGATriggerSignal), not VMAX.
+//	         The worker host-times the integration (EnableFPGATriggerSignal), not VMAX.
 //	<  1 s : free-run. exposure <= frame-time keeps defaultVMAX and encodes the time in SHS
 //	         (VMAX-1-lines, clamped [1, VMAX-1]); a longer one extends VMAX = lines + 20.
 //	SHS = SHS >> 1  (the normal-path halve), written little-endian to the indexed regs 0x18/0x19.
 //
-// VMAX is programmed via the camera FPGA (SetVMAX -> regs 0x10/0x11/0x12); the 16-bit halved SHS
-// to the small indexed sensor regs 0x18/0x19. The SHS IS halved (>>1) on the normal path; omitting
-// it 2x over-exposes. Holding VMAX at one frame in the trigger band matters: extending it to the
-// exposure line count there stretched the frame period ~lines/height× (the bug the 455 profile
-// fixed on the wire).
-//
-// bin is taken from the live ReadoutMode; the hardware-bin SHS branch is not modelled (always the
-// free-run normal path).
+// VMAX goes via the FPGA (SetVMAX -> regs 0x10/0x11/0x12); the halved SHS to sensor regs
+// 0x18/0x19. The halve is required (the full SHS 2× over-exposes), and VMAX must stay at one
+// frame in the trigger band (extending it to the exposure line count stretches the frame period
+// ~lines/height×). bin comes from the live ReadoutMode; the hardware-bin SHS branch is not
+// modelled.
 func imx571SetExposure(rm Regmap, d time.Duration) error {
 	bin := ModeOf(rm).Bin
 	if bin < 1 {
 		bin = 1
 	}
 	mode := imx571SelectMode(bin)
-	// lineTime_ns = V * 1e6 / clock (V from the binned readout mode); bin 1 -> 1350·1e6/20000 = 67500.
+	// lineTime_ns = V * 1e6 / clock (V from the binned readout mode); bin 1 -> 1350·1e6/20000 =
+	// 67500.
 	lineNs := uint64(mode.v) * 1_000_000 / imx571ClockHz
-	// effHeight = output rows = MaxHeight/bin, except bin 4 = MaxHeight/2 (output rows<<1 reuse of
-	// bin-2 geometry). Follow the live ROI height when set, else full/bin.
+	// effHeight = the sensor-side readout rows (the live ROI height set by SetROI, else full/bin).
 	effH := int64(imx571FullHeight) / int64(bin)
-	if bin == 4 {
-		effH = int64(imx571FullHeight) / 2
-	}
 	if h := ModeOf(rm).Height; h > 0 {
 		effH = int64(h)
-		if bin == 4 {
-			effH *= 2
-		}
 	}
 	defVMAX := int64(mode.vblank) + effH      // vblank + effHeight = one frame
 	frameUs := defVMAX * int64(lineNs) / 1000 // frame-readout time in µs
@@ -751,8 +717,8 @@ func imx571SetExposure(rm Regmap, d time.Duration) error {
 	var vmax, shs int64
 	if d >= imx571LongExpUs*time.Microsecond {
 		// >= 1 s: wait+trigger mode. EnableFPGAWaitMode(1) = reg0 bit6, EnableFPGATriggerMode(1) =
-		// bit7. VMAX is held at ONE frame; the worker host-times the integration via the trigger
-		// signal (the IMX455 shape: (frame-readout time + 10 ms)/line_time + 20, SHS = 20).
+		// bit7. VMAX is held at one frame ((frame-readout time + 10 ms)/line_time + 20, SHS = 20);
+		// the worker host-times the integration via the trigger signal.
 		if err := SetFPGABit(rm, 0x00, 0x40, true); err != nil {
 			return err
 		}
@@ -762,7 +728,7 @@ func imx571SetExposure(rm Regmap, d time.Duration) error {
 		vmax = (frameUs+10000)*1000/int64(lineNs) + 20
 		shs = 20
 	} else {
-		// < 1 s: free-run — clear trigger/wait mode; the sensor self-times via SHS.
+		// < 1 s: free-run. Clear trigger/wait mode; the sensor self-times via SHS.
 		if err := SetFPGABit(rm, 0x00, 0x80, false); err != nil {
 			return err
 		}
@@ -792,20 +758,29 @@ func imx571SetExposure(rm Regmap, d time.Duration) error {
 	if shs > 0x1fffe { // 17-bit cap
 		shs = 0x1fffe
 	}
-	// Normal-path SHS halve: low = (SHS>>1)&0xff to 0x18, high = (SHS>>9)&0xff to 0x19.
-	// Equivalent to writing (SHS>>1) little-endian since 0x18/0x19 hold the >>1 value's two bytes.
-	return WriteRegLE(rm, imx571RegApply, []uint16{imx571RegSHS0, imx571RegSHS1}, uint32(shs>>1))
+	// SHS readout halving, following the hardware-verified IMX455 of this DDR pair: halve for
+	// bin 1 and bin 3, write the whole value when the sensor bins 2×. Halving is the normal path
+	// (low = (SHS>>1)&0xff to 0x18, high = (SHS>>9)&0xff to 0x19, equivalent to writing SHS>>1
+	// little-endian), and the bin-2 branch is the "writes the full SHS" case this profile's
+	// decode records. Inferred from the IMX455, not yet seen on a IMX571 camera.
+	if bin != 2 {
+		if shs >= 6 {
+			shs >>= 1
+		} else {
+			shs = 3
+		}
+	}
+	return WriteRegLE(rm, imx571RegApply, []uint16{imx571RegSHS0, imx571RegSHS1}, uint32(shs))
 }
 
-// imx571SetROI — InitSensorMode (per-mode table) + SetStartPos + Cam_SetResolution.
-// Applies the bin's readout-mode register table (the second init stage), then the ROI
-// start (X aligned to 16 -> 0xa7/0xa8/0xa9, Y+0x19/0x1b -> 0x08/0x09) and the output window
-// (HEIGHT 0x0a/0x0b, WIDTH ×4-aligned+0x18 0x1dd/0x1de, window mode 0x1d8 = 4 full / 0 binned).
-// Then the optical-black crop SetFPGAVBLK/SetFPGAHBLK (per-mode skip values) and the FPGA frame
-// geometry + BinDataLen.
+// imx571SetROI: InitSensorMode (per-mode table), SetStartPos, Cam_SetResolution (window + mode
+// 0x1d8), the FPGA OB crop (per-mode skip values), the FPGA frame geometry and SetFPGABinDataLen.
 func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if bin < 1 {
 		bin = 1
+	}
+	if bin > 3 {
+		return fmt.Errorf("imx571: sensor bin %d has no readout mode (hardware modes are 2 and 3; the Camera host-bins the rest)", bin)
 	}
 	if x < 0 {
 		x = 0
@@ -813,16 +788,17 @@ func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if y < 0 {
 		y = 0
 	}
-	// (x,y,w,h) are BINNED OUTPUT pixels. Apply this bin's readout-mode table (InitSensorMode),
-	// then the ROI. START is SENSOR pixels (= binned·bin); window mode 0x1d8 = 4 full / 0 binned;
-	// HEIGHT(0x0a) takes the raw output height +2 when binned, WIDTH(0x1dd) the ×4-aligned width +0x18.
+	// (x,y,w,h) are binned output pixels. Apply this bin's readout-mode table (InitSensorMode),
+	// then the ROI. The start is sensor pixels (binned·bin); window mode 0x1d8 = 4 full / 0
+	// binned; HEIGHT(0x0a) takes the output height +2 when binned, WIDTH(0x1dd) the ×4-aligned
+	// width +0x18.
 	mode := imx571SelectMode(bin)
 	sx := x * bin
 	sy := y * bin
 	sx &^= imx571StartXAlign - 1 // align X to 16 (and 0xfffffff0)
-	yBias := imx571StartYOff     // 0x19 for bin 1/2/4
+	yBias := imx571StartYOff     // 0x19 for bin 1/2
 	switch bin {
-	case 2, 4:
+	case 2:
 		sy &^= 3 // align Y to 4 for binned (and 0xfffffffc)
 	case 3:
 		// bin 3: align Y down to a multiple of 6 and use Y bias 0x1b.
@@ -845,7 +821,7 @@ func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
 	uw := uint16(wAligned + 0x18) // WIDTH -> 0x1dd/0x1de, +0x18
 
 	// The whole mode table + ROI group under the reg 0x07 apply bracket (released even when a
-	// write errors — a held apply freezes every later grouped update).
+	// write errors: a held apply freezes every later grouped update).
 	if err := WithLatch(rm, imx571RegApply, func() error {
 		for _, rv := range mode.table {
 			if err := rm.WriteReg(rv.Reg, rv.Val); err != nil {
@@ -874,8 +850,22 @@ func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
 	}); err != nil {
 		return err
 	}
-	// Optical-black crop: SetFPGAVBLK = FPGA_SKIP_LINE, SetFPGAHBLK = FPGA_SKIP_CLOUMN — the
-	// per-mode leading-blank counts the readout windows past. Without these the frame carries the
+	// SetOutput16Bits / InitSensorMode: FPGA reg 0xa bit0 (ADC_BIT) follows the table, 1 for the
+	// 16-bit readout and 0 for the 12-bit bin tables; bit4 is the output width (1 = RAW16). The
+	// 455 rule (ADC_BIT left at 1 on a 12-bit table delivers unreadable frames), applied here by
+	// inference: not verified on an ASI2600.
+	adcOut := uint16(0)
+	if mode.v == imx571VBin1 {
+		adcOut |= 0x01
+	}
+	if ModeOf(rm).BytesPerPx >= 2 {
+		adcOut |= 0x10
+	}
+	if err := FPGAWriteBits(rm, 0x0a, 0x11, adcOut); err != nil {
+		return err
+	}
+	// Optical-black crop: SetFPGAVBLK = FPGA_SKIP_LINE, SetFPGAHBLK = FPGA_SKIP_CLOUMN, the
+	// per-mode leading-blank counts the readout windows past; without them the frame carries the
 	// OB margin as a darker band on the left/top.
 	if err := SetFPGAVBLK(rm, uint16(mode.skipLine)); err != nil {
 		return err
@@ -883,7 +873,7 @@ func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if err := SetFPGAHBLK(rm, uint16(mode.skipColumn)); err != nil {
 		return err
 	}
-	// FPGA frame geometry (SetFPGAHeight/SetFPGAWidth) = the OUTPUT dims — the FX3 transfer size.
+	// FPGA frame geometry (SetFPGAWidth/SetFPGAHeight) = the output dims, the FX3 transfer size.
 	if err := FPGAWrite16(rm, 0x04, 0x05, uint16(w)); err != nil {
 		return err
 	}
@@ -892,15 +882,18 @@ func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
 	}
 	// SetFPGABinDataLen: per-frame DMA word count = output_area·bpp/4 (FPGA 0x40..0x43).
 	bpp := ModeOf(rm).BytesPerPx
-	return SetFPGABinDataLen(rm, uint32((w*h*bpp+3)/4))
+	if err := SetFPGABinDataLen(rm, uint32((w*h*bpp+3)/4)); err != nil {
+		return err
+	}
+	// DDR-branch HMAX (SetFPSPerc): the per-mode V written to 0x13/0x14, not the bandwidth-
+	// throttle formula; SetExposure derives the line time from the same V.
+	return FPGAWrite16(rm, 0x13, 0x14, uint16(mode.v))
 }
 
-// IMX571 per-mode register tables (InitSensorMode). Each entry {reg16,val16}, 53 entries.
+// IMX571 per-mode register tables (InitSensorMode), 53 entries each:
 //
-// Mode -> table:
-//
-//	bin 1, 16-bit : reg_full_16bit  — the streaming default (imx571Init)
-//	bin 2 / bin 4 : reg_bin2w_12bit
+//	bin 1, 16-bit : reg_full_16bit   the streaming default (imx571Init)
+//	bin 2         : reg_bin2w_12bit
 //	bin 3         : reg_bin3w_12bit
 var imx571ModeFull16 = []RegVal{ // reg_full_16bit
 	{Reg: 0x0001, Val: 0x00}, {Reg: 0x0002, Val: 0x80}, {Reg: 0x002a, Val: 0x0a}, {Reg: 0x0324, Val: 0x01},

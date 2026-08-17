@@ -1,13 +1,13 @@
 package astrocam
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
 
-// TestPulseGuideDirection checks the decoded wire format: bReq 0xB0 (on) / 0xB1
-// (off) with the DIRECTION in wValue (the bug-trap — a naive sendCmd would send
-// wValue=0 and always guide North).
+// TestPulseGuideDirection: bReq 0xB0 (on) / 0xB1 (off) with the direction in wValue (a wValue
+// of 0 would always guide North).
 func TestPulseGuideDirection(t *testing.T) {
 	f := &fakeTransport{}
 	Register(ZWO.VID, 0x00A0, Model{Name: "GuideTest", Sensor: &testSensor})
@@ -38,8 +38,8 @@ func TestPulseGuideDirection(t *testing.T) {
 	}
 }
 
-// TestPulseGuideOutOfRange confirms dir>3 is a silent no-op, matching the SDK's
-// `cmp #3 / b.hi` guard that returns success with no transfer.
+// TestPulseGuideOutOfRange: dir>3 is a silent no-op, matching the SDK's `cmp #3 / b.hi` guard
+// that returns success with no transfer.
 func TestPulseGuideOutOfRange(t *testing.T) {
 	f := &fakeTransport{}
 	c, _ := Open(f, ZWO.VID, 0x00A0)
@@ -63,8 +63,8 @@ func (p *pulseRecorder) ControlOutUngated(bRequest uint8, wValue, wIndex uint16)
 	return p.ControlOut(bRequest, wValue, wIndex, nil)
 }
 
-// TestPulseGuideUngatedDispatch: the ST4 commands route through UngatedControlSender when
-// the transport offers it (a pulse edge must not queue behind ioMu).
+// TestPulseGuideUngatedDispatch: the ST4 commands route through UngatedControlSender when the
+// transport offers it.
 func TestPulseGuideUngatedDispatch(t *testing.T) {
 	p := &pulseRecorder{}
 	c := &Camera{t: p, vend: ZWO}
@@ -112,5 +112,51 @@ func TestIsPulseGuiding(t *testing.T) {
 	<-done
 	if c.IsPulseGuiding() {
 		t.Fatal("pulse completed but IsPulseGuiding is true")
+	}
+}
+
+// failOutTransport fails every vendor OUT after the nth, so a test can let the assert through and
+// break the release.
+type failOutTransport struct {
+	Transport
+	outs, failAfter int
+}
+
+func (f *failOutTransport) ControlOut(b uint8, v, i uint16, d []byte) error {
+	f.outs++
+	if f.outs > f.failAfter {
+		return errStubOutFailed
+	}
+	return f.Transport.ControlOut(b, v, i, d)
+}
+
+var errStubOutFailed = errors.New("stub: vendor OUT failed")
+
+// TestPulseGuideOffKeepsLineOnFailure: the ST4 line state must follow the hardware, not the
+// intent. PulseGuideOff clears its bit only when the release reached the camera, so a failed
+// release leaves IsPulseGuiding true — a mount that is still slewing must not be reported as
+// settled, which is what an optimistic clear would do.
+func TestPulseGuideOffKeepsLineOnFailure(t *testing.T) {
+	ft := &failOutTransport{Transport: NewStubTransport(), failAfter: 1}
+	c := &Camera{t: ft, vend: ZWO}
+	if err := c.PulseGuideOn(GuideEast); err != nil {
+		t.Fatal(err)
+	}
+	if !c.IsPulseGuiding() {
+		t.Fatal("line not asserted after PulseGuideOn")
+	}
+	if err := c.PulseGuideOff(GuideEast); err == nil {
+		t.Fatal("PulseGuideOff returned nil with the transport failing")
+	}
+	if !c.IsPulseGuiding() {
+		t.Error("IsPulseGuiding false after a FAILED release: the line is still asserted on the camera")
+	}
+	// A release that succeeds does clear it.
+	ft.failAfter = 1 << 30
+	if err := c.PulseGuideOff(GuideEast); err != nil {
+		t.Fatal(err)
+	}
+	if c.IsPulseGuiding() {
+		t.Error("IsPulseGuiding still true after a successful release")
 	}
 }

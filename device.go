@@ -5,10 +5,9 @@ import (
 	"fmt"
 )
 
-// DeviceInfo describes one attached camera discovered on the USB bus without opening it:
-// VID/PID, the USB product-name string, and a platform location id. The factory serial is
-// absent (no USB serial-number descriptor; reading it means opening the device, see
-// OpenSerial / Camera.SerialNumber).
+// DeviceInfo describes one attached camera discovered on the USB bus without opening it. The
+// factory serial is absent: reading it means opening the device (OpenSerial /
+// Camera.SerialNumber).
 type DeviceInfo struct {
 	VID, PID uint16
 	Name     string // USB product-name string, e.g. "ASI6200MC Pro"
@@ -20,10 +19,9 @@ func (d DeviceInfo) String() string {
 }
 
 // Enumerate lists attached cameras (across every known vendor VID) that map to a registered
-// camera model, without opening any of them. Devices that share a vendor id but aren't
-// cameras (e.g. EFW filter wheels) are filtered out. Location binds a result to a physical
-// port for OpenLocation. One vendor's scan failing does not hide the healthy vendors: the
-// error is returned only when NO vendor could be scanned at all.
+// camera model, without opening any of them. Devices that share a vendor id but are not cameras
+// (e.g. EFW filter wheels) are filtered out. An error is returned only when no vendor could be
+// scanned at all.
 func Enumerate() ([]DeviceInfo, error) {
 	var raw []DeviceInfo
 	var errs []error
@@ -41,26 +39,25 @@ func Enumerate() ([]DeviceInfo, error) {
 	return filterCameras(raw), nil
 }
 
-// filterCameras keeps only the raw USB devices whose PID resolves to a registered camera
-// Model (dropping non-camera devices on the same VID, e.g. EFW wheels) and fills a missing
-// Name from the registry.
+// filterCameras keeps only the raw USB devices whose PID resolves to a registered camera Model
+// and fills a missing Name from the registry.
 func filterCameras(raw []DeviceInfo) []DeviceInfo {
 	out := make([]DeviceInfo, 0, len(raw))
 	for _, d := range raw {
 		m, ok := Lookup(d.VID, d.PID)
 		if !ok {
-			continue // not a camera (e.g. an EFW wheel on the same VID)
+			continue // not a camera
 		}
 		if d.Name == "" {
-			d.Name = m.Name // fall back to the registry name if the USB string was unreadable
+			d.Name = m.Name // the USB string was unreadable
 		}
 		out = append(out, d)
 	}
 	return out
 }
 
-// readSerial reads the 8-byte factory serial off a Transport (the vendor's SerialNumber
-// request, 0xC8 on ZWO) without binding a full Camera.
+// readSerial reads the 8-byte factory serial off a Transport (the vendor's SerialNumber request,
+// 0xC8 on ZWO) without binding a full Camera.
 func readSerial(t Transport, vid uint16) (Serial, error) {
 	v, ok := VendorOf(vid)
 	if !ok || v.Cmds.SerialNumber == 0 {
@@ -74,9 +71,8 @@ func readSerial(t Transport, vid uint16) (Serial, error) {
 }
 
 // OpenSerial finds and opens the attached camera whose factory serial matches (hex, as
-// Serial.String renders it), the stable per-unit key, since bus locations move on replug.
-// It enumerates, opens each candidate by location, reads its serial, and returns the match
-// (closing the others). Errors if no attached camera has that serial.
+// Serial.String renders it): it enumerates, opens each candidate by location, reads its serial,
+// and returns the match, closing the others. Errors if no attached camera has that serial.
 func OpenSerial(serial string) (Transport, DeviceInfo, error) {
 	devs, err := Enumerate()
 	if err != nil {

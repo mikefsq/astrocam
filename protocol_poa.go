@@ -5,9 +5,9 @@ import (
 	"sync"
 )
 
-// PlayerOne control-transfer opcodes. Same FX3 bridge as ZWO, different host dialect.
-// Argument order is the OPPOSITE of ZWO's: PlayerOne puts the VALUE in wValue and the
-// REGISTER in wIndex (ZWO is reg in wValue, value in wIndex).
+// PlayerOne control-transfer opcodes. Same FX3 bridge as ZWO, different host dialect. The
+// argument order is the reverse of ZWO's: PlayerOne puts the value in wValue and the register in
+// wIndex.
 //
 //	Fx3ImgSenWrite(reg,val)      OUT bReq 0xB0  wValue=val wIndex=reg
 //	Fx3ImgSenRead(reg)           IN  bReq 0xB2  wValue=0   wIndex=reg
@@ -26,14 +26,13 @@ const (
 	poaCrypRegBias uint16 = 0xABCD
 )
 
-// poaProtectedRegs are the registers written via the obfuscated CrypWrite path instead of
-// a plain sensor write. The only protected register on either Sony die is the gain-setup
-// 0x67f. Read-only after init.
+// poaProtectedRegs are the registers written via CrypWrite instead of a plain sensor write. The
+// only protected register on either Sony die is the gain-setup 0x67f. Read-only after init.
 var poaProtectedRegs = map[uint16]bool{0x67f: true}
 
-// poaRegmap implements Regmap over a Transport using PlayerOne's control-transfer protocol.
-// The Sony dies and register semantics are identical to ZWO's; only this wire dialect
-// differs. protected routes the gain-setup register through CrypWrite automatically.
+// poaRegmap implements Regmap over a Transport using PlayerOne's control-transfer protocol. The
+// Sony dies and register semantics are identical to ZWO's; only the wire dialect differs.
+// protected routes the gain-setup register through CrypWrite.
 type poaRegmap struct {
 	t         Transport
 	bus       RegBus // PlayerOne's Sony dies all use the ImgSen path; kept for interface parity
@@ -42,16 +41,14 @@ type poaRegmap struct {
 	protected map[uint16]bool
 }
 
-// ReadoutMode implements modeReader: returns the live runtime context the Camera set.
-// Guarded: capture goroutines read it while camera methods mutate via updateMode.
+// ReadoutMode implements modeReader (read under the mode lock).
 func (r *poaRegmap) ReadoutMode() ReadoutMode {
 	r.modeMu.RLock()
 	defer r.modeMu.RUnlock()
 	return r.mode
 }
 
-// updateMode implements modeCarrier: the Camera mutates the live ReadoutMode (FPS%,
-// output depth, bin) under the mode lock.
+// updateMode implements modeCarrier (mutate under the mode lock).
 func (r *poaRegmap) updateMode(f func(*ReadoutMode)) {
 	r.modeMu.Lock()
 	defer r.modeMu.Unlock()
@@ -61,9 +58,8 @@ func (r *poaRegmap) updateMode(f func(*ReadoutMode)) {
 // VID reports the PlayerOne vendor id (selects the PlayerOne gain/offset encoding).
 func (r *poaRegmap) VID() uint16 { return POA.VID }
 
-// WriteReg writes a sensor register. A protected register (gain-setup 0x67f) goes via
-// CrypWrite (opcode 0xB3, address offset by +0xABCD); the value is unchanged. All others
-// use the plain sensor write 0xB0.
+// WriteReg writes a sensor register: plain write 0xB0, or CrypWrite (0xB3, address +0xABCD,
+// value unchanged) for a protected register.
 func (r *poaRegmap) WriteReg(reg, val uint16) error {
 	if r.protected[reg] {
 		return r.t.ControlOut(poaReqImgSenCryp, val, reg+poaCrypRegBias, nil)
@@ -95,10 +91,9 @@ func (r *poaRegmap) WriteRegBits(reg uint16, lo, hi uint8, val uint16) error {
 	return r.WriteReg(reg, cur)
 }
 
-// WriteFPGAReg writes a camera-FPGA register (Fx3FpgaWrite 0xC0; reg in wIndex, value in
-// wValue). val is transmitted as given: FPGA regs are byte-wide and every in-tree caller
-// pre-masks to the low byte (same convention as the ZWO dialect); what an over-byte wValue
-// does on the POA wire is unverified.
+// WriteFPGAReg writes a camera-FPGA register (Fx3FpgaWrite 0xC0). val is transmitted as given:
+// FPGA regs are byte-wide and every in-tree caller pre-masks to the low byte; what an over-byte
+// wValue does on the POA wire is unverified.
 func (r *poaRegmap) WriteFPGAReg(reg, val uint16) error {
 	return r.t.ControlOut(poaReqFpgaWrite, val, reg, nil)
 }
@@ -116,12 +111,11 @@ func (r *poaRegmap) ReadFPGAReg(reg uint16) (uint16, error) {
 	return uint16(buf[0]), nil
 }
 
-// POA is the vendor descriptor for PlayerOne Astronomy cameras (USB VID 0xA0A0). Its
-// Regmap dialect is defined above. Registered at init; the product rows (PID -> sensor) are
-// registered by the sensors package. No PlayerOne camera has been driven on hardware yet, and
-// its FX3 vendor commands (stream stop/start/flush, GPIF bus, flash read, firmware, serial)
-// are not decoded: Cmds is zero, so Camera.Init, ReadSPIFlash, FirmwareVersion and
-// SerialNumber return "not decoded" errors instead of sending ZWO's opcodes.
+// POA is the vendor descriptor for PlayerOne Astronomy cameras (USB VID 0xA0A0). Registered at
+// init; the product rows (PID -> sensor) are registered by the sensors package. Not driven on
+// hardware; its FX3 vendor commands are not decoded, so Cmds is zero and Camera.Init,
+// ReadSPIFlash, FirmwareVersion and SerialNumber return "not decoded" errors instead of sending
+// ZWO's opcodes.
 var POA = &Vendor{
 	VID:  0xA0A0,
 	Name: "PlayerOne",

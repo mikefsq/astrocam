@@ -5,18 +5,17 @@ import (
 	"testing"
 )
 
-// TestFilterCameras checks the Enumerate filter: raw USB devices on the ZWO VID are
-// kept only when their PID resolves to a registered camera Model (so non-camera ZWO
-// devices — e.g. EFW filter wheels — are dropped), and a missing USB product name
-// falls back to the registry name.
+// TestFilterCameras: raw USB devices are kept only when their PID resolves to a registered
+// camera Model (an EFW wheel on the same VID is dropped), and a missing USB product name falls
+// back to the registry name.
 func TestFilterCameras(t *testing.T) {
 	Register(ZWO.VID, 0xE001, Model{Name: "TestCamA", Sensor: &testSensor})
 	Register(ZWO.VID, 0xE002, Model{Name: "TestCamB", Sensor: &testSensor})
 
 	raw := []DeviceInfo{
 		{VID: ZWO.VID, PID: 0xE001, Name: "ASI-A", Location: 0x100},
-		{VID: ZWO.VID, PID: 0xEFEF, Name: "EFW Mini", Location: 0x200}, // not a registered camera → drop
-		{VID: ZWO.VID, PID: 0xE002, Name: "", Location: 0x300},         // no USB name → fall back to registry
+		{VID: ZWO.VID, PID: 0xEFEF, Name: "EFW Mini", Location: 0x200}, // unregistered PID: dropped
+		{VID: ZWO.VID, PID: 0xE002, Name: "", Location: 0x300},         // falls back to registry
 	}
 
 	got := filterCameras(raw)
@@ -36,8 +35,8 @@ func TestFilterCameras(t *testing.T) {
 	}
 }
 
-// TestDeviceInfoString sanity-checks that the human listing carries the identifying
-// fields (VID:PID, name, location) without pinning the exact spacing.
+// TestDeviceInfoString: the listing carries VID:PID, name and location, without pinning the
+// spacing.
 func TestDeviceInfoString(t *testing.T) {
 	d := DeviceInfo{VID: ZWO.VID, PID: 0x620A, Name: "ASI6200MC Pro", Location: 0x02200000}
 	got := d.String()

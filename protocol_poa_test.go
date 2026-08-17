@@ -5,8 +5,8 @@ import (
 	"time"
 )
 
-// poaFake records every control transfer with full args. (The shared fakeTransport
-// discards read wValue/wIndex, but the PlayerOne swapped-order assertions need them.)
+// poaFake records every control transfer with full args (the shared fakeTransport discards read
+// wValue/wIndex, which the PlayerOne swapped-order assertions need).
 type poaCtl struct {
 	dir            byte // 'O' = ControlOut, 'I' = ControlIn
 	bRequest       uint8
@@ -34,9 +34,9 @@ func (f *poaFake) Close() error                                    { return nil 
 
 func (f *poaFake) last() poaCtl { return f.calls[len(f.calls)-1] }
 
-// TestPOARegmapWire locks PlayerOne's decoded control-transfer dialect (POAFx3.o): the
-// opcodes, and crucially the reg/val order — OPPOSITE ZWO's (value in wValue, register in
-// wIndex) — plus the CrypWrite obfuscation on the protected gain-setup register 0x67f.
+// TestPOARegmapWire: PlayerOne's control-transfer dialect (POAFx3.o): the opcodes, the reg/val
+// order (value in wValue, register in wIndex, the reverse of ZWO's), and the CrypWrite
+// obfuscation on the protected gain-setup register 0x67f.
 func TestPOARegmapWire(t *testing.T) {
 	f := &poaFake{}
 	rm := POA.newRegmap(f, BusSony, ReadoutMode{})
@@ -83,8 +83,8 @@ func TestPOARegmapWire(t *testing.T) {
 	}
 }
 
-// TestPOAVendorRegistered checks the PlayerOne vendor is discoverable by the
-// vendor-independent core: VID 0xA0A0 resolves to POA, and KnownVIDs carries both vendors.
+// TestPOAVendorRegistered: VID 0xA0A0 resolves to POA, KnownVIDs carries both vendors, and
+// poaRegmap implements modeCarrier.
 func TestPOAVendorRegistered(t *testing.T) {
 	v, ok := VendorOf(0xA0A0)
 	if !ok || v != POA || v.Name != "PlayerOne" {
@@ -103,8 +103,7 @@ func TestPOAVendorRegistered(t *testing.T) {
 		t.Errorf("KnownVIDs missing a vendor: ZWO=%v POA=%v", sawZWO, sawPOA)
 	}
 
-	// modeCarrier works through the poaRegmap too (the de-coupling that replaced the
-	// *zwoRegmap assertions): mutating the live mode must stick.
+	// Mutating the live mode through modeCarrier sticks on a poaRegmap.
 	rm := POA.newRegmap(&poaFake{}, BusSony, ReadoutMode{})
 	mc, ok := rm.(modeCarrier)
 	if !ok {
@@ -116,10 +115,10 @@ func TestPOAVendorRegistered(t *testing.T) {
 	}
 }
 
-// TestPOACmdsNotDecoded: with an empty FX3 command table the Camera must refuse to drive a
-// PlayerOne body with ZWO's opcodes. Init errors before any vendor command, FirmwareVersion /
-// SerialNumber / ReadSPIFlash error, and the transport log carries none of ZWO's 0xAA/0xA9/
-// 0xAF/0xBE/0xC3/0xAD/0xC8 requests. The ZWO table itself carries the known opcodes.
+// TestPOACmdsNotDecoded: with an empty FX3 command table the Camera refuses to drive a PlayerOne
+// body with ZWO's opcodes: Init, FirmwareVersion, SerialNumber, ReadSPIFlash, VendorCmd, ST4 and
+// thermal reads error, and the transport log carries none of ZWO's requests. The ZWO table
+// itself carries the known opcodes.
 func TestPOACmdsNotDecoded(t *testing.T) {
 	if z := ZWO.Cmds; z.StreamStop != 0xAA || z.StreamStart != 0xA9 || z.Flush != 0xAF ||
 		z.EnableGPIF32DQ != 0xBE || z.ReadSPIFlash != 0xC3 || z.FirmwareVersion != 0xAD || z.SerialNumber != 0xC8 ||

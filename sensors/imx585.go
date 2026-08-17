@@ -1,24 +1,18 @@
-// IMX585 (Type 1/1.2, 8.3 MP, STARVIS 2). Own register map with a STARVIS-2 dual-gain: gain
-// registers 0x3030 (conv-gain select) + 0x306c/0x306d (analog code), offset 0x30dc/0x30dd, SHS
-// 0x3050-52, ROI in the 0x303c-47 block, latch 0x3001. DDR-buffered USB3 camera (FPGADDRTest +
-// EnableFPGADDR at bringup, SetFPGABinDataLen + windowed startAsyncXfer for capture), so the
-// readout path mirrors the IMX455/6200 rather than the 290.
+// Sony IMX585: Type 1/1.2, 8.3 MP, STARVIS 2, 3840×2160 (ZWO ASI585, PlayerOne Uranus). Own
+// register map with a STARVIS-2 dual gain (0x3030 conv-gain select + 0x306c/0x306d analog
+// code), offset 0x30dc/0x30dd, SHS 0x3050-52, ROI in the 0x303c-47 block, latch 0x3001.
+// DDR-buffered USB3 camera (EnableFPGADDR at bringup, SetFPGABinDataLen + windowed
+// startAsyncXfer for capture), so the readout path follows the IMX455/6200. Not
+// hardware-validated. SDK op → profile function:
 //
-// Register/behavior summary:
-//
-//	ctor              (geometry 3840x2160 (lit16 0x3440); clock 20000; HMAX 192; the SDK's FPS%-default 80 is not applied here)
-//	InitCamera        (reglist = 226 records [reg:u16le][val:u16le], size 0x388;
-//	                   tail 0x3015/0x3002/0x3018/0x301b/0x3022/0x3023; FPGAReset + DDR bringup)
-//	SetCMOSClk        (clock 20000 kHz; no static HMAX floor → HMAX is baked 192)
-//	Cam_SetResolution (window X 0x303e/3f, Y 0x3046/47; SetFPGABinDataLen + SetFPGAWidth/Height)
-//	SetStartPos       (0x3018=0x14; ROI X 0x303c/3d align 2, Y 0x3044/45 align 4)
-//	SetGain           (clamp 0..600; HCG when gain>199 → conv 0x3030=1 and eff=gain-150; LCG eff=gain;
-//	                   code = eff/3 (eff*0xaaab>>17) → 0x306c/0x306d 16-bit LE; latch 0x3001)
-//	SetExp            (SHS 24-bit 0x3050-52; line_time=HMAX*1000/clock; VMAX=height+2;
-//	                   SHS=clamp((VMAX-8)-lines, 8, VMAX-8); ≥1 s → FPGA trigger mode)
-//	SetBrightness     (offset -> 0x30dc (low) / 0x30dd (high), 16-bit LE; latch 0x3001)
-//	Start/StopSensorStreaming (start: 0x3004=0, 0x3000=0, FPGAStart; stop: FPGAStop, 0x3000=1)
-//	the capture worker (DDR capture: arm, TriggerSignal+XHSStop window, windowed xfer)
+//	InitCamera                 imx585Init, imx585InitFPGA
+//	Cam_SetResolution          imx585SetROI (window, SetFPGABinDataLen, FPGA geometry, HMAX)
+//	SetStartPos                imx585SetROI (ROI start)
+//	SetGain                    imx585SetGain
+//	SetExp                     imx585SetExposure
+//	SetBrightness              imx585SetOffset
+//	Start/StopSensorStreaming  imx585StreamStart / StreamStop
+//	WorkingFunc                imx585Worker
 
 package sensors
 
@@ -55,31 +49,31 @@ const (
 	imx585RegHeightH = 0x3047
 	imx585RegWinMode = 0x3018 // window/mode byte, full-res value 0x14
 
-	imx585GainMax   = 600 // 60.0 dB ceiling, ASI 0.1 dB units (SetGain clamp)
-	imx585GainHCGAt = 199 // ABOVE this (gain > 199) → HCG: conv 0x3030=1
-	imx585HCGSub    = 150 // HCG analog code uses (gain - 150)
+	imx585GainMax   = 600 // 60.0 dB, ASI 0.1 dB units (SetGain clamp)
+	imx585GainHCGAt = 199 // above this (gain > 199), HCG: conv 0x3030=1
+	imx585HCGSub    = 150 // the HCG analog code uses (gain - 150)
 
-	imx585ExpMinUs  = 32            // µs floor (clamp 32)
+	imx585ExpMinUs  = 32            // µs floor
 	imx585ExpMaxUs  = 2_000_000_000 // 2000 s ceiling
-	imx585LongExpUs = 1_000_000     // ≥ 1 s enters FPGA trigger mode — EXACT
+	imx585LongExpUs = 1_000_000     // >= 1 s enters FPGA trigger mode (inclusive bound)
 
-	// Die/mode readout facts (shared engine: fps.go / shutter.go). Geometry is image-orientation;
-	// effective 4K (3840×2160).
+	// Readout constants for the shared engine (fps.go / shutter.go). Geometry is image
+	// orientation, effective 4K. HMAX is baked (SetCMOSClk sets clock 20000 with no static HMAX
+	// floor; the SDK's FPS% default 80 is not applied).
 	imx585FullWidth  = 3840  // horizontal (lit16 0x3440)
-	imx585FullHeight = 2160  // vertical — the line count VMAX = height + 2 uses
+	imx585FullHeight = 2160  // vertical, the line count VMAX = height + 2 uses
 	imx585ClkKHz     = 20000 // 20 MHz
-	imx585HMAX       = 192   // baked line-period HMAX, fixed post-init; line_time = 192·1e6/20000 = 9600 ns
-	imx585VBlankAdd  = 2     // VMAX = height + 2 (the 60 used for the Sony output-height registers
-	//                     0x3046/0x3047 in Cam_SetResolution is NOT the VMAX addend). Affects the
-	//                     frame period, not the integration time.
-	imx585SHSGuard = 8 // SHS = clamp((VMAX-8) − lines, 8, VMAX-8) (the -8 / floor 8)
+	imx585HMAX       = 192   // baked line-period HMAX; line time = 192·1e6/20000 = 9600 ns
+	imx585VBlankAdd  = 2     // VMAX = height + 2 (the 60 in the Sony output-height regs 0x3046/47
+	//                     is not the VMAX addend); affects the frame period, not the integration
+	imx585SHSGuard = 8 // SHS = clamp((VMAX-8) - lines, 8, VMAX-8)
 )
 
-// imx585Init — the InitCamera reglist: 226 records, [reg:u16le][val:u16le], reg 0xffff = delay ms.
-// The big STARVIS-2 analog tuning table. (The InitCamera tail 0x3015/0x3002/0x3018/0x301b/0x3022/0x3023
-// + the FPGA bringup are in imx585InitFPGA / Camera.Init.)
+// imx585Init is the InitCamera reglist (234 records, reg 0xffff = delay ms, the STARVIS-2 analog
+// tuning table) plus the InitCamera tail (0x3015/0x3002/0x3018/0x301b/0x3022/0x3023), all inside
+// one 0x3001 latch group. FPGA bringup is in imx585InitFPGA.
 var imx585Init = []RegVal{
-	{Reg: 0x3001, Val: 0x01}, // latch on — InitCamera brackets the whole reglist+tail
+	{Reg: 0x3001, Val: 0x01}, // latch on; InitCamera brackets the whole reglist+tail
 	{Reg: 0x3018, Val: 0x14}, {Reg: 0x3014, Val: 0x01}, {Reg: 0x3015, Val: 0x06}, {Reg: 0x3460, Val: 0x21}, {Reg: 0x3478, Val: 0xa1}, {Reg: 0x347c, Val: 0x01},
 	{Reg: 0x3480, Val: 0x01}, {Reg: 0x3a4e, Val: 0x14}, {Reg: 0x3409, Val: 0x00}, {Reg: 0x340b, Val: 0x00}, {Reg: 0x3458, Val: 0x00}, {Reg: 0x3a4d, Val: 0x01},
 	{Reg: 0x3a50, Val: 0x48}, {Reg: 0x3a51, Val: 0x01}, {Reg: 0x3a52, Val: 0x14}, {Reg: 0x3a56, Val: 0x00}, {Reg: 0x3a5a, Val: 0x00}, {Reg: 0x3a5e, Val: 0x00},
@@ -124,9 +118,10 @@ var imx585Init = []RegVal{
 	{Reg: 0x3001, Val: 0x00}, // latch off; FPGAReset + SendCMD(0xAF) follow in imx585InitFPGA / Camera.Init
 }
 
-// IMX585 is the Sony IMX585 STARVIS 2 profile (ZWO ASI585, PlayerOne Uranus). Not yet hardware-validated.
+// IMX585 is the Sony IMX585 STARVIS 2 profile (ZWO ASI585, PlayerOne Uranus). Not
+// hardware-validated.
 var IMX585 = Sensor{
-	Name:      "IMX585", // ASI585 / Xena 585M; Sony IMX585 STARVIS 2 (mono die; MC adds a CFA)
+	Name:      "IMX585", // mono die; MC adds a CFA
 	GainMax:   imx585GainMax,
 	ExpMinUs:  imx585ExpMinUs,
 	ExpMaxUs:  imx585ExpMaxUs,
@@ -134,25 +129,27 @@ var IMX585 = Sensor{
 	Info: CameraInfo{
 		MaxWidth:  imx585FullWidth,
 		MaxHeight: imx585FullHeight,
-		PixelUm:   2.9,      // 2.9 µm pixel pitch
+		PixelUm:   2.9,      // µm pitch
 		BitDepth:  12,       // 12-bit ADC (RAW16 transport)
-		Bayer:     "RGGB",   // CFA (color/MC only); surfaced when Model.Color
-		Bins:      []int{1}, // bin modes (InitSensorMode 0x30d5 branches) not yet decoded → SetROI errors
+		Bayer:     "RGGB",   // CFA (color variant); surfaced when Model.Color
+		Bins:      []int{1}, // bin modes (InitSensorMode 0x30d5 branches) not decoded
 	},
-	Init:        imx585Init,
-	InitFPGA:    imx585InitFPGA,
-	SetGain:     imx585SetGain,
-	SetExposure: imx585SetExposure,
-	SetOffset:   imx585SetOffset,
-	GetOffset:   imx585GetOffset,
-	SetROI:      imx585SetROI,
-	StreamStop:  func(rm Regmap) error { return rm.WriteReg(imx585RegStandby, 1) }, // standby on (StopSensorStreaming)
-	StreamStart: imx585StreamStart,
-	Worker:      imx585Worker,
+	Init:          imx585Init,
+	InitFPGA:      imx585InitFPGA,
+	SetGain:       imx585SetGain,
+	SetExposure:   imx585SetExposure,
+	SetOffset:     imx585SetOffset,
+	GetOffset:     imx585GetOffset,
+	SetROI:        imx585SetROI,
+	StreamStop:    func(rm Regmap) error { return rm.WriteReg(imx585RegStandby, 1) }, // standby on
+	StreamStart:   imx585StreamStart,
+	Worker:        imx585Worker,
+	ROIStartAlign: func(int) (int, int) { return 2, 4 }, // SetStartPos masks (X to 2, Y to 4)
 }
 
-// imx585StreamStart — StartSensorStreaming: clear the master-start gate (0x3004=0) then release
-// standby (0x3000=0). The capture framework brackets this with FPGAStop/Start and the 0xAA/0xA9 vendor cmds.
+// imx585StreamStart (StartSensorStreaming) clears the master-start gate (0x3004=0) then releases
+// standby (0x3000=0). The capture framework brackets this with FPGAStop/Start and the 0xAA/0xA9
+// vendor cmds.
 func imx585StreamStart(rm Regmap) error {
 	if err := rm.WriteReg(imx585RegXmsta, 0); err != nil {
 		return err
@@ -160,10 +157,10 @@ func imx585StreamStart(rm Regmap) error {
 	return rm.WriteReg(imx585RegStandby, 0)
 }
 
-// imx585SetGain — STARVIS-2 dual gain: clamp [0,600]; above gain 199 the high conversion gain engages
-// (0x3030 = 1) and the analog code is computed on (gain-150); at/below 199 it is LCG (0x3030 = 0) on the
-// raw gain. The analog code = eff/3 (eff*0xaaab>>17), written 16-bit LE to 0x306c/0x306d. Bracketed by
-// the 0x3001 latch.
+// imx585SetGain (SetGain): STARVIS-2 dual gain. Clamp [0, 600]; above gain 199 the high
+// conversion gain engages (0x3030 = 1) and the analog code is computed on (gain-150); at/below
+// 199 it is LCG (0x3030 = 0) on the raw gain. Code = eff/3 (eff*0xaaab>>17), 16-bit LE to
+// 0x306c/0x306d, under the 0x3001 latch.
 func imx585SetGain(rm Regmap, gain int) error {
 	if gain > imx585GainMax {
 		gain = imx585GainMax
@@ -192,13 +189,13 @@ func imx585SetGain(rm Regmap, gain int) error {
 	})
 }
 
-// imx585SetExposure — STARVIS-2 rolling shutter: line_time = HMAX·1000/clock (HMAX baked at 192),
-// VMAX = height + 2, SHS = clamp((VMAX-8) − lines, 8, VMAX-8) to the 24-bit 0x3050-52 (bracketed by
-// 0x3001), VMAX to the FPGA (SetFPGAVMAX). Exposures ≥ 1 s engage FPGA trigger mode (reg0 bit7) and the
-// worker host-times them.
+// imx585SetExposure (SetExp): STARVIS-2 rolling shutter. line time = HMAX·1000/clock (HMAX baked
+// 192), VMAX = height + 2, SHS = clamp((VMAX-8) - lines, 8, VMAX-8) to the 24-bit 0x3050-52
+// under the 0x3001 latch, VMAX to the FPGA (SetFPGAVMAX). Exposures >= 1 s engage FPGA wait +
+// trigger mode (reg0 bit6/bit7) and the worker host-times them.
 func imx585SetExposure(rm Regmap, d time.Duration) error {
 	trigger := d >= imx585LongExpUs*time.Microsecond
-	// Engage both FPGA flags for the ≥1 s band and clear both below: reg0 bit6 (EnableFPGAWaitMode)
+	// Set both FPGA flags for the >= 1 s band and clear both below: reg0 bit6 (EnableFPGAWaitMode)
 	// + bit7 (EnableFPGATriggerMode), WaitMode then TriggerMode to set, the reverse to clear.
 	if trigger {
 		if err := SetFPGABit(rm, 0x00, 0x40, true); err != nil { // EnableFPGAWaitMode
@@ -218,9 +215,15 @@ func imx585SetExposure(rm Regmap, d time.Duration) error {
 	lineNs := uint64(imx585HMAX) * 1_000_000 / imx585ClkKHz // 9600 ns
 	lines := ExposureLines(d, lineNs, imx585ExpMinUs, imx585ExpMaxUs)
 
-	vmax := uint64(imx585FullHeight) + imx585VBlankAdd // 2220
-	hi := vmax - imx585SHSGuard                        // SHS base / ceiling = VMAX-8 = 2212
-	if lines+1 > hi {                                  // exposure exceeds the in-frame window → stretch VMAX
+	// effHeight = the sensor-side readout rows (the live ROI height set by SetROI, else full), so
+	// a sub-frame free-runs at its own frame period.
+	effH := uint64(imx585FullHeight)
+	if h := ModeOf(rm).Height; h > 0 {
+		effH = uint64(h)
+	}
+	vmax := effH + imx585VBlankAdd // 2162 at full height
+	hi := vmax - imx585SHSGuard    // SHS base / ceiling = VMAX-8
+	if lines+1 > hi {              // past the in-frame window: stretch VMAX
 		vmax = lines + 1 + imx585SHSGuard
 		hi = vmax - imx585SHSGuard
 	}
@@ -240,9 +243,8 @@ func imx585SetExposure(rm Regmap, d time.Duration) error {
 	return WriteRegLE(rm, imx585RegLatch, []uint16{imx585RegSHS0, imx585RegSHS1, imx585RegSHS2}, uint32(shs))
 }
 
-// imx585SetOffset — SetBrightness: offset 16-bit LE to 0x30dc (low) / 0x30dd (high), bracketed by
-// the 0x3001 latch.
-// imx585GetOffset reads the offset back from 0x30dc (low) / 0x30dd (high).
+// imx585SetOffset (SetBrightness) writes the offset 16-bit LE to 0x30dc/0x30dd under the 0x3001
+// latch; imx585GetOffset reads it back.
 func imx585GetOffset(rm Regmap) (int, error) {
 	v, err := ReadRegLE(rm, []uint16{imx585RegOffsetL, imx585RegOffsetH})
 	return int(v), err
@@ -252,9 +254,9 @@ func imx585SetOffset(rm Regmap, offset int) error {
 	return WriteRegLE(rm, imx585RegLatch, []uint16{imx585RegOffsetL, imx585RegOffsetH}, uint32(uint16(offset)))
 }
 
-// imx585SetROI — SetStartPos (0x3018=0x14; ROI X→0x303c/3d align 2, Y→0x3044/45 align 4) +
-// Cam_SetResolution (window W→0x303e/3f, H→0x3046/47; SetFPGABinDataLen + SetFPGAWidth/Height).
-// Only bin 1 — the binned modes (InitSensorMode 0x30d5 branches) are not yet decoded.
+// imx585SetROI: SetStartPos (0x3018=0x14; X aligned to 2, Y to 4) + Cam_SetResolution (window,
+// SetFPGABinDataLen, SetFPGAWidth/Height, HMAX). Bin 1 only; the binned modes (InitSensorMode
+// 0x30d5 branches) are not decoded.
 func imx585SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if bin != 1 {
 		return fmt.Errorf("imx585: bin %d not supported (binned mode regs not yet decoded)", bin)
@@ -267,8 +269,12 @@ func imx585SetROI(rm Regmap, x, y, w, h, bin int) error {
 	}
 	ux := uint16(x &^ 1) // align X to 2 (&~1)
 	uy := uint16(y &^ 3) // align Y to 4 (&~3)
-	// Window sizes carry margins (Cam_SetResolution): width rounded up to 16,
-	// height rounded up to 4 then +2 dummy lines.
+	// Window sizes carry margins (Cam_SetResolution): width rounded up to 16, height rounded up
+	// to 4 then +2 dummy lines. The sensor window is deliberately wider than the frame the host
+	// receives: the FPGA below is given the exact requested w×h and crops the margin, the same
+	// split the IMX455 uses (its window register is width+0x18 against an exact SetFPGAWidth),
+	// there confirmed pixel-for-pixel against the SDK. The margin falls in the die's non-active
+	// columns/rows, so a window reaching the array edge does not over-read.
 	uw := uint16((w + 15) &^ 15)
 	uh := uint16(((h + 3) &^ 3) + 2)
 
@@ -291,9 +297,9 @@ func imx585SetROI(rm Regmap, x, y, w, h, bin int) error {
 		return err
 	}
 
-	// FPGA frame geometry for the FX3 DDR transfer (Cam_SetResolution): the per-frame DMA word count,
-	// then output width/height. HMAX is the baked 192 (DDR branch writes it straight to the FPGA HMAX
-	// register, like the IMX455/6200 — not the bandwidth throttle).
+	// FPGA frame geometry for the FX3 DDR transfer (Cam_SetResolution): the per-frame DMA word
+	// count, then output width/height. HMAX is the baked 192, written to the FPGA HMAX register
+	// directly (DDR branch, as on the IMX455; not the bandwidth throttle).
 	bpp := ModeOf(rm).BytesPerPx
 	if err := SetFPGABinDataLen(rm, uint32((w*h*bpp+3)/4)); err != nil {
 		return err
@@ -307,12 +313,11 @@ func imx585SetROI(rm Regmap, x, y, w, h, bin int) error {
 	return WriteFPGAHMAX(rm, imx585HMAX)
 }
 
-// imx585InitFPGA — the FPGA bringup after the Sony reglist (InitCamera).
-// Sequence: FPGAReset, usleep, SendCMD(0xAF) [Camera.Init], FPGADDRTest, SetFPGAAsMaster(1),
-// FPGAStop, EnableFPGADDR(1) (585 is DDR), SetFPGAADCWidthOutputWidth(adc, outputWidth),
-// SetFPGAGain(0x80×4 → 0x0c-0x0f). No SetFPGABinMode here (that is IMX455-only). FPGADDRTest is a
-// DDR self-test with no host-visible state — omitted. outputWidth = 0 (8-bit) at init; bit4 is
-// raised for RAW16 from the live ReadoutMode.
+// imx585InitFPGA is the FPGA bringup after the Sony reglist (InitCamera): FPGAReset, usleep,
+// SendCMD(0xAF) [Camera.Init], FPGADDRTest (a DDR self-test with no host-visible state, omitted),
+// SetFPGAAsMaster(1), FPGAStop, EnableFPGADDR(1) (the 585 is DDR),
+// SetFPGAADCWidthOutputWidth(adc, outputWidth) with bit4 = RAW16 from the live ReadoutMode,
+// SetFPGAGain(0x80×4 → 0x0c-0x0f). No SetFPGABinMode (the 455 and 571 write it; this die does not).
 func imx585InitFPGA(rm Regmap, subtype int) error {
 	_ = subtype
 	if err := FPGAClearBits(rm, 0x00, 0x01); err != nil { // FPGAReset
@@ -325,7 +330,7 @@ func imx585InitFPGA(rm Regmap, subtype int) error {
 	if err := FPGASetBits(rm, 0x00, 0x10); err != nil { // FPGAStop
 		return err
 	}
-	if err := FPGAWriteBits(rm, 0x0a, 0x40, 0x00); err != nil { // EnableFPGADDR(1): bit6 = 0 (DDR on)
+	if err := FPGAWriteBits(rm, 0x0a, 0x40, 0x00); err != nil { // EnableFPGADDR(1): bit6 = 0 (DDR)
 		return err
 	}
 	adcOut := uint16(0x01) // bit0 = ADC
@@ -346,13 +351,27 @@ func imx585InitFPGA(rm Regmap, subtype int) error {
 	return rm.WriteFPGAReg(0x01, 0)
 }
 
-// imx585Worker — the capture worker, host-timed single-shot DDR capture. Same skeleton as
-// the IMX455/6200 (DDR + windowed startAsyncXfer): arm (SendCMD 0xAA + FPGAStop, SendCMD 0xA9, stream the
-// sensor, FPGAStart, ResetEndPoint), open the FPGA exposure window with EnableFPGATriggerSignal(1) +
-// EnableFPGAXHSStop(1), hold for the exposure, close it, then read one frame with the continuous windowed
-// pump. XHSStop is FPGA reg0a bit4; TriggerSignal is reg0b bit0.
+// imx585Worker is the host-timed single-shot DDR capture worker (the IMX455/6200 shape). XHSStop
+// is FPGA reg 0x0b bit4 (EnableFPGAXHSStop); TriggerSignal is reg 0x0b bit0.
+//
+//	arm:    SendCMD(0xAA)·FPGAStop·SendCMD(0xA9)·0x3004=0·0x3000=0·10ms·FPGAStart·ResetEndPoint
+//	expose: EnableFPGATriggerSignal(1)+EnableFPGAXHSStop(1)·hold for the exposure·
+//	        EnableFPGAXHSStop(0)+EnableFPGATriggerSignal(0)
+//	read:   one frame with the continuous windowed pump (ctl.StreamFrame), FPGABufReload pulsed
+//	        every 20 ms so the FX3 commits the frame's final partial DDR buffer
+//	stop:   FPGAStop·0x3000=1·SendCMD(0xAA)·ResetEndPoint (WorkingFunc exit)
 func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
+	// Halt the readout on every return, the arm's own failures included, as WorkingFunc's
+	// exit does (0104_CCameraS585MC.o):
+	// StopSensorStreaming (FPGAStop + standby 0x3000=1), SendCMD(0xAA), ResetEndPoint. A sensor
+	// left free-running with no reader backs up the FX3 GPIF. Best-effort; not hardware-verified.
+	defer func() {
+		_ = SetFPGABit(rm, 0x00, 0x10, true) // FPGAStop: reg0 bit4
+		_ = rm.WriteReg(imx585RegStandby, 1) // standby (sensor stop)
+		_ = ctl.VendorCmd(FX3StreamStop)
+		_ = ctl.ResetEndpoint()
+	}()
 	if err := ctl.VendorCmd(FX3StreamStop); err != nil {
 		return 0, err
 	}
@@ -369,17 +388,6 @@ func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := SetFPGABit(rm, 0x00, 0x10, false); err != nil { // FPGAStart
 		return 0, err
 	}
-	// Halt the readout on EVERY return — the 585 object's WorkingFunc exit:
-	// StopSensorStreaming (FPGAStop + standby 0x3000=1, per 0104_CCameraS585MC.o) then
-	// SendCMD(0xAA) then ResetEndPoint. A sensor left free-running with no reader backs up
-	// the FX3 GPIF. Best-effort. VERIFY-HW: ported from the object; no 585 on the bench at
-	// port time.
-	defer func() {
-		_ = SetFPGABit(rm, 0x00, 0x10, true) // FPGAStop: reg0 bit4
-		_ = rm.WriteReg(imx585RegStandby, 1) // standby (sensor stop)
-		_ = ctl.VendorCmd(FX3StreamStop)
-		_ = ctl.ResetEndpoint()
-	}()
 	_ = ctl.ResetEndpoint()
 
 	open := func(on bool) error {
@@ -387,9 +395,9 @@ func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 			if err := SetFPGABit(rm, 0x0b, 0x01, true); err != nil { // EnableFPGATriggerSignal(1)
 				return err
 			}
-			return SetFPGABit(rm, 0x0a, 0x10, true) // EnableFPGAXHSStop(1)
+			return SetFPGABit(rm, 0x0b, 0x10, true) // EnableFPGAXHSStop(1)
 		}
-		if err := SetFPGABit(rm, 0x0a, 0x10, false); err != nil { // EnableFPGAXHSStop(0)
+		if err := SetFPGABit(rm, 0x0b, 0x10, false); err != nil { // EnableFPGAXHSStop(0)
 			return err
 		}
 		return SetFPGABit(rm, 0x0b, 0x01, false) // EnableFPGATriggerSignal(0)
@@ -397,9 +405,8 @@ func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := open(true); err != nil {
 		return 0, err
 	}
-	// Band split must match imx585SetExposure's trigger threshold (>= 1 s, EXACT): at exactly
-	// 1 s the FPGA is in trigger mode and the host hold IS the integration, so it gets the
-	// full-exposure wait — `<=` here under-integrated a 1.000 s exposure by 200 ms.
+	// The band split matches imx585SetExposure's inclusive >= 1 s trigger threshold: at 1 s the
+	// FPGA is in trigger mode and the host hold is the integration, so it gets the full wait.
 	if exposure < time.Second {
 		if w := exposure - 200*time.Millisecond; w > 0 {
 			time.Sleep(w)
@@ -407,11 +414,9 @@ func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	} else {
 		for start := time.Now(); time.Since(start) < exposure; {
 			if ctl.Aborted() {
-				// StopExposure ran: bail, dropping the trigger window on the way out —
-				// open(false) clears BOTH XHSStop (reg 0x0a bit4) and the trigger signal
-				// (reg 0x0b bit0); left asserted, the next open(true) is a no-edge write.
-				// (Host-side hygiene, not object-derived: the SDK snap thread never
-				// host-aborts mid-integration.)
+				// StopExposure ran: drop the trigger window on the way out. open(false)
+				// clears both XHSStop (reg 0x0b bit4) and the trigger signal (reg 0x0b
+				// bit0); left asserted, the next open(true) is a no-edge write.
 				_ = open(false)
 				return 0, errExposureAborted
 			}
@@ -427,9 +432,45 @@ func imx585Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if target > len(buf) {
 		target = len(buf)
 	}
-	n, err := ctl.StreamFrame(buf[:target], 500*time.Millisecond, exposure+5*time.Second)
+	// idle covers the wait for the first chunk (about one frame period); once flowing, chunks
+	// are ms apart. In the >= 1 s trigger band the integration completed above, so the read spans
+	// only the readout and the timeouts are not exposure-scaled.
+	idle := exposure + 2*time.Second
+	total := 2*exposure + 5*time.Second
+	if exposure >= time.Second {
+		idle = 2 * time.Second
+		total = 15 * time.Second
+	}
+	// On USB3 the FX3 commits whole 1-MiB DMA buffers and holds the frame's final partial buffer
+	// until it is filled or committed (a 3840×2160×2 frame ends in a partial buffer); pulse
+	// FPGABufReload (reg 0x18 bit0) throughout the read so the tail flushes into a posted
+	// transfer, as the IMX455 worker does; on a USB2 link the pulses wedge the readout (the 455
+	// finding) and the ticker stays off. Inferred from the 455 (the 585 SDK WorkingFunc has the
+	// same DDR shape); not verified on a 585.
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if !ModeOf(rm).USB3 {
+			<-stop
+			return
+		}
+		t := time.NewTicker(20 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				_ = SetFPGABit(rm, 0x18, 0x01, true)
+			}
+		}
+	}()
+	n, err := ctl.StreamFrame(buf[:target], idle, total)
+	close(stop)
+	<-done // no control transfer outlives the worker
 	if err == nil && n < target && ctl.Aborted() {
-		return n, errExposureAborted // StopExposure broke the read (AbortRead): clean abort, not a stall
+		return n, errExposureAborted // AbortRead: clean abort, not a stall
 	}
 	return n, err
 }

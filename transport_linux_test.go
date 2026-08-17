@@ -7,10 +7,9 @@ import (
 )
 
 // newFakeUsbfs returns a usbfsDevice over /dev/null: every ioctl fails instantly (ENOTTY),
-// so the only observable behavior is the LOCK DISCIPLINE — which is exactly what these
-// tests pin down. The ioMu serialization is the single most safety-critical property of the
-// transport (a control transfer interleaving a USB2 bulk readout parks the FX3 GPIF), and
-// before these tests it was locked only by convention.
+// so the only observable behavior is the lock discipline these tests assert. ioMu
+// serialization is the transport's central safety property (a control transfer
+// interleaving a USB2 bulk readout parks the FX3 GPIF).
 func newFakeUsbfs(t *testing.T) *usbfsDevice {
 	t.Helper()
 	f, err := os.OpenFile("/dev/null", os.O_RDWR, 0)
@@ -22,9 +21,9 @@ func newFakeUsbfs(t *testing.T) *usbfsDevice {
 }
 
 // runsWhileLocked reports whether op completes while d.ioMu is held by the test. wait is how
-// long to give the op: guarded ops use a short window (they are blocked on the held lock, so
-// a longer wait only slows the test); exempt ops need a generous one so scheduler jitter
-// under -race can't make a lock-free op look blocked (a flake, not a finding).
+// long to give the op: guarded ops use a short window (they are blocked on the held lock);
+// exempt ops need a generous one so scheduler jitter under -race cannot make a lock-free op
+// look blocked.
 func runsWhileLocked(t *testing.T, d *usbfsDevice, wait time.Duration, op func()) bool {
 	t.Helper()
 	d.ioMu.Lock()
@@ -40,7 +39,7 @@ func runsWhileLocked(t *testing.T, d *usbfsDevice, wait time.Duration, op func()
 	d.ioMu.Unlock()
 	if !completed {
 		select {
-		case <-done: // released by the unlock — the op was honoring ioMu
+		case <-done: // released by the unlock: the op honored ioMu
 		case <-time.After(2 * time.Second):
 			t.Fatal("op never completed even after ioMu was released")
 		}
@@ -48,8 +47,8 @@ func runsWhileLocked(t *testing.T, d *usbfsDevice, wait time.Duration, op func()
 	return completed
 }
 
-// TestIoMuDiscipline pins which transport operations serialize on ioMu. Guarded ops must
-// block while another I/O holds the lock; the two deliberate exceptions must not.
+// TestIoMuDiscipline asserts which transport operations serialize on ioMu: guarded ops block
+// while another I/O holds the lock; the exempt ops do not.
 func TestIoMuDiscipline(t *testing.T) {
 	buf := make([]byte, 4096)
 	guarded := []struct {
@@ -80,13 +79,13 @@ func TestIoMuDiscipline(t *testing.T) {
 		why  string
 		op   func(d *usbfsDevice)
 	}{
-		// ReadFrameStream (bulkOne) is the USB3/DDR path that REQUIRES a concurrent
-		// FPGABufReload; its DDR buffering makes the interleave harmless (see ioMu doc).
+		// ReadFrameStream is the USB3 DDR path, which needs a concurrent
+		// FPGABufReload; its DDR buffering makes the interleave harmless (see ioMu).
 		{"ReadFrameStream", "DDR path needs concurrent FPGABufReload", func(d *usbfsDevice) {
 			_, _ = d.ReadFrameStream(buf, 50*time.Millisecond, 200*time.Millisecond)
 		}},
-		// ResetDevice is the last-resort unwedger: it must work WHILE a stuck read holds
-		// ioMu — serializing it would deadlock the recovery.
+		// ResetDevice is the last-resort recovery: it must work while a stuck read holds
+		// ioMu; serializing it would deadlock the recovery.
 		{"ResetDevice", "must recover a wedged read that holds ioMu", func(d *usbfsDevice) {
 			_ = d.ResetDevice()
 		}},
@@ -124,7 +123,7 @@ func TestClosedTransportFailsFast(t *testing.T) {
 	}
 }
 
-// TestCloseWaitsForInflightIO: Close must block until in-flight I/O releases the interlock —
+// TestCloseWaitsForInflightIO: Close must block until in-flight I/O releases the interlock;
 // closing the fd under a live URB drain abandons kernel-held pointers into the caller's buf.
 func TestCloseWaitsForInflightIO(t *testing.T) {
 	d := newFakeUsbfs(t)
@@ -166,9 +165,9 @@ var (
 	_ QuietBulkReader = (*usbfsDevice)(nil)
 )
 
-// TestReadAbortFailsFast: with the read-abort latched (StopExposure), every frame read
-// returns (0, nil) immediately — even while ioMu is held, since queueing behind the lock is
-// exactly what the latch exists to prevent — and ArmRead restores the guarded behavior.
+// TestReadAbortFailsFast: with the read-abort latched, every frame read returns (0, nil)
+// immediately, even while ioMu is held (queueing behind the lock is what the latch
+// prevents), and ArmRead restores the guarded behavior.
 func TestReadAbortFailsFast(t *testing.T) {
 	buf := make([]byte, 4096)
 	reads := []struct {

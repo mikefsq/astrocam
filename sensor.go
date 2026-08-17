@@ -31,10 +31,9 @@ type Sensor struct {
 	// OffsetMin/OffsetMax/OffsetDef bound the sensor offset / black level (ASI Brightness),
 	// surfaced by Camera.OffsetRange. OffsetMax 0 means undeclared.
 	OffsetMin, OffsetMax, OffsetDef int
-	// GainCaps/OffsetCaps, when set, return the vendor-specific advertised range (the dual of the
-	// vendor-dispatched SetGain/SetOffset for a die shared across vendors). Camera.GainRange and
-	// OffsetRange call them with the regmap's VID; nil falls back to the static fields above. A
-	// max of 0 means undeclared.
+	// GainCaps/OffsetCaps, when set, return the vendor-specific advertised range for a die
+	// shared across vendors. Camera.GainRange and OffsetRange call them with the regmap's VID;
+	// nil falls back to the static fields above. A max of 0 means undeclared.
 	GainCaps   func(vid uint16) (min, max int)
 	OffsetCaps func(vid uint16) (min, max, def int)
 	// ExpMinUs/ExpMaxUs bound SetExposure in microseconds, surfaced by Camera.ExposureRange.
@@ -42,19 +41,35 @@ type Sensor struct {
 	ExpMinUs, ExpMaxUs int64
 
 	// Bus selects which vendor request WriteReg/ReadReg use. Zero value is BusSony (WriteSONYREG
-	// 0xB6 / ReadSONYREG 0xB7) for the Sony IMX majority; non-Sony dies (Aptina/ON, Panasonic,
-	// SmartSens) drive the generic camera-register bus (BusCamera, 0xA6). FPGA timing always goes
-	// through WriteFPGAReg regardless.
+	// 0xB6 / ReadSONYREG 0xB7); non-Sony dies (Aptina/ON, Panasonic, SmartSens) use the generic
+	// camera-register bus (BusCamera, 0xA6). FPGA timing always goes through WriteFPGAReg.
 	Bus RegBus
 
+	// ROIStartAlign, when set, reports the sensor-pixel alignment of the readout window start
+	// for a sensor bin factor (the SDK's SetStartPos masks: X to 16 on the IMX455/571, to 4 on
+	// the IMX290/462 and the 174, to 2 on the IMX585; Y to 2, to 4 on the 585, or 4/6 for the
+	// 455/571 bin-2/3 tables). Camera.SetROI
+	// aligns the requested start down by it and reports the aligned start from ROI, so a caller
+	// sees the window it gets. nil = the profile aligns silently.
+	ROIStartAlign func(bin int) (x, y int)
+
+	// HWBins lists the binning factors the profile has a hardware (on-sensor) readout mode for;
+	// SetROI receives one of them, or 1. The Camera uses them only when SetHardwareBin(true) is
+	// set (the SDK's ASI_HARDWARE_BIN); by default every factor is binned on the host from a
+	// bin-1 readout, as the SDK does. A requested factor with no hardware mode of its own is
+	// split into the largest listed divisor on the sensor and the rest on the host (the SDK's
+	// bin 4 on the IMX455/571 = the bin-2 table over 2w×2h, host-binned 2×). nil = no hardware
+	// binning.
+	HWBins []int
+
 	// FX3DMAMarkers marks a sensor whose FX3 readout brackets every frame with fixed DDR
-	// header/footer marker words: the first and last 32-bit DMA word (0x5A7E header / 0x3CF0
-	// footer) are not pixel data. When set, GetDataAfterExp runs the frame through
-	// repairFX3DMAMarkers (which signature-checks, so it cannot corrupt a frame that lacks the
-	// markers). Confirmed: IMX455, IMX462. Leave false on unverified sensors.
+	// header/footer marker words (see repairFX3DMAMarkers). Hardware-confirmed on the IMX455,
+	// IMX462, IMX290 and IMX174; the IMX571 sets it from the 455's behaviour without a camera to
+	// check it on. Leave
+	// false on unverified sensors.
 	FX3DMAMarkers bool
 
-	// Init is the sensor-side init sequence (ZWO/FPGA-facing).
+	// Init is the sensor-side init sequence.
 	Init []RegVal
 
 	// InitFPGA, if set, runs the FPGA-side init after the Init table (FPGAReset /
@@ -67,71 +82,71 @@ type Sensor struct {
 	SetExposure func(rm Regmap, d time.Duration) error
 	// SetOffset programs the sensor offset / black level (ASI Brightness). nil = unsupported.
 	SetOffset func(rm Regmap, offset int) error
-	// GetOffset reads the offset back from the sensor registers, in the same units SetOffset
-	// takes, so Camera.Offset reports what the camera is actually set to rather than what the
-	// driver last wrote. nil = not readable (Camera.Offset falls back to the last value set).
+	// GetOffset reads the offset back from the sensor registers, in SetOffset's units. nil = not
+	// readable (Camera.Offset falls back to the last value set).
 	GetOffset func(rm Regmap) (int, error)
 	// SetROI programs a readout window. (x, y) is the top-left and (w, h) the size, in binned
 	// output pixels; bin is the symmetric binning factor (1 = full resolution). The profile owns
-	// the bin→register translation, converting the binned window to its registers' coordinate
-	// system (e.g. IMX455 start is in sensor pixels = binned·bin). A profile that has only decoded
-	// bin 1 must return an error for bin > 1.
+	// the bin→register translation (e.g. IMX455 start is in sensor pixels = binned·bin). A profile
+	// that has only decoded bin 1 must return an error for bin > 1.
 	SetROI func(rm Regmap, x, y, w, h, bin int) error
 
 	// StreamStop / StreamStart are the sensor-side master stop/start that bracket a capture. The
-	// generic FX3 SendCMD 0xAA/0xA9 and FPGA start/stop are issued by the Camera; the sensor's own
+	// FX3 SendCMD 0xAA/0xA9 and FPGA start/stop are issued by the Camera; the sensor's own
 	// streaming gate (e.g. IMX174 WriteSONYREG 0x200 = 1 then 0) lives here. nil = no sensor gate.
 	StreamStop  func(rm Regmap) error
 	StreamStart func(rm Regmap) error
 
-	// Arm, if set, is the sensor's own stream-arm choreography (the FX3 stop/start bracketing
-	// its master gate, FPGA stop/start, settle), used by StartVideo and the generic snap path
-	// instead of Camera.arm's generic sequence, and by the sensor's own Worker. The DDR
-	// cameras need it: the IMX455 object issues a second FPGAStop after SendCMD(0xA9) before
-	// the master start, without which the readout never delivers a free-run frame. nil = the
-	// generic sequence (SendCMD stop, FPGAStop, StreamStop, SendCMD start, StreamStart, settle,
-	// FPGAStart).
+	// Arm, if set, replaces Camera.arm's generic sequence (SendCMD stop, FPGAStop, StreamStop,
+	// SendCMD start, StreamStart, settle, FPGAStart) for StartVideo, the generic snap path and
+	// the sensor's own Worker. The DDR cameras need it: the IMX455 object issues a second
+	// FPGAStop after SendCMD(0xA9) before the master start, without which the readout never
+	// delivers a free-run frame.
 	Arm func(ctl WorkerCtl) error
 
-	// Worker, if set, runs the full per-sensor capture worker, superseding the generic arm()/
-	// readFrame() snap path. It arms the sensor, host-times the integration where needed, reads
-	// one frame into buf, and halts the readout before returning so the sensor does not free-run
-	// between captures (leaving the 174 streaming backs up the FX3 and crashes its firmware).
-	// exposure is the integration time; it returns the bytes read. nil = use the generic snap path.
+	// Worker, if set, runs the full per-sensor capture, superseding the generic arm()/readFrame()
+	// snap path: it arms the sensor, host-times the integration where needed, reads one frame into
+	// buf, and halts the readout before returning so the sensor does not free-run between captures
+	// (a 174 left streaming backs up the FX3 and crashes its firmware). exposure is the integration
+	// time; it returns the bytes read.
+	//
+	// The halt runs on every return, including an aborted one, and is not generation-guarded, so
+	// a Camera runs one capture at a time: the previous Worker must have returned before the next
+	// is armed, or its halt would stop the new capture's readout.
 	Worker func(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error)
 }
 
 // WorkerCtl gives a per-sensor Worker the generic FX3/FPGA/transport primitives it needs around
-// its own sensor-register choreography. Implemented by *Camera.
+// its own sensor-register choreography. Implemented by *Camera; see the Camera methods of the
+// same names for the fallbacks.
 type WorkerCtl interface {
-	Rm() Regmap                                              // sensor + FPGA register R/W
-	VendorCmd(op FX3Op) error                                // FX3 vendor cmd (FX3StreamStop / FX3StreamStart / FX3Flush), vendor-resolved
-	ResetEndpoint() error                                    // clear the bulk-IN pipe (EP 0x81)
-	ResetDevice() error                                      // USB device reset (last-resort wedge recovery; errors on backends without it)
-	NoteStall()                                              // record one readout stall for the soak diagnostic (Camera.StallCount)
-	Aborted() bool                                           // StopExposure was called: a host-timed integration loop should bail out
+	Rm() Regmap               // sensor + FPGA register R/W
+	VendorCmd(op FX3Op) error // FX3StreamStop/Start/Flush
+	ResetEndpoint() error     // clear the bulk-IN pipe (EP 0x81)
+	ResetDevice() error       // USB device reset (last resort)
+	NoteStall()               // record one readout stall
+	// ReapplyOffset rewrites the last offset set (Camera.SetOffset / the init default) through
+	// the profile's SetOffset, for a die whose black-level register does not survive the
+	// capture cycle (IMX174).
+	ReapplyOffset() error
+	Aborted() bool                                           // StopExposure ran: bail out
 	BulkRead(buf []byte, timeout time.Duration) (int, error) // whole-frame bulk read
-	// BulkReadQuiet is BulkRead whose first `quiet` is a SENSOR-TIMED integration the read
-	// spans (cycle-count / free-run bands): transfers armed up front, but the control-transfer
-	// gate engages only at quiet-elapsed or first data, so the exposure does not blind EP0.
-	// Pass quiet undershooting the real integration (leave ≥500 ms margin); quiet 0 = BulkRead.
-	// Falls back to a fully-gated BulkRead on backends without it.
+	// BulkReadQuiet is BulkRead whose first `quiet` is a sensor-timed integration the read spans
+	// (QuietBulkReader). Pass quiet undershooting the real integration (leave ≥500 ms margin);
+	// quiet 0 = BulkRead.
 	BulkReadQuiet(buf []byte, quiet, timeout time.Duration) (int, error)
 	FrameBytes() int // bytes to read off the wire (W*H*bpp; ×SoftBin² for RAW16 software bin)
-	// StreamFrame reads one frame with the continuous windowed pump: transfers cycle on EP 0x81
-	// until len(buf) bytes are in, gap-free across short packets (what a large IMX455/IMX571 frame
-	// needs and a one-shot BulkRead cannot do). idle bounds a per-completion stall (returns short so
-	// the worker can re-kick the FPGA and continue into buf[n:]); total bounds the whole read.
-	// Falls back to BulkRead on backends without it.
+	// StreamFrame reads one frame with the windowed pump (FrameStreamer). idle bounds a
+	// per-completion stall (returns short; no worker re-kicks and resumes into
+	// buf[n:]); total bounds the whole read.
 	StreamFrame(buf []byte, idle, total time.Duration) (int, error)
-	// StreamFramePrequeued reads one frame with a pre-queued URB batch covering it exactly (the
-	// SDK's async-transfer model): the transfers wait on the pipe before the frame arrives, so
-	// the read overlaps the sensor readout. The free-run STARVIS sensors tear on a USB2 link
-	// with the one-at-a-time StreamFrame. Falls back to StreamFrame where unavailable.
+	// StreamFramePrequeued reads one frame with a pre-queued transfer batch
+	// (PrequeuedFrameStreamer). Only the 462 uses it: the other free-run STARVIS profile, the
+	// 290, reads with BulkRead, whose backends are whole-frame batch engines anyway.
 	StreamFramePrequeued(buf []byte, idle, total time.Duration) (int, error)
 }
 
-// ExposureStatus mirrors ASI_EXPOSURE_STATUS (the int at the camera's +0x254).
+// ExposureStatus mirrors ASI_EXPOSURE_STATUS (the int at the SDK camera object's +0x254).
 type ExposureStatus int
 
 const (

@@ -70,9 +70,9 @@ func TestIMX174Gain(t *testing.T) {
 	}
 }
 
-// TestIMX178Exposure locks the IMX178 exposure path: a BAKED HMAX of 420
-// (line_time = 420·1e6/27000 = 15555 ns), VMAX = height+29, SHS = height+29−lines.
-// A 10 ms exposure stays within one frame; a 2 s exposure trips FPGA trigger mode.
+// TestIMX178Exposure asserts the IMX178 exposure path: baked HMAX 420 (line time = 420·1e6/27000
+// = 15555 ns), VMAX = height+29, SHS = height+29-lines. A 10 ms exposure stays within one frame;
+// a 2 s exposure enters FPGA trigger mode.
 func TestIMX178Exposure(t *testing.T) {
 	f := &fakeRegmap{}
 	if err := IMX178.SetExposure(f, 10*time.Millisecond); err != nil {
@@ -103,9 +103,8 @@ func TestIMX178Exposure(t *testing.T) {
 	}
 }
 
-// TestIMX462Exposure locks the 462 STARVIS exposure path:
-// VMAX = height+18 = 1098 for a sub-frame exposure (SetExp), and ≥ 1 s trips
-// FPGA trigger mode (reg0 bit7).
+// TestIMX462Exposure asserts the 462 STARVIS exposure path: VMAX = height+18 for a sub-frame
+// exposure (SetExp), and >= 1 s enters FPGA trigger mode (reg0 bit7).
 func TestIMX462Exposure(t *testing.T) {
 	f := &fakeRegmap{}
 	if err := IMX462.SetExposure(f, 10*time.Millisecond); err != nil {
@@ -132,9 +131,9 @@ func TestIMX462Exposure(t *testing.T) {
 	}
 }
 
-// TestIMX585Gain locks the STARVIS-2 dual-gain (SetGain): below the threshold gain/3
-// to 0x306c at LCG (0x3030=0); above gain 199 the conversion gain engages (0x3030=1) and the code is
-// (gain-150)/3 — a reset, not a continuation.
+// TestIMX585Gain asserts the STARVIS-2 dual gain (SetGain): at/below gain 199 the code is gain/3
+// to 0x306c at LCG (0x3030=0); above 199 the conversion gain engages (0x3030=1) and the code is
+// (gain-150)/3 (a reset, not a continuation).
 func TestIMX585Gain(t *testing.T) {
 	// gain 199: LCG, code = 199/3 = 66 = 0x42.
 	f := &fakeRegmap{}
@@ -162,15 +161,16 @@ func TestIMX585Gain(t *testing.T) {
 	}
 }
 
-// TestIMX585Exposure locks the STARVIS-2 exposure (baked HMAX 192 → line 9600 ns, VMAX=height+2,
-// SHS=clamp((VMAX-8)-lines,8,VMAX-8) to 0x3050-52) and the ≥1 s trigger mode.
+// TestIMX585Exposure asserts the STARVIS-2 exposure (baked HMAX 192 → line 9600 ns,
+// VMAX=height+2, SHS=clamp((VMAX-8)-lines,8,VMAX-8) to 0x3050-52) and the >= 1 s trigger mode.
 func TestIMX585Exposure(t *testing.T) {
 	f := &fakeRegmap{}
 	if err := IMX585.SetExposure(f, 10*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	sens, fpga := lastVals(f.writes), lastVals(f.fpgaWrites)
-	// lines = 10_000_000/9600 = 1041; VMAX = 2160+2 = 2162 = 0x000872; SHS = (2162-8)-1041 = 1113 = 0x000459.
+	// lines = 10_000_000/9600 = 1041; VMAX = 2160+2 = 2162 = 0x000872; SHS = (2162-8)-1041 =
+	// 1113 = 0x000459.
 	if fpga[0x10] != 0x72 || fpga[0x11] != 0x08 || fpga[0x12] != 0x00 {
 		t.Errorf("VMAX = %02x/%02x/%02x, want 72/08/00 (2162)", fpga[0x10], fpga[0x11], fpga[0x12])
 	}
@@ -192,9 +192,28 @@ func TestIMX585Exposure(t *testing.T) {
 	}
 }
 
-// TestIMX455Exposure2s locks the trigger-mode exposure (SetExp) to the SDK USB capture: a 2 s
-// exposure (>= 1 s) must enter wait+trigger mode (FPGA reg0 bit6 0x40 + bit7 0x80), hold VMAX
-// at one frame = 0x0019c0 = 6592 (not exposure/line_time = 26400), and write SHS = 10. The
+// TestIMX585ExposureFollowsWindow: VMAX is the live readout height + 2, so a sub-frame free-runs
+// at its own frame period rather than the full-frame one. Every other profile derives VMAX from
+// ModeOf(rm).Height (ApplyExposure for the STARVIS dies, the effH block on the IMX455/571); the
+// 585 must too, else a 1080-row window integrates against 2160 rows of frame period.
+func TestIMX585ExposureFollowsWindow(t *testing.T) {
+	rm := &modeRegmap{mode: ReadoutMode{BytesPerPx: 2, Width: 1920, Height: 1080}, regVals: map[uint16]uint16{}}
+	if err := IMX585.SetExposure(rm, 10*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	sens, fpga := lastVals(rm.writes), lastVals(rm.fpgaWrites)
+	// lines = 10_000_000/9600 = 1041; VMAX = 1080+2 = 1082 = 0x00043a; SHS = (1082-8)-1041 = 33.
+	if got := int(fpga[0x10]) | int(fpga[0x11])<<8 | int(fpga[0x12])<<16; got != 1082 {
+		t.Errorf("VMAX = %d, want 1082 (window height 1080 + 2)", got)
+	}
+	if got := int(sens[0x3050]) | int(sens[0x3051])<<8 | int(sens[0x3052])<<16; got != 33 {
+		t.Errorf("SHS = %d, want 33 ((1082-8) - 1041 lines)", got)
+	}
+}
+
+// TestIMX455Exposure2s asserts the trigger-mode exposure (SetExp) against the SDK USB capture: a
+// 2 s exposure (>= 1 s) enters wait+trigger mode (FPGA reg0 bit6 0x40 + bit7 0x80), holds VMAX
+// at one frame = 0x0019c0 = 6592 (not exposure/line_time = 26400), and writes SHS = 10. The
 // integration itself is host-timed.
 func TestIMX455Exposure2s(t *testing.T) {
 	f := &fakeRegmap{}
@@ -226,10 +245,10 @@ func TestIMX455Exposure2s(t *testing.T) {
 	}
 }
 
-// TestIMX571Exposure2s locks the 571's trigger-mode exposure to the IMX455 shape it tracks: a
-// 2 s exposure enters wait+trigger mode (reg0 bit6+bit7), holds VMAX at ONE frame — bin 1:
-// (frameUs+10ms)/line+20 with frameUs = (48+4168)·67.5 µs → 4384 = 0x001120, NOT the exposure
-// line count (~29630) — and writes SHS = 20>>1 = 10 to 0x18/0x19. A 10 ms exposure stays in
+// TestIMX571Exposure2s asserts the 571 trigger-mode exposure (the IMX455 shape): a 2 s exposure
+// enters wait+trigger mode (reg0 bit6+bit7), holds VMAX at one frame (bin 1:
+// (frameUs+10ms)/line+20 with frameUs = (48+4168)·67.5 µs → 4384 = 0x001120, not the exposure
+// line count ~29630) and writes SHS = 20>>1 = 10 to 0x18/0x19. A 10 ms exposure stays in
 // free-run: default VMAX 4216 = 0x001078, SHS = (4216−1−148)>>1 = 2033 = 0x07f1.
 func TestIMX571Exposure2s(t *testing.T) {
 	f := &fakeRegmap{}
@@ -281,11 +300,10 @@ func regsOf(t *testing.T, gain int) map[uint16]uint16 {
 	return m
 }
 
-// TestIMX455GainHCG locks the re-traced IMX455 gain map (SetGain).
-// The decisive facts: reg 0x2d is the conversion-gain MODE byte whose bit0 is HCG enable
-// (0 below gain 100, 1 at/above), and the analog code (0x2e/0x2f, mirror 0x30/0x31) RESETS at
-// that boundary — exp10(gain) below 100, exp10(gain−100) at/above. The old decode wrote the
-// constant 0x2d to reg 0x2d and never reset the code (gain 100 → 0x0af0); both are corrected.
+// TestIMX455GainHCG asserts the IMX455 gain map (SetGain): reg 0x2d is the conversion-gain mode
+// byte whose bit0 is the HCG enable (0 below gain 100, 1 at/above), and the analog code
+// (0x2e/0x2f, mirror 0x30/0x31) resets at that boundary: exp10(gain) below 100, exp10(gain−100)
+// at/above.
 func TestIMX455GainHCG(t *testing.T) {
 	// gain 0: LCG. code = 0, mode bit0 clear, aux 0x4d = 8.
 	g0 := regsOf(t, 0)
@@ -313,7 +331,7 @@ func TestIMX455GainHCG(t *testing.T) {
 		t.Errorf("gain 61: still LCG, want 0x2d bit0 clear, got 0x%02x", g61[0x2d])
 	}
 
-	// gain 100: HCG engages — mode bit0 set AND the analog code resets to 0 (the whole point).
+	// gain 100: HCG engages: mode bit0 set and the analog code resets to 0.
 	g100 := regsOf(t, 100)
 	if g100[0x2d]&1 != 1 {
 		t.Errorf("gain 100: 0x2d = 0x%02x, want HCG bit0 set", g100[0x2d])
@@ -333,7 +351,7 @@ func TestIMX455GainHCG(t *testing.T) {
 		t.Errorf("gain 160: code = 0x%02x%02x, want 0x07fa", g160[0x2f], g160[0x2e])
 	}
 
-	// gain 280 (band D): the high-config switch — 0x3a4→0x23, 0x3a5/0x3a6→0x2d.
+	// gain 280 (band D): the high-config switch: 0x3a4→0x23, 0x3a5/0x3a6→0x2d.
 	g280 := regsOf(t, 280)
 	if g280[0x3a4] != 0x23 || g280[0x3a5] != 0x2d || g280[0x3a6] != 0x2d {
 		t.Errorf("gain 280: cfg = 0x3a4=0x%02x 0x3a5=0x%02x 0x3a6=0x%02x, want 0x23/0x2d/0x2d",
@@ -351,14 +369,13 @@ func TestIMX455GainHCG(t *testing.T) {
 	}
 }
 
-// TestIMX455ROISubFrame locks the ROI/binning disentanglement: a sub-frame window — even a
-// narrow one that the old width-inference (imx455Bin) would have misread as 2× binning —
-// must select the BIN-1 readout table and program the window at full resolution, not a
-// binned mode. Reg 0x0001 discriminates the table (0x00 = bin-1 full16; 0x85 = bin-2).
+// TestIMX455ROISubFrame asserts that a sub-frame window at bin 1 (including a half-width one)
+// selects the bin-1 readout table and programs the window at full resolution, not a binned
+// mode. Reg 0x0001 discriminates the table (0x00 = bin-1 full16; 0x85 = bin-2).
 func TestIMX455ROISubFrame(t *testing.T) {
 	f := &fakeRegmap{}
-	// Half-width crop (4788 of 9576) at bin 1: the old width inference would have picked the
-	// bin-2 table; an explicit bin 1 must stay the full-res table. x=64 (16-aligned), y=128.
+	// Half-width crop (4788 of 9576) at bin 1 stays on the full-res table. x=64 (16-aligned),
+	// y=128.
 	if err := IMX455.SetROI(f, 64, 128, 4788, 3194, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -378,10 +395,9 @@ func TestIMX455ROISubFrame(t *testing.T) {
 	}
 }
 
-// TestIMX455Bin2 locks the bin-2 readout geometry: SetROI at bin 2 applies the bin-2
-// mode table (reg 0x0001 = 0x85, vs 0x00 full-res), writes the binned output dims to the FPGA
-// width/height, and programs HMAX = the bin-2 timing base VBin2 (625). (InitSensorMode /
-// Cam_SetResolution.)
+// TestIMX455Bin2 asserts the bin-2 readout geometry (InitSensorMode / Cam_SetResolution): SetROI
+// at bin 2 applies the bin-2 mode table (reg 0x0001 = 0x85, vs 0x00 full-res), writes the binned
+// output dims to the FPGA width/height, and programs HMAX = the bin-2 timing base VBin2 (625).
 func TestIMX455Bin2(t *testing.T) {
 	f := &fakeRegmap{}
 	// Full-frame bin 2: output = 9576/2 × 6388/2 = 4788 × 3194, start (0,0).
@@ -402,8 +418,8 @@ func TestIMX455Bin2(t *testing.T) {
 	}
 }
 
-// TestSensorOffset locks the offset / black-level (ASI Brightness, SetBrightness): the
-// 455 writes offset·10 16-bit LE to sensor 0x40/0x41 mirrored 0x42/0x43; the 290 writes the raw
+// TestSensorOffset asserts the offset / black level (ASI Brightness, SetBrightness): the 455
+// writes offset·10 16-bit LE to sensor 0x40/0x41 mirrored 0x42/0x43; the 290 writes the raw
 // value to 0x300a/0x300b.
 func TestSensorOffset(t *testing.T) {
 	f := &fakeRegmap{}
@@ -425,9 +441,9 @@ func TestSensorOffset(t *testing.T) {
 	}
 }
 
-// TestIMX290Binning locks the IMX290 2× binning (Cam_SetResolution):
-// mode byte 0x3006 = 0x22; the sensor window regs (0x3042/3 width, 0x303e/f height)
-// take the PHYSICAL region = output·bin; the FPGA geometry takes the OUTPUT dims. bin 3 rejected.
+// TestIMX290Binning asserts the IMX290 2× binning (Cam_SetResolution): mode byte 0x3006 = 0x22;
+// the sensor window regs (0x3042/3 width, 0x303e/f height) take the physical region =
+// output·bin; the FPGA geometry takes the output dims. bin 3 is rejected.
 func TestIMX290Binning(t *testing.T) {
 	if err := IMX290.SetROI(&fakeRegmap{}, 0, 0, 100, 100, 3); err == nil {
 		t.Error("bin 3 accepted, want rejected (290 does 1×/2× only)")
@@ -455,9 +471,8 @@ func TestIMX290Binning(t *testing.T) {
 	}
 }
 
-// TestIMX571Binning locks the IMX571 binning + the W/H-swap fix (Cam_SetResolution /
-// InitSensorMode). bin 1 writes HEIGHT to 0x0a and the
-// ×4-aligned WIDTH+0x18 to 0x1dd (these were swapped before); bin 2 applies the bin-2 mode
+// TestIMX571Binning asserts the IMX571 binning (Cam_SetResolution / InitSensorMode): bin 1
+// writes HEIGHT to 0x0a and the ×4-aligned WIDTH+0x18 to 0x1dd; bin 2 applies the bin-2 mode
 // table (reg 0x0001=0x05), sets window-mode 0x1d8=0, and programs the binned FPGA geometry.
 func TestIMX571Binning(t *testing.T) {
 	// bin 1 full frame: HEIGHT(0x0a)=4168=0x1048; WIDTH(0x1dd)=(6224+0x18)=6248=0x1868 (&0xfc).
@@ -496,6 +511,23 @@ func TestIMX571Binning(t *testing.T) {
 	if fp2[0x04] != 0x28 || fp2[0x05] != 0x0c {
 		t.Errorf("bin2: FPGA width = 0x%02x%02x, want 0x0c28 (3112)", fp2[0x05], fp2[0x04])
 	}
+	// HMAX 0x13/0x14 = the mode's V (bin 1: imx571VBin1, bin 2: imx571VBin2), the DDR-branch
+	// SetFPSPerc value SetExposure's line time is derived from.
+	fp1 := lastVals(f1.fpgaWrites)
+	if got := int(fp1[0x13]) | int(fp1[0x14])<<8; got != imx571VBin1 {
+		t.Errorf("bin1: HMAX = %d, want V %d", got, imx571VBin1)
+	}
+	if got := int(fp2[0x13]) | int(fp2[0x14])<<8; got != imx571VBin2 {
+		t.Errorf("bin2: HMAX = %d, want V %d", got, imx571VBin2)
+	}
+	// ADC_BIT (FPGA 0x0a bit0) follows the table: 1 for the 16-bit bin-1 table, 0 for the 12-bit
+	// bin-2 table; bit4 = RAW16 output on the fake regmap's default mode.
+	if fp1[0x0a]&0x11 != 0x11 {
+		t.Errorf("bin1: FPGA 0x0a = 0x%02x, want bit0 (ADC 16-bit) and bit4 (RAW16) set", fp1[0x0a])
+	}
+	if fp2[0x0a]&0x11 != 0x10 {
+		t.Errorf("bin2: FPGA 0x0a = 0x%02x, want bit0 clear (12-bit table), bit4 set", fp2[0x0a])
+	}
 }
 
 // regsOf571 runs IMX571.SetGain and returns the last value written per register.
@@ -512,10 +544,10 @@ func regsOf571(t *testing.T, gain int) map[uint16]uint16 {
 	return m
 }
 
-// TestIMX571GainHCG locks the re-traced IMX571 gain map (SetGain).
-// The IMX571 HCG switch is the clean reg 0x2f = 0 (LCG, gain < 100) / 1 (HCG, gain ≥ 100),
-// the code resets at that boundary, gain clamps DOWN to −25 (0x67f = 0x11 in that segment),
-// and the top band (gain > 460) carries a byte-wrapped coarse stage in reg 0x40 bits[4:7].
+// TestIMX571GainHCG asserts the IMX571 gain map (SetGain): the HCG switch is reg 0x2f = 0 (LCG,
+// gain < 100) / 1 (HCG, gain >= 100), the code resets at that boundary, gain clamps down to −25
+// (0x67f = 0x11 in that segment), and the top band (gain > 460) carries a byte-wrapped coarse
+// stage in reg 0x40 bits[4:7].
 func TestIMX571GainHCG(t *testing.T) {
 	// gain 0: LCG, conv 0x2f = 0, code 0, setup 0x67f = 0, no high stage.
 	g0 := regsOf571(t, 0)
@@ -537,7 +569,7 @@ func TestIMX571GainHCG(t *testing.T) {
 		t.Errorf("gain -25: 0x2f=0x%02x code=0x%02x%02x, want conv 0 / code 0", gNeg[0x2f], gNeg[0x31], gNeg[0x30])
 	}
 
-	// gain 100: HCG engages — 0x2f = 1 and the code resets to 0.
+	// gain 100: HCG engages: 0x2f = 1 and the code resets to 0.
 	g100 := regsOf571(t, 100)
 	if g100[0x2f] != 1 {
 		t.Errorf("gain 100: 0x2f = 0x%02x, want 1 (HCG)", g100[0x2f])
@@ -554,8 +586,8 @@ func TestIMX571GainHCG(t *testing.T) {
 		t.Errorf("gain 160: code = 0x%02x%02x, want 0x07fa", g160[0x31], g160[0x30])
 	}
 
-	// gain 461 (top band): the byte-wrapped stage is 1 → 0x40 = 0x10, NOT the over-counted
-	// stage-9/0x90 the missing &0xff produced. conv 0x2f stays 1.
+	// gain 461 (top band): the byte-wrapped stage is 1 → 0x40 = 0x10 (not an over-counted 0x90).
+	// conv 0x2f stays 1.
 	g461 := regsOf571(t, 461)
 	if g461[0x40] != 0x10 {
 		t.Errorf("gain 461: 0x40 = 0x%02x, want 0x10 (stage 1, byte-wrapped)", g461[0x40])
@@ -563,16 +595,16 @@ func TestIMX571GainHCG(t *testing.T) {
 	if g461[0x2f] != 1 {
 		t.Errorf("gain 461: 0x2f = 0x%02x, want 1", g461[0x2f])
 	}
-	// And the re-based code must be a sane in-range value (the bug drove it negative/garbage).
+	// The re-based code must be in range.
 	code461 := g461[0x30] | g461[0x31]<<8
 	if code461 == 0 || code461 > 4095 {
 		t.Errorf("gain 461: code = 0x%04x, want a sane 1..4095 (bug drove it out of range)", code461)
 	}
 }
 
-// TestProfileRanges confirms each validated profile carries its gain/exposure
-// bounds, which Camera.GainRange/ExposureRange surface for the Alpaca caps. The values are
-// the SetGain/SetExp clamps (imx455GainMax etc.), not invented.
+// TestProfileRanges confirms each validated profile carries its gain/exposure bounds, which
+// Camera.GainRange/ExposureRange surface for the Alpaca caps. The values are the SetGain/SetExp
+// clamps (imx455GainMax etc.).
 func TestProfileRanges(t *testing.T) {
 	for _, tc := range []struct {
 		s       *Sensor
@@ -592,9 +624,8 @@ func TestProfileRanges(t *testing.T) {
 	}
 }
 
-// TestRegistered confirms init() wired representative PIDs to the right sensor.
-// 0x260A is the ASI2600 block (IMX571); 0x620A is ASI6200 (IMX455), which must
-// NOT resolve to IMX571 — that pairing was a prior bug.
+// TestRegistered confirms init() wired representative PIDs to the right sensor. 0x260A is the
+// ASI2600 block (IMX571); 0x620A is ASI6200 (IMX455) and must not resolve to IMX571.
 func TestRegistered(t *testing.T) {
 	for pid, sensor := range map[uint16]string{
 		0x1749: "IMX174", // ASI174
@@ -610,10 +641,9 @@ func TestRegistered(t *testing.T) {
 	}
 }
 
-// TestVendorOffsetDispatch verifies the single shared IMX455/IMX571 profile selects the
-// vendor offset encoding from the regmap's VID: PlayerOne (0xA0A0) → offset·8, ZWO (0x03C3)
-// → offset·10, same [lo,hi,lo,hi] mirror block. An unrecognized vendor is an error (the
-// dispatch is vendor-agnostic — no implicit default).
+// TestVendorOffsetDispatch verifies the shared IMX455/IMX571 profiles select the vendor offset
+// encoding from the regmap's VID: PlayerOne (0xA0A0) → offset·8, ZWO (0x03C3) → offset·10, same
+// [lo,hi,lo,hi] mirror block. An unrecognized vendor is an error (no implicit default).
 func TestVendorOffsetDispatch(t *testing.T) {
 	eq := func(t *testing.T, tag string, got, want []RegVal) {
 		t.Helper()
@@ -676,7 +706,7 @@ func TestVendorGainDispatch(t *testing.T) {
 	}
 }
 
-// TestVendorCaps locks the advertised gain/offset ranges per vendor (the dual of the
+// TestVendorCaps asserts the advertised gain/offset ranges per vendor (the dual of the
 // dispatched SetGain/SetOffset). PlayerOne uses a unified 0..550 gain / 0..2000 offset scale
 // across both dies (CamAttributesInit + the SetGain/SetOffset clamp).
 func TestVendorCaps(t *testing.T) {
@@ -710,9 +740,9 @@ func TestVendorCaps(t *testing.T) {
 	}
 }
 
-// TestIMX571GainPOA locks PlayerOne's IMX571 gain bands (CamGainSet, M=125):
-// the per-band 0x2f conv-gain mode and 0x67f setup, the analog-code mirror (0x30/0x31 →
-// 0x32/0x33), and the code reset at each conversion-gain boundary. The 571 has no 0x3a4/5/6.
+// TestIMX571GainPOA asserts PlayerOne's IMX571 gain bands (CamGainSet, M=125): the per-band 0x2f
+// conv-gain mode and 0x67f setup, the analog-code mirror (0x30/0x31 → 0x32/0x33), and the code
+// reset at each conversion-gain boundary. The 571 has no 0x3a4/5/6.
 func TestIMX571GainPOA(t *testing.T) {
 	for _, c := range []struct {
 		gain        int
@@ -754,9 +784,9 @@ func TestIMX571GainPOA(t *testing.T) {
 	}
 }
 
-// TestIMX455GainPOA locks PlayerOne's IMX455 gain bands (CamGainSet, M=125):
-// the per-band 0x2d conv-gain mode, 0x67f setup, and 0x3a4/5/6 config, plus the analog-code
-// mirror (0x2e/0x2f → 0x30/0x31) and its reset to 0 at each conversion-gain boundary.
+// TestIMX455GainPOA asserts PlayerOne's IMX455 gain bands (CamGainSet, M=125): the per-band 0x2d
+// conv-gain mode, 0x67f setup, and 0x3a4/5/6 config, plus the analog-code mirror (0x2e/0x2f →
+// 0x30/0x31) and its reset to 0 at each conversion-gain boundary.
 func TestIMX455GainPOA(t *testing.T) {
 	for _, c := range []struct {
 		gain                    int
@@ -802,9 +832,9 @@ func TestIMX455GainPOA(t *testing.T) {
 	}
 }
 
-// TestIMX462Gain locks the 462's STARVIS gain map (SetGain): the conv-gain
-// HCG bit (0x3009 bit 0x10) engages ABOVE gain 80 — the 462's threshold, vs the 290's 60 — and the
-// analog code lands in 0x3014, the group latched by 0x3001.
+// TestIMX462Gain asserts the 462 STARVIS gain map (SetGain): the HCG bit (0x3009 bit 0x10)
+// engages above gain 80 (the 290's threshold is 60) and the analog code lands in 0x3014, the
+// group latched by 0x3001.
 func TestIMX462Gain(t *testing.T) {
 	f := &fakeRegmap{} // gain 80 → LCG (HCG bit clear)
 	if err := IMX462.SetGain(f, 80); err != nil {
@@ -826,8 +856,8 @@ func TestIMX462Gain(t *testing.T) {
 	}
 }
 
-// TestIMX178Gain locks the 178's gain map (SetGain): conv-gain 0x301b
-// (0 LCG / 0x1e above gain 30) and the RAW 0.1 dB value written 16-bit LE to 0x301f/0x3020.
+// TestIMX178Gain asserts the 178 gain map (SetGain): conv-gain 0x301b (0 LCG / 0x1e above gain
+// 30) and the raw 0.1 dB value written 16-bit LE to 0x301f/0x3020.
 func TestIMX178Gain(t *testing.T) {
 	f := &fakeRegmap{} // gain 30 → LCG, code 30
 	if err := IMX178.SetGain(f, 30); err != nil {
@@ -860,45 +890,76 @@ func (m *modeRegmap) ReadReg(reg uint16) (uint16, error) {
 	return m.regVals[reg], nil
 }
 
-// clockSelCase runs one profile op and asserts the FINAL 0x3009 value — the clock/FRSEL
-// select the tail SetCMOSClk write must leave: FRSEL 0x01 for the 12-bit
-// normal clock, 0x00 for 10-bit high-speed, preserving the conversion-gain bit 0x10.
-func clockSelCase(t *testing.T, name string, highSpeed bool, hcgIn uint16, want uint16, op func(rm Regmap) error) {
+// clockSelCase runs one profile op and asserts the final 0x3009 value, the clock/FRSEL select
+// the tail SetCMOSClk write must leave: FRSEL 0x01 for the 12-bit normal clock, 0x00 for 10-bit
+// high-speed (the flag with RAW8 output only), preserving the conversion-gain bit 0x10. It
+// returns the regmap so a caller can assert the format block too.
+func clockSelCase(t *testing.T, name string, highSpeed bool, bpp int, hcgIn uint16, want uint16, op func(rm Regmap) error) *modeRegmap {
 	t.Helper()
-	rm := &modeRegmap{mode: ReadoutMode{HighSpeed: highSpeed, BytesPerPx: 2}, regVals: map[uint16]uint16{0x3009: hcgIn}}
+	rm := &modeRegmap{mode: ReadoutMode{HighSpeed: highSpeed, BytesPerPx: bpp}, regVals: map[uint16]uint16{0x3009: hcgIn}}
 	if err := op(rm); err != nil {
 		t.Fatalf("%s: %v", name, err)
 	}
 	if got := lastVals(rm.writes)[0x3009]; got != want {
 		t.Errorf("%s: final 0x3009 = 0x%02x, want 0x%02x", name, got, want)
 	}
+	return rm
 }
 
-// TestIMX462ClockSelect: SetExposure and SetROI end with the object's SetCMOSClk write —
-// normal restores FRSEL 1 (closing the one-way high-speed clear), high-speed runs FRSEL 0,
-// and the HCG bit rides along untouched.
+// assertOutputFormat checks the SetOutput16Bits block a SetROI left: the 10-bit reformat
+// (0x3046=0xf0, 0x3005=0, 0x3129=0x1d, 0x317c=0x12, FPGA 0x0a bit0 = 0) for high-speed, else the
+// 12-bit block (0x3046=0xf1, 0x3005=1, 0x3129=0, 0x317c=0, 0x31ec=0x0e, bit0 = 1).
+func assertOutputFormat(t *testing.T, name string, rm *modeRegmap, tenBit bool) {
+	t.Helper()
+	v := lastVals(rm.writes)
+	want := map[uint16]uint16{0x3046: 0xf1, 0x3005: 0x01, 0x3129: 0x00, 0x317c: 0x00, 0x31ec: 0x0e}
+	if tenBit {
+		want = map[uint16]uint16{0x3046: 0xf0, 0x3005: 0x00, 0x3129: 0x1d, 0x317c: 0x12}
+	}
+	for reg, w := range want {
+		if v[reg] != w {
+			t.Errorf("%s: reg 0x%04x = 0x%02x, want 0x%02x", name, reg, v[reg], w)
+		}
+	}
+	adc := uint16(1)
+	if tenBit {
+		adc = 0
+	}
+	if got := lastVals(rm.fpgaWrites)[0x0a] & 0x01; got != adc {
+		t.Errorf("%s: FPGA 0x0a ADC_BIT = %d, want %d", name, got, adc)
+	}
+}
+
+// TestIMX462ClockSelect: SetExposure and SetROI end with the SetCMOSClk write: normal restores
+// FRSEL 1, high-speed (RAW8) runs FRSEL 0 with the 10-bit format, high-speed with RAW16 stays on
+// the 12-bit clock and format, and the HCG bit is preserved.
 func TestIMX462ClockSelect(t *testing.T) {
 	exp := func(rm Regmap) error { return imx462SetExposure(rm, 10*time.Millisecond) }
 	roi := func(rm Regmap) error { return imx462SetROI(rm, 0, 0, 1936, 1096, 1) }
-	clockSelCase(t, "SetExposure normal", false, 0x00, 0x01, exp)
-	clockSelCase(t, "SetExposure normal+HCG", false, 0x10, 0x11, exp)
-	clockSelCase(t, "SetExposure highspeed+HCG", true, 0x10, 0x10, exp)
-	clockSelCase(t, "SetROI normal", false, 0x00, 0x01, roi)
-	clockSelCase(t, "SetROI highspeed", true, 0x00, 0x00, roi)
+	clockSelCase(t, "SetExposure normal", false, 2, 0x00, 0x01, exp)
+	clockSelCase(t, "SetExposure normal+HCG", false, 2, 0x10, 0x11, exp)
+	clockSelCase(t, "SetExposure highspeed+HCG", true, 1, 0x10, 0x10, exp)
+	clockSelCase(t, "SetExposure highspeed RAW16", true, 2, 0x00, 0x01, exp)
+	assertOutputFormat(t, "SetROI normal", clockSelCase(t, "SetROI normal", false, 2, 0x00, 0x01, roi), false)
+	assertOutputFormat(t, "SetROI highspeed", clockSelCase(t, "SetROI highspeed", true, 1, 0x00, 0x00, roi), true)
+	assertOutputFormat(t, "SetROI highspeed RAW16", clockSelCase(t, "SetROI highspeed RAW16", true, 2, 0x00, 0x01, roi), false)
 }
 
-// TestIMX290ClockSelect: same contract from the 290's own object (0003_CCameraS290MM_Mini.o).
+// TestIMX290ClockSelect: the same contract for the 290 (0003_CCameraS290MM_Mini.o), including
+// the SetOutput16Bits block ported from the 462.
 func TestIMX290ClockSelect(t *testing.T) {
 	exp := func(rm Regmap) error { return imx290SetExposure(rm, 10*time.Millisecond) }
 	roi := func(rm Regmap) error { return imx290SetROI(rm, 0, 0, 1936, 1096, 1) }
-	clockSelCase(t, "SetExposure normal", false, 0x00, 0x01, exp)
-	clockSelCase(t, "SetExposure normal+HCG", false, 0x10, 0x11, exp)
-	clockSelCase(t, "SetExposure highspeed+HCG", true, 0x10, 0x10, exp)
-	clockSelCase(t, "SetROI normal", false, 0x00, 0x01, roi)
-	clockSelCase(t, "SetROI highspeed", true, 0x00, 0x00, roi)
+	clockSelCase(t, "SetExposure normal", false, 2, 0x00, 0x01, exp)
+	clockSelCase(t, "SetExposure normal+HCG", false, 2, 0x10, 0x11, exp)
+	clockSelCase(t, "SetExposure highspeed+HCG", true, 1, 0x10, 0x10, exp)
+	clockSelCase(t, "SetExposure highspeed RAW16", true, 2, 0x00, 0x01, exp)
+	assertOutputFormat(t, "SetROI normal", clockSelCase(t, "SetROI normal", false, 2, 0x00, 0x01, roi), false)
+	assertOutputFormat(t, "SetROI highspeed", clockSelCase(t, "SetROI highspeed", true, 1, 0x00, 0x00, roi), true)
+	assertOutputFormat(t, "SetROI highspeed RAW16", clockSelCase(t, "SetROI highspeed RAW16", true, 2, 0x00, 0x01, roi), false)
 }
 
-// TestIMX455ADCBitFollowsTable locks SetOutput16Bits: FPGA reg 0xa bit0 (ADC_BIT) is 1 for the
+// TestIMX455ADCBitFollowsTable asserts SetOutput16Bits: FPGA reg 0xa bit0 (ADC_BIT) is 1 for the
 // 16-bit readout table and 0 for the 12-bit tables (high-speed at bin 1, hardware bin 2/4), with
 // bit4 = RAW16. Wire-checked on the ASI6200MC: ADC_BIT left at 1 on a 12-bit table delivers
 // unreadable frames; the SDK's high-speed RAW8 clears it.
@@ -956,6 +1017,109 @@ func TestGetOffsetRoundTrip(t *testing.T) {
 			if got != off {
 				t.Errorf("%s/%#x: SetOffset(%d) reads back %d", tc.s.Name, tc.vid, off, got)
 			}
+		}
+	}
+	// The IMX455's ZWO binned scale (offset·100/16, floored on write) must round-trip every
+	// offset in the range through the rounding read-back.
+	for off := 0; off <= 200; off++ {
+		rm := &modeRegmap{fakeRegmap: fakeRegmap{vid: ZWO.VID}, mode: ReadoutMode{BytesPerPx: 1, Bin: 2}, regVals: map[uint16]uint16{}}
+		if err := IMX455.SetOffset(rm, off); err != nil {
+			t.Fatal(err)
+		}
+		for r, v := range lastVals(rm.writes) {
+			rm.regVals[r] = v
+		}
+		if got, err := IMX455.GetOffset(rm); err != nil || got != off {
+			t.Errorf("IMX455 binned: SetOffset(%d) reads back %d (%v)", off, got, err)
+		}
+	}
+}
+
+// TestIMX174ExposureFollowsWindow: SetExposure takes its HMAX (line time) and default VMAX from
+// the live window, not the full frame, so a sub-frame ROI keeps SetROI's HMAX and frames at
+// height+0x26 (SetExp on the SDK: HMAX 780 and VMAX 0x206 for a 640×480 ROI at 1 ms).
+func TestIMX174ExposureFollowsWindow(t *testing.T) {
+	rm := &modeRegmap{mode: ReadoutMode{USB3: false, BytesPerPx: 2, FPSPercent: 100, Width: 640, Height: 480}, regVals: map[uint16]uint16{}}
+	if err := imx174SetExposure(rm, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	fp := lastVals(rm.fpgaWrites)
+	wantHMAX := imx174HMAX(rm, 640, 480)
+	if got := fp[imx174FPGAHMAXL] | fp[imx174FPGAHMAXH]<<8; got != wantHMAX {
+		t.Errorf("ROI HMAX = %d, want %d (the window's, as SetROI programs)", got, wantHMAX)
+	}
+	if fullHMAX := imx174HMAX(rm, imx174FullWidth, imx174FullHeight); wantHMAX == fullHMAX {
+		t.Fatalf("test premise: window HMAX %d equals full-frame HMAX; pick a smaller window", wantHMAX)
+	}
+	// FPGA VMAX 0x10/0x11 = 480 + 0x26 = 518 = 0x0206 at 1 ms.
+	if got := int(fp[0x10]) | int(fp[0x11])<<8 | int(fp[0x12])<<16; got != 480+0x26 {
+		t.Errorf("ROI default VMAX = %d, want %d (height + 0x26)", got, 480+0x26)
+	}
+}
+
+// TestROIStartAlignIsEven: every profile aligns the readout window start to an even sensor pixel
+// on both axes, for every bin it supports. The Bayer phase of a colour frame is the phase at the
+// window origin, so this invariant is what lets the FITS writer state XBAYROFF/YBAYROFF as 0
+// unconditionally. A profile that aligned to an odd start would shift the mosaic against the
+// declared BAYERPAT.
+func TestROIStartAlignIsEven(t *testing.T) {
+	for _, p := range []struct {
+		name string
+		s    *Sensor
+	}{
+		{"IMX174", &IMX174}, {"IMX178", &IMX178}, {"IMX290", &IMX290}, {"IMX462", &IMX462},
+		{"IMX455", &IMX455}, {"IMX571", &IMX571}, {"IMX585", &IMX585},
+	} {
+		if p.s.ROIStartAlign == nil {
+			t.Errorf("%s: no ROIStartAlign; an odd window start would shift the Bayer phase", p.name)
+			continue
+		}
+		for _, bin := range append([]int{1}, p.s.HWBins...) {
+			ax, ay := p.s.ROIStartAlign(bin)
+			if ax <= 0 || ax%2 != 0 {
+				t.Errorf("%s bin %d: X align %d is not a positive even step", p.name, bin, ax)
+			}
+			if ay <= 0 || ay%2 != 0 {
+				t.Errorf("%s bin %d: Y align %d is not a positive even step", p.name, bin, ay)
+			}
+		}
+	}
+}
+
+// TestIMX571SHSHalveFollowsSensorBin: the SHS written to the sensor is halved on the normal path
+// and left whole when the sensor bins 2×. The IMX455 is the hardware-verified member of this DDR
+// pair and branches around the halve at bin 2 exactly this way (halving at bin 1 and bin 3), and
+// the IMX571's own decode records the same shape: "the high-speed/hardware-bin branch writes the
+// full SHS". The IMX571 is the smaller sensor of an equivalent design, so it follows the IMX455;
+// halving where the hardware does not would under-expose a hardware-binned frame by half.
+//
+// 100 ms, per bin (line time = mode V·1e6/20000, VMAX = vblank + 4168/bin, and an exposure past
+// one frame extends VMAX to lines+20 with SHS 20):
+//
+//	bin 1: line 67500 ns, VMAX 4216, SHS 2734 -> halved 1367
+//	bin 2: line 24500 ns, VMAX 4101, SHS   20 -> whole   20
+//	bin 3: line 12500 ns, VMAX 8020, SHS   20 -> halved  10
+func TestIMX571SHSHalveFollowsSensorBin(t *testing.T) {
+	for _, tc := range []struct {
+		bin       int
+		vmax, shs uint32
+	}{
+		{1, 4216, 1367},
+		{2, 4101, 20}, // the sensor bins: written whole
+		{3, 8020, 10},
+	} {
+		rm := &modeRegmap{mode: ReadoutMode{USB3: true, BytesPerPx: 2, Bin: tc.bin, FPSPercent: 100}, regVals: map[uint16]uint16{}}
+		if err := IMX571.SetExposure(rm, 100*time.Millisecond); err != nil {
+			t.Fatalf("bin %d: %v", tc.bin, err)
+		}
+		fp, sens := lastVals(rm.fpgaWrites), lastVals(rm.writes)
+		vmax := uint32(fp[0x10]) | uint32(fp[0x11])<<8 | uint32(fp[0x12])<<16
+		shs := uint32(sens[0x18]) | uint32(sens[0x19])<<8
+		if vmax != tc.vmax {
+			t.Errorf("bin %d: VMAX = %d, want %d", tc.bin, vmax, tc.vmax)
+		}
+		if shs != tc.shs {
+			t.Errorf("bin %d: SHS = %d, want %d", tc.bin, shs, tc.shs)
 		}
 	}
 }

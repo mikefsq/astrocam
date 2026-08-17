@@ -11,9 +11,8 @@ type Model struct {
 	ST4    bool // has an ST4 guide port (CanPulseGuide)
 }
 
-// registry maps a USB VID:PID to its camera model. Sensor profiles live in the sensors
-// package and register themselves from its init() (caller does
-// `import _ "github.com/mikefsq/astrocam/sensors"`), so the core never imports sensor data.
+// registry maps a USB VID:PID to its camera model. Sensor profiles live in the sensors package
+// and register themselves from its init() (`import _ "github.com/mikefsq/astrocam/sensors"`).
 var registry = map[DeviceID]Model{}
 
 // Register adds a model under its USB vendor:product id (called by the sensors package).

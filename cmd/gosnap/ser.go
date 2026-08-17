@@ -4,14 +4,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 )
 
-// SER v3 writer: one fixed-size header, then every frame's raw pixels back-to-back, then
-// an optional per-frame timestamp trailer. Read by SER Player, PIPP, AutoStakkert!,
-// FireCapture.
+// SER v3 writer: one fixed-size header, every frame's raw pixels back-to-back, then a
+// per-frame timestamp trailer.
 //
-// Layout (all integers little-endian; total header = 178 bytes):
+// Header layout (all integers little-endian; 178 bytes total):
 //
 //	[ 0:14]  FileID            "LUCAM-RECORDER"
 //	[14:18]  LuID              int32  (0)
@@ -37,35 +37,45 @@ const (
 	serBayerBGGR = 11
 )
 
-// serLittleEndian: SER v3 LittleEndian header field. The spec TEXT says 1 = little-endian,
-// but the de-facto convention (FireCapture, SharpCap, and the readers tuned to them) is
-// INVERTED: 0 with little-endian data. The camera delivers RAW16 little-endian, written
-// verbatim, so follow the ecosystem — a spec-literal 1 makes strict readers byte-swap.
-// (8-bit data is byte-order-agnostic.)
+// serLittleEndian is the LittleEndian header field. The spec text says 1 = little-endian,
+// but the de-facto convention (FireCapture, SharpCap, and the readers tuned to them) is 0
+// with little-endian data; a spec-literal 1 makes those readers byte-swap. RAW16 frames
+// are written little-endian verbatim, so the field is 0.
 const serLittleEndian = 0
 
-// netEpochTicks is the number of 100-ns ticks from the .NET epoch (0001-01-01) to the
-// Unix epoch (1970-01-01) — SER timestamps are .NET DateTime ticks.
+// netEpochTicks is the number of 100 ns ticks from the .NET epoch (0001-01-01) to the Unix
+// epoch (1970-01-01); SER timestamps are .NET DateTime ticks.
 const netEpochTicks = 621355968000000000
 
 func netTicks(t time.Time) int64 { return netEpochTicks + t.UnixNano()/100 }
 
-// netTicksLocal renders t's LOCAL wall-clock as .NET ticks — the SER DateTime field is
-// local time (DateTimeUTC is the UTC one). UnixNano is zone-independent (netTicks(t) ==
-// netTicks(t.UTC())), so the local field needs the zone offset added explicitly.
+// netTicksLocal renders t's local wall-clock as .NET ticks for the DateTime field
+// (DateTimeUTC is the UTC one). UnixNano is zone-independent, so the zone offset is added.
 func netTicksLocal(t time.Time) int64 {
 	_, off := t.Zone()
-	return netTicks(t) + int64(off)*10_000_000 // offset seconds → 100 ns ticks
+	return netTicks(t) + int64(off)*10_000_000 // offset seconds to 100 ns ticks
 }
 
 type serWriter struct {
+	// mu serializes writeFrame against close: the burst writes frames on its own goroutine while
+	// an interrupt closes the file from the signal handler, and the trailer must not be built
+	// from a half-updated stamp slice. It also makes count safe to read after a burst.
+	mu         sync.Mutex
 	f          *os.File
 	frameBytes int
+	closed     bool
 	count      int
 	stamps     []int64
 }
 
-// serColorID maps the gosnap color flag + Bayer pattern to a SER ColorID.
+// frameCount reports how many frames have been written.
+func (s *serWriter) frameCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
+}
+
+// serColorID maps the color flag and Bayer pattern to a SER ColorID.
 func serColorID(color bool, bayer string) int32 {
 	if !color {
 		return serMono
@@ -84,8 +94,8 @@ func serColorID(color bool, bayer string) int32 {
 	}
 }
 
-// newSER creates a SER file and writes its header with a placeholder frame count (patched
-// on Close). frameBytes is the exact per-frame size (w*h*bpp); writeFrame enforces it.
+// newSER creates a SER file and writes its header with a placeholder FrameCount (patched on
+// close). writeFrame enforces the per-frame size w*h*bpp.
 func newSER(path string, w, h, bpp int, colorID int32, instrument string) (*serWriter, error) {
 	f, err := os.Create(path)
 	if err != nil {
@@ -100,7 +110,7 @@ func newSER(path string, w, h, bpp int, colorID int32, instrument string) (*serW
 	le.PutUint32(hdr[26:], uint32(w))
 	le.PutUint32(hdr[30:], uint32(h))
 	le.PutUint32(hdr[34:], uint32(bpp*8))
-	le.PutUint32(hdr[38:], 0) // FrameCount — patched on Close
+	le.PutUint32(hdr[38:], 0) // FrameCount, patched on close
 	writeFixed(hdr[42:82], "")
 	writeFixed(hdr[82:122], instrument)
 	writeFixed(hdr[122:162], "")
@@ -114,11 +124,15 @@ func newSER(path string, w, h, bpp int, colorID int32, instrument string) (*serW
 	return &serWriter{f: f, frameBytes: w * h * bpp}, nil
 }
 
-// writeFrame appends one frame's raw pixels (exactly frameBytes) and records `at` — the
-// frame's CAPTURE time — in the trailer. The caller stamps at read completion, not at
-// write time: the async writer drains a pool-deep queue, and a write-time stamp would
-// skew every trailer entry by pool×frame-time.
+// writeFrame appends one frame's raw pixels (frameBytes long) and records at, the frame's
+// capture time, for the trailer. Callers stamp at read completion, not at write time: the
+// async writer runs a pool-deep queue behind the reads.
 func (s *serWriter) writeFrame(data []byte, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return fmt.Errorf("ser: file already closed")
+	}
 	if len(data) != s.frameBytes {
 		return fmt.Errorf("ser: frame %d is %d bytes, want %d", s.count, len(data), s.frameBytes)
 	}
@@ -130,8 +144,14 @@ func (s *serWriter) writeFrame(data []byte, at time.Time) error {
 	return nil
 }
 
-// Close writes the per-frame timestamp trailer, patches FrameCount in the header, and closes.
+// close writes the per-frame timestamp trailer, patches FrameCount in the header, and closes.
 func (s *serWriter) close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed { // an interrupt hook and the normal return both close
+		return nil
+	}
+	s.closed = true
 	trailer := make([]byte, 8*len(s.stamps))
 	for i, t := range s.stamps {
 		binary.LittleEndian.PutUint64(trailer[i*8:], uint64(t))
@@ -149,7 +169,7 @@ func (s *serWriter) close() error {
 	return s.f.Close()
 }
 
-// writeFixed copies s into a fixed-width field, space-padded, NUL-safe (truncates if long).
+// writeFixed copies s into a fixed-width field, space-padded and truncated to fit.
 func writeFixed(dst []byte, s string) {
 	for i := range dst {
 		dst[i] = ' '

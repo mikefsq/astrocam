@@ -1,11 +1,9 @@
 // Package astrocam is a pure-Go driver for FX3-bridged Sony-sensor astronomy cameras: a
-// vendor transport, per-sensor profiles, and a model table. ZWO (VID 0x03C3) and PlayerOne
-// (VID 0xA0A0) share one profile per Sony die; the per-vendor difference is the Regmap opcode
-// dialect and the gain/offset unit scale, selected from the regmap's VID.
+// vendor transport, per-sensor profiles, and a model table.
 //
 // Layering:
 //
-//	Transport     the USB seam (control transfers + bulk), one backend per OS; vendor-neutral
+//	Transport     the USB physical layer
 //	protocol.go   ZWO's control-transfer register dialect (zwoRegmap) over a Transport
 //	protocol_poa  PlayerOne's dialect (poaRegmap): different opcodes, same Regmap
 //	Vendor        VID -> { Name, newRegmap } (vendor.go); each die maps to one Vendor
@@ -13,147 +11,140 @@
 //	Sensor        a per-chip profile: init table + gain/exposure/ROI ops (vendor-dispatched)
 //	Models        (VID,PID) -> { sensor, mono|color, cooled, usb3 }
 //	Camera        binds a Transport + Model + Sensor into the control flow
-//
-// Backends: macOS IOUSBHost, Linux usbfs, Windows WinUSB. Sensor profiles validated on
-// hardware: imx174 (ASI174 Mini, USB2), imx290 (ASI290MM Mini), imx455 (ASI6200 MM/MC, USB3 +
-// USB2, 122 MB frames), imx462 (ASI462MC). PlayerOne models are registered over the same shared
-// profiles via poaRegmap (protocol_poa.go), unit-tested but not yet validated on a live PlayerOne
-// camera.
 package astrocam
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
-// Transport is the per-vendor USB seam. Control transfers are vendor-typed:
-// ControlOut uses bmRequestType 0x40, ControlIn 0xC0.
+// Default bounds, substituted when a caller passes a non-positive value.
+const (
+	defaultIdleBound    = 800 * time.Millisecond // no-completion stall bound, after first data
+	defaultTotalBound   = 5 * time.Second        // whole-read bound
+	defaultTimeoutBound = 2 * time.Second        // single-shot BulkRead bound
+)
+
+// Transport is the USB seam each backend implements: vendor control transfers (bmRequestType
+// 0x40 OUT, 0xC0 IN) and bulk-IN frame reads.
 type Transport interface {
-	// ControlOut issues a vendor OUT control transfer (bmRequestType 0x40).
+	// ControlOut issues a vendor OUT control transfer.
 	ControlOut(bRequest uint8, wValue, wIndex uint16, data []byte) error
-	// ControlIn issues a vendor IN control transfer (bmRequestType 0xC0) and
-	// fills data; returns the byte count read.
+	// ControlIn issues a vendor IN control transfer, fills data, and returns the byte count.
 	ControlIn(bRequest uint8, wValue, wIndex uint16, data []byte) (int, error)
-	// BulkRead reads from the bulk-IN endpoint (small one-shots / low-rate frames).
-	// High-throughput frame data should use FrameStreamer instead.
+	// BulkRead reads one whole frame from the bulk-IN endpoint. A short or empty read returns
+	// (n, nil). An error means a failure the caller cannot retry past.
 	BulkRead(buf []byte, timeout time.Duration) (int, error)
+	// Close releases the device handle.
 	Close() error
 }
 
-// FrameStreamer is an optional Transport capability: read one whole frame with a
-// window of transfers kept cycling on EP 0x81, copied contiguously so a short packet
-// at a burst boundary cannot leave a gap. Large USB3 frames (IMX455/571) need it; a
-// one-shot BulkRead truncates them. It returns short on an idle stall so the caller can
-// flush, recover, and continue into buf[n:].
+// FrameStreamer reads one whole frame with a window of transfers cycling on EP 0x81. Large USB3
+// frames (IMX455/571) need it: a one-shot BulkRead truncates them.
 type FrameStreamer interface {
+	// ReadFrameStream fills buf and returns short on an idle stall, so the caller can continue
+	// into buf[n:].
 	ReadFrameStream(buf []byte, idle, total time.Duration) (int, error)
 }
 
-// PrequeuedFrameStreamer reads one frame the way the ASI SDK's capture thread does: a batch of
-// async bulk-IN transfers covering the frame exactly (initAsyncXfer/startAsyncXfer, 1 MiB slices
-// on EP 0x81, last slice = the remainder), all queued BEFORE the frame arrives so the transfer
-// overlaps the sensor read and the pipe never idles. The one-at-a-time ReadFrameStream leaves a
-// gap between transfers and does not overlap; on a USB2 HighSpeed link that shears the frame.
-// One frame per batch (a retry is a fresh call); the DDR mid-frame-hold path keeps using
-// ReadFrameStream.
+// PrequeuedFrameStreamer reads one frame with its whole batch of transfers queued before the
+// frame arrives. ReadFrameStream leaves a gap between transfers and shears a free-run frame on a
+// USB2 HighSpeed link.
 type PrequeuedFrameStreamer interface {
+	// ReadFrameStreamPrequeued reads one frame per call; a retry is a fresh call.
 	ReadFrameStreamPrequeued(buf []byte, idle, total time.Duration) (int, error)
 }
 
-// FrameStream is a resident streaming session (the video / planetary-burst path): the
-// windowed pump is primed once and Next pulls one frame per call, so the per-frame setup
-// cost (thread spawn, window prime, teardown) is paid once for the whole burst. Close
-// aborts and frees the session.
+// FrameStream is a resident streaming session for the video and planetary-burst path.
 type FrameStream interface {
+	// Next pulls one frame into buf.
 	Next(buf []byte, idle time.Duration) (int, error)
+	// Close aborts the session and frees it.
 	Close() error
 }
 
-// StreamStarter is an optional Transport capability: open a resident FrameStream session.
-// Backends without it (linux/windows/stub) fall back to per-frame reads.
+// StreamStarter opens a resident FrameStream session.
 type StreamStarter interface {
 	StartStream(frameBytes int, total time.Duration) (FrameStream, error)
 }
 
-// FrameStreamZC is an optional zero-copy extension a FrameStream may implement: NextZC
-// returns a slice aliasing the session's internal buffer (no per-frame memcpy), valid until
-// Release re-arms the slot. It is only meaningful when each frame is a single transfer
-// (sub-MiB ROI). The caller must consume the slice before Release.
+// FrameStreamZC is a zero-copy extension a FrameStream may implement, for frames small enough to
+// arrive in one transfer (sub-MiB ROI).
 type FrameStreamZC interface {
+	// NextZC returns a slice aliasing the session's buffer, valid until Release.
 	NextZC(idle time.Duration) ([]byte, error)
+	// Release re-arms the slot the last NextZC slice aliases.
 	Release()
 }
 
-// ReadAborter is the optional Transport capability StopExposure uses to make an abort
-// PROMPT. A whole-frame read (BulkRead / ReadFrameStream / ReadFrameStreamPrequeued) can
-// block for seconds while holding ioMu on the gated paths, so even the master-stop control
-// writes queue behind it. AbortRead is LEVEL-triggered: it breaks a read already in flight
-// (drains its transfers and returns the short prefix within about one poll interval) AND
-// fails any frame read started afterwards fast, until ArmRead clears the state, so a stale
-// worker that issues its read just after the abort cannot re-block the bus. The camera calls
-// ArmRead when a new exposure is claimed (StartExposure / StartVideo). Control transfers,
-// ResetEndpoint and stream sessions are unaffected.
+// ReadAborter breaks a frame read in flight, so a stop does not wait out a gated whole-frame
+// read.
 type ReadAborter interface {
+	// AbortRead breaks the read in flight and fails later reads until ArmRead.
 	AbortRead()
+	// ArmRead clears the abort state. The camera calls it from StartExposure and StartVideo.
 	ArmRead()
 }
 
-// QuietBulkReader is the optional Transport capability for a whole-frame read whose first
-// `quiet` duration is a HOST-TIMED integration: the sensor is exposing, so no data can
-// arrive yet, but the transfers must already be armed (the GPIF must never stream without
-// a reader). During the quiet window the control-transfer gate (ioMu) is RELEASED, so TEC
-// polls, telemetry and ST4 pulses flow. The gate is taken when the quiet window elapses or
-// the first transfer completes, whichever comes first, then held through the readout as
-// usual. quiet 0 is BulkRead. Callers must undershoot the real integration (leave a safety
-// margin) so the gate is normally in place BEFORE data flows.
+// QuietBulkReader reads one whole frame whose first quiet duration is a host-timed integration.
 type QuietBulkReader interface {
+	// BulkReadQuiet arms the transfers, then releases ioMu until the quiet window elapses or
+	// the first transfer completes. Callers must undershoot the real integration. quiet 0 is
+	// BulkRead.
 	BulkReadQuiet(buf []byte, quiet, timeout time.Duration) (int, error)
 }
 
-// UngatedControlSender is the optional Transport capability for the ST4 guide-pulse
-// commands (0xB0 on / 0xB1 off) ONLY: a vendor OUT issued WITHOUT the ioMu wedge gate, so
-// a pulse edge is never queued behind a whole-frame read (a pulse-off landing behind a
-// held ioMu stretches a 100 ms guide correction into the rest of the readout). This mirrors
-// the SDK: its API layer serializes pulses only against other API calls (per-camera mutex),
-// never against the capture thread's bulk stream, so ST4 pulses land mid-readout on every
-// PHD2+ASI rig in the field. Do NOT use this for any other request: EP0 READS mid-readout
-// are the proven GPIF-wedge mechanism (gosnap -wedge).
+// UngatedControlSender issues a vendor OUT without ioMu, so a pulse edge does not queue behind a
+// frame read.
 type UngatedControlSender interface {
+	// ControlOutUngated serves the ST4 guide pulses (0xB0 on, 0xB1 off) only. An EP0 read
+	// mid-readout wedges the GPIF.
 	ControlOutUngated(bRequest uint8, wValue, wIndex uint16) error
 }
 
-// EndpointResetter is an optional Transport capability: clear a stalled bulk endpoint
-// (per-platform clear-halt) to drop stale data before a capture. The camera issues
-// ResetEndpoint(0x81) before each session.
+// EndpointResetter clears a stalled bulk endpoint.
 type EndpointResetter interface {
 	ResetEndpoint(ep uint8) error
 }
 
-// DeviceResetter is an optional Transport capability: a USB bus reset of the whole
-// device, the last-resort recovery when a pipe-level reset cannot unwedge the camera. It
-// wipes the device's state, so the caller must re-Init afterwards.
+// DeviceResetter resets the whole device on the bus. It wipes device state, so the caller must
+// re-Init.
 type DeviceResetter interface {
 	ResetDevice() error
 }
 
-// Regmap is the sensor-register interface a Sensor profile writes to. The ZWO
-// implementation (zwoRegmap) carries each access as a control transfer. Two register
-// spaces, routed through two distinct vendor requests in the FX3 bridge:
-//
-//   - WriteReg/ReadReg   → the sensor's own registers (Sony WriteSONYREG 0xB6 /
-//     ReadSONYREG 0xB7 by default; a non-Sony profile can select the generic
-//     camera-register bus 0xA6 via Sensor.Bus).
-//   - WriteFPGAReg/ReadFPGAReg → the camera FPGA's registers (0xBD / 0xBC).
-//     Exposure timing (VMAX) and HBLANK live here, not on the sensor, so every
-//     profile's SetExposure needs this path. See SetVMAX.
+// Regmap is the sensor-register interface a Sensor profile writes to. WriteReg and ReadReg reach
+// the sensor's own registers; WriteFPGAReg and ReadFPGAReg reach the camera FPGA, which holds the
+// exposure timing (VMAX) and HBLANK.
 type Regmap interface {
 	WriteReg(reg, val uint16) error
 	// WriteRegBits sets bits [lo:hi] of reg to val (read-modify-write).
 	WriteRegBits(reg uint16, lo, hi uint8, val uint16) error
 	ReadReg(reg uint16) (uint16, error)
-	// WriteFPGAReg writes a camera-FPGA register (WriteFPGAREG 0xBD).
 	WriteFPGAReg(reg, val uint16) error
-	// ReadFPGAReg reads a camera-FPGA register (ReadFPGAREG 0xBC).
 	ReadFPGAReg(reg uint16) (uint16, error)
-	// VID reports the USB vendor id of the dialect this regmap speaks, so a sensor
-	// profile shared across vendors (same Sony die) can select the vendor-specific
-	// gain/offset encoding at call time. zwoRegmap -> 0x03C3, poaRegmap -> 0xA0A0.
+	// VID reports the USB vendor id of the dialect this regmap speaks, so a shared profile can
+	// select the vendor's gain/offset encoding at call time.
 	VID() uint16
+}
+
+// usb2InPace is the minimum spacing between vendor IN control transfers while a frame read is in
+// flight on a USB2 HighSpeed link. 500/s took the FX3 control plane down on an ASI6200MC.
+const usb2InPace = 20 * time.Millisecond
+
+// inPacer spaces calls at least min apart; concurrent callers queue in order.
+type inPacer struct {
+	mu   sync.Mutex
+	last time.Time
+	min  time.Duration
+}
+
+// wait blocks until min has elapsed since the previous wait returned, then claims the slot.
+func (p *inPacer) wait() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d := p.min - time.Since(p.last); d > 0 {
+		time.Sleep(d)
+	}
+	p.last = time.Now()
 }

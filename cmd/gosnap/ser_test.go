@@ -4,14 +4,14 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
 
-// TestSERWriter round-trips a two-frame SER file and pins the header conventions:
-// de-facto LittleEndian=0 with LE data, DateTime local vs DateTimeUTC differing by the
-// zone offset, FrameCount patched on close, and trailer stamps carrying the CAPTURE
-// times passed to writeFrame (not the write times).
+// TestSERWriter round-trips a two-frame SER file: LittleEndian=0 with LE data, DateTime
+// and DateTimeUTC differing by the zone offset, FrameCount patched on close, and trailer
+// stamps equal to the capture times passed to writeFrame.
 func TestSERWriter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.ser")
 	const w, h, bpp = 4, 2, 2
@@ -68,15 +68,14 @@ func TestSERWriter(t *testing.T) {
 	if got := le.Uint32(b[38:]); got != 2 {
 		t.Errorf("FrameCount = %d, want 2 (patched on close)", got)
 	}
-	// DateTime (local) − DateTimeUTC must equal the zone offset in ticks; with a UTC-only
-	// environment both are equal (offset 0), so derive the expectation from the live zone.
+	// DateTime (local) minus DateTimeUTC equals the live zone offset in ticks (0 under UTC).
 	dtLocal := int64(le.Uint64(b[162:]))
 	dtUTC := int64(le.Uint64(b[170:]))
 	_, off := time.Now().Zone()
 	if diff := dtLocal - dtUTC; diff != int64(off)*10_000_000 {
 		t.Errorf("DateTime-DateTimeUTC = %d ticks, want zone offset %d", diff, int64(off)*10_000_000)
 	}
-	// Trailer: the two capture stamps, verbatim.
+	// Trailer: the two capture stamps.
 	tr := b[serHeaderSize+2*len(frame):]
 	if got := int64(le.Uint64(tr[0:])); got != netTicks(at1) {
 		t.Errorf("trailer[0] = %d, want capture stamp %d", got, netTicks(at1))
@@ -90,4 +89,32 @@ func TestSERWriter(t *testing.T) {
 			t.Fatalf("frame 0 byte %d = %d, want %d", i, b[serHeaderSize+i], frame[i])
 		}
 	}
+}
+
+// TestSERWriterCloseRacesWriter: on SIGINT the interrupt hook closes the SER file while the
+// burst's writer goroutine may be mid-writeFrame, so the two must not touch count, stamps and
+// the file concurrently. Without serialization the trailer can be written from a half-updated
+// stamp slice and FrameCount can disagree with the frames on disk.
+func TestSERWriterCloseRacesWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "race.ser")
+	sw, err := newSER(path, 4, 4, 1, serMono, "T")
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := make([]byte, 16)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { // the burst's async writer
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			if err := sw.writeFrame(frame, time.Now()); err != nil {
+				return // the file is closed under us: expected, must not corrupt
+			}
+		}
+	}()
+	time.Sleep(time.Millisecond)
+	if err := sw.close(); err != nil { // the interrupt hook
+		t.Logf("close: %v", err)
+	}
+	wg.Wait()
 }

@@ -2,36 +2,33 @@ package astrocam
 
 import "sort"
 
-// DeviceID is a USB (VID,PID) identifier, the key the camera-model registry uses. The
-// VID is part of the key because two vendors can reuse the same PID.
+// DeviceID is a USB (VID,PID) identifier, the key the camera-model registry uses. The VID is
+// part of the key because two vendors can reuse the same PID.
 type DeviceID struct{ VID, PID uint16 }
 
-// Vendor describes a camera maker on the shared FX3 + Sony-sensor platform: its USB
-// vendor id and the wire-protocol dialect its cameras speak. Sensor profiles are
-// vendor-independent; a Vendor supplies the Regmap dialect and the FX3 bridge command
-// table. One VID per Vendor.
+// Vendor describes a camera maker on the shared FX3 + Sony-sensor platform: its USB vendor id
+// and the wire-protocol dialect its cameras speak. Sensor profiles are vendor-independent; a
+// Vendor supplies the Regmap dialect and the FX3 bridge command table. One VID per Vendor.
 type Vendor struct {
 	VID  uint16
 	Name string
-	// Cmds are the vendor requests the FX3 bridge firmware answers outside the register
-	// dialect (stream control, GPIF bus, flash, identity). The Camera routes every such
-	// transfer through this table; a zero entry means "not decoded for this vendor" and the
-	// operation errors instead of sending another vendor's bytes.
+	// Cmds are the vendor requests the FX3 bridge firmware answers outside the register dialect
+	// (stream control, GPIF bus, flash, identity). A zero entry means "not decoded for this
+	// vendor" and the operation errors instead of sending another vendor's bytes.
 	Cmds FX3Cmds
-	// newRegmap builds this vendor's Regmap dialect over an open Transport. bus selects
-	// the sensor-register path (Sony I2C vs generic camera reg); mode carries the live
-	// readout context (USB speed, output depth, FPS%).
+	// newRegmap builds this vendor's Regmap dialect over an open Transport. bus selects the
+	// sensor-register path (Sony I2C vs generic camera reg); mode carries the live readout
+	// context.
 	newRegmap func(t Transport, bus RegBus, mode ReadoutMode) Regmap
 }
 
 // FX3Cmds holds a vendor's FX3 bridge request codes (bRequest values). SendCMD-style entries
-// take no payload (vendor OUT, wValue 0); the others are documented per field. Zero = not
-// decoded for the vendor.
+// take no payload (vendor OUT, wValue 0). Zero = not decoded for the vendor.
 type FX3Cmds struct {
 	StreamStop      uint8 // SendCMD: stop/prepare before (re)arming
 	StreamStart     uint8 // SendCMD: begin streaming
 	Flush           uint8 // SendCMD: pipeline flush / drop recovery
-	EnableGPIF32DQ  uint8 // vendor OUT, wValue 0 = disable / 1 = enable the FPGA->FX3 32-bit data bus
+	EnableGPIF32DQ  uint8 // vendor OUT, wValue 0/1 disables/enables the FPGA->FX3 32-bit data bus
 	ReadSPIFlash    uint8 // vendor IN, wIndex = flash address >> 8, up to 2 KiB per transfer
 	FirmwareVersion uint8 // vendor IN, 2 bytes little-endian
 	SerialNumber    uint8 // vendor IN, 8 raw factory-serial bytes
@@ -78,8 +75,8 @@ func (c FX3Cmds) cmd(op FX3Op) uint8 {
 	return 0
 }
 
-// vendors maps a USB VID to the Vendor that owns it. Protocol layers register themselves
-// from init(), so the core never hardcodes a vendor.
+// vendors maps a USB VID to the Vendor that owns it. Protocol layers register themselves from
+// init().
 var vendors = map[uint16]*Vendor{}
 
 // RegisterVendor records a vendor descriptor under its VID.

@@ -8,9 +8,8 @@ import (
 	_ "github.com/mikefsq/astrocam/sensors" // registers the PID → sensor table
 )
 
-// TestE2ECapture runs the full hardware-free capture pipeline against StubTransport
-// for each validated camera, asserting the frame round-trips and the control plane
-// actually drove the device.
+// TestE2ECapture runs the full capture pipeline against StubTransport for each validated
+// camera, asserting the frame round-trips and the control plane drove the device.
 func TestE2ECapture(t *testing.T) {
 	for _, tc := range []struct {
 		pid  uint16
@@ -38,7 +37,7 @@ func TestE2ECapture(t *testing.T) {
 			step("Init", cam.Init())
 			step("SetROI", cam.SetROI(0, 0, info.MaxWidth, info.MaxHeight))
 			step("SetGain", cam.SetGain(0))
-			step("SetExposure", cam.SetExposure(10*time.Millisecond)) // < 1 s → free-run, no host wait
+			step("SetExposure", cam.SetExposure(10*time.Millisecond)) // < 1 s: free-run
 			step("StartExposure", cam.StartExposure(true))
 
 			buf := make([]byte, cam.FrameBytes())
@@ -51,14 +50,12 @@ func TestE2ECapture(t *testing.T) {
 			if ft.Reads == 0 {
 				t.Errorf("no frame read was served")
 			}
-			// The stub served a 16-bit ramp (pixel i = i); confirm it round-tripped. Check
-			// interior pixels 2,3 (= 02 00 03 00) rather than 0,1: the IMX455 worker repairs the
-			// FX3 DDR header/footer marker words, which edge-replicate pixels 0,1 (and the last
-			// two), so the very first pixels are intentionally no longer the raw ramp there.
+			// The stub served a 16-bit ramp (pixel i = i). Check interior pixels 2,3 rather than
+			// 0,1: the IMX455 marker repair edge-replicates pixels 0,1 and the last two.
 			if buf[4] != 2 || buf[5] != 0 || buf[6] != 3 || buf[7] != 0 {
 				t.Errorf("frame px2,3 = % x, want ramp 02 00 03 00", buf[4:8])
 			}
-			// The control plane must have actually programmed the camera (init + ops).
+			// The control plane programmed the camera (init + ops).
 			if len(ft.Log) < 20 {
 				t.Errorf("only %d control transfers logged — pipeline did not run", len(ft.Log))
 			}
@@ -66,10 +63,10 @@ func TestE2ECapture(t *testing.T) {
 	}
 }
 
-// TestE2ETriggerMode exercises the IMX455 ≥1 s trigger path end-to-end: the worker
-// must host-time the integration AND the device must end up programmed for wait+trigger
-// mode (FPGA reg0 bit6+bit7) with VMAX held at one frame (0x02cc for this 512 ROI, ROI-following)
-// and SHS=10 — the values cross-checked against the SDK wire. The 1 s host wait keeps it off -short.
+// TestE2ETriggerMode exercises the IMX455 ≥1 s trigger path end-to-end: the worker host-times
+// the integration and the device ends up programmed for wait+trigger mode (FPGA reg0 bit6+bit7)
+// with VMAX at one frame (0x02cc for this 512 ROI) and SHS=10, values cross-checked against the
+// SDK wire. The 1 s host wait keeps it off -short.
 func TestE2ETriggerMode(t *testing.T) {
 	if testing.Short() {
 		t.Skip("trigger mode host-times a 1 s integration; skipped in -short")
@@ -95,12 +92,12 @@ func TestE2ETriggerMode(t *testing.T) {
 			t.Fatalf("%s: %v", s.name, s.err)
 		}
 	}
-	// SetExposure must have programmed wait+trigger mode and the one-frame VMAX.
+	// SetExposure programmed wait+trigger mode and the one-frame VMAX.
 	if reg0 := ft.FPGAReg(0x00); reg0&0x40 == 0 || reg0&0x80 == 0 {
 		t.Errorf("reg0 = 0x%02x, want wait(0x40)+trigger(0x80) bits set", reg0)
 	}
 	// One-frame VMAX follows the ROI: 512-row window → vblank(52)+512=564 → (frameUs+10ms)/line+20
-	// = 0x02cc (716). (Full-frame would be 0x19c0; the SDK shrinks it for a sub-frame ROI.)
+	// = 0x02cc (716). Full-frame would be 0x19c0.
 	if lo, mid := ft.FPGAReg(0x10), ft.FPGAReg(0x11); lo != 0xcc || mid != 0x02 {
 		t.Errorf("VMAX = 0x%02x%02x.., want 0x02cc (one frame for the 512 ROI)", mid, lo)
 	}

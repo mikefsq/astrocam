@@ -20,7 +20,7 @@ func (f *frameTransport) ControlOut(b uint8, wv, wi uint16, _ []byte) error {
 	return nil
 }
 func (f *frameTransport) ControlIn(_ uint8, _, _ uint16, data []byte) (int, error) {
-	return len(data), nil // real transports fill the request; a 0-count read is now an error
+	return len(data), nil // real transports fill the request; a 0-count read is an error
 }
 func (f *frameTransport) BulkRead(buf []byte, _ time.Duration) (int, error) {
 	return copy(buf, f.frame), nil
@@ -78,8 +78,8 @@ func TestSnapDataPlane(t *testing.T) {
 		}
 	}
 
-	// After the arm the sensor is WORKING; the read happens immediately (the bulk
-	// read blocks for the frame) rather than host-waiting the exposure first.
+	// After the arm the sensor is Working; the read happens immediately (the bulk read blocks
+	// for the frame) rather than host-waiting the exposure first.
 	if s := c.GetExpStatus(); s != ExpWorking {
 		t.Errorf("status after arm = %s, want working", s)
 	}
@@ -96,9 +96,8 @@ func TestSnapDataPlane(t *testing.T) {
 	}
 }
 
-// dispatchTransport is a bare Transport (BulkRead only) that records which read path the
-// Camera dispatched to; the wrapper types below add FrameStreamer / PrequeuedFrameStreamer
-// so a test can lock the StreamFramePrequeued capability-dispatch order.
+// dispatchTransport is a bare Transport (BulkRead only) that records which read path the Camera
+// dispatched to; the wrapper types below add FrameStreamer / PrequeuedFrameStreamer.
 type dispatchTransport struct {
 	path string
 }
@@ -127,10 +126,8 @@ func (d *pqDispatchTransport) ReadFrameStreamPrequeued(buf []byte, _, _ time.Dur
 	return len(buf), nil
 }
 
-// TestStreamFramePrequeuedDispatch locks the capability-dispatch order of the worker read
-// primitives: StreamFramePrequeued uses the pre-queued batch when the backend has it, falls
-// back to the windowed pump, then to a plain BulkRead (the free-run 462 worker depends on the
-// pre-queued path whenever the backend offers it; all in-tree backends do).
+// TestStreamFramePrequeuedDispatch: StreamFramePrequeued uses the pre-queued batch when the
+// backend has it, falls back to the windowed pump, then to a plain BulkRead.
 func TestStreamFramePrequeuedDispatch(t *testing.T) {
 	buf := make([]byte, 32)
 	cases := []struct {
@@ -164,10 +161,9 @@ func TestStreamFramePrequeuedDispatch(t *testing.T) {
 	}
 }
 
-// TestStubImplementsPrequeued: every in-tree backend the free-run
-// worker can land on must offer the pre-queued read (the StreamFrame fallback idles out
-// from t0 and breaks free-run exposures ≳ the idle window). Linux/darwin/windows are
-// build-tagged; the stub is assertable everywhere.
+// TestStubImplementsPrequeued: StubTransport offers the pre-queued read (the StreamFrame
+// fallback idles out from t0 and breaks free-run exposures longer than the idle window). The
+// hardware backends are build-tagged; the stub is assertable everywhere.
 func TestStubImplementsPrequeued(t *testing.T) {
 	var tr Transport = NewStubTransport()
 	if _, ok := tr.(PrequeuedFrameStreamer); !ok {
@@ -175,13 +171,10 @@ func TestStubImplementsPrequeued(t *testing.T) {
 	}
 }
 
-// TestCameraConcurrentAccess drives one Camera the way the Alpaca server does: several
-// goroutines at once — a capture loop (StartExposure → the post-exposure data read), an independent
-// ImageReady poller (GetExpStatus), an aborter (StopExposure), and config writers
-// (SetExposure / SetROI / FrameBytes) all hitting the same camera. Run under -race this is
-// the regression guard for the capture-state mutex and the transport's control serialization
-// (think PHD2 polling the guide cam while a long exposure runs). Errors are ignored — only
-// data races fail the test.
+// TestCameraConcurrentAccess drives one Camera from several goroutines at once: a capture loop
+// (StartExposure → GetDataAfterExp), a status poller (GetExpStatus), an aborter (StopExposure),
+// and config writers (SetExposure / SetROI / FrameBytes). Under -race it guards the
+// capture-state mutex. Errors are ignored; only data races fail the test.
 func TestCameraConcurrentAccess(t *testing.T) {
 	st := NewStubTransport()
 	Register(ZWO.VID, 0x00C0, Model{Name: "Conc", Sensor: &armSensor})
@@ -224,9 +217,8 @@ func TestCameraConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-// TestSnapShortFrame: a short frame (fewer bytes than FrameBytes — validation is by SIZE,
-// there is no magic check on the pixel data) fails readout and marks the exposure FAILED
-// (the dropped-frame path).
+// TestSnapShortFrame: a frame shorter than FrameBytes (validation is by size, not a header)
+// fails readout and marks the exposure Failed.
 func TestSnapShortFrame(t *testing.T) {
 	f := &frameTransport{frame: []byte{0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4}} // 8 < 16-byte frame
 	c, _ := Open(f, ZWO.VID, 0x00D0)
@@ -242,11 +234,9 @@ func TestSnapShortFrame(t *testing.T) {
 	}
 }
 
-// TestAbortSupersede locks the exposure-generation guard: a capture aborted mid-flight and
-// superseded by a NEW StartExposure must (a) observe the abort through its WorkerCtl, and
-// (b) leave the new exposure's status untouched when it unwinds — the historical bug was the
-// stale worker seeing status==Working again ("un-aborting" itself) and then consuming or
-// failing the new exposure's state.
+// TestAbortSupersede: a capture aborted mid-flight and superseded by a new StartExposure
+// observes the abort through its WorkerCtl and leaves the new exposure's status untouched when
+// it unwinds.
 func TestAbortSupersede(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -308,11 +298,9 @@ func TestAbortSupersede(t *testing.T) {
 	}
 }
 
-// TestStatusPollDoesNotAbortWorker locks GetExpStatus purity: polling the status past the
-// host-timed window derives SUCCESS without mutating the stored status, so the worker still
-// integrating must NOT observe an abort. (The historical bug: the getter stored ExpSuccess and
-// Aborted() keyed off status != Working, so any poll in the arm-lag tail killed the exposure
-// at ~99% integrated.)
+// TestStatusPollDoesNotAbortWorker: polling GetExpStatus past the host-timed window derives
+// Success without mutating the stored status, so a worker still integrating does not observe an
+// abort.
 func TestStatusPollDoesNotAbortWorker(t *testing.T) {
 	workerDone := make(chan struct{})
 	var abortedDuringRun bool
@@ -324,8 +312,7 @@ func TestStatusPollDoesNotAbortWorker(t *testing.T) {
 		SetROI:      func(Regmap, int, int, int, int, int) error { return nil },
 		Worker: func(ctl WorkerCtl, buf []byte, _ time.Duration) (int, error) {
 			defer close(workerDone)
-			// Integrate PAST the host-timed window (the arm-lag tail), polling the abort
-			// signal the way real workers do.
+			// Integrate past the host-timed window, polling the abort signal as real workers do.
 			for end := time.Now().Add(120 * time.Millisecond); time.Now().Before(end); {
 				if ctl.Aborted() {
 					mu.Lock()
@@ -354,7 +341,7 @@ func TestStatusPollDoesNotAbortWorker(t *testing.T) {
 		_, err := c.GetDataAfterExp(make([]byte, 64))
 		done <- err
 	}()
-	// Poll like an Alpaca ImageReady loop: after the window the DERIVED status is Success.
+	// After the window the derived status is Success.
 	sawSuccess := false
 	for i := 0; i < 20; i++ {
 		if c.GetExpStatus() == ExpSuccess {
@@ -384,8 +371,8 @@ func (d *quietDispatchTransport) BulkReadQuiet(buf []byte, _, _ time.Duration) (
 	return len(buf), nil
 }
 
-// TestBulkReadQuietDispatch: the worker primitive routes to the transport's quiet-gated
-// read when offered and falls back to the fully-gated BulkRead otherwise.
+// TestBulkReadQuietDispatch: BulkReadQuiet routes to the transport's QuietBulkReader when
+// offered and falls back to BulkRead otherwise.
 func TestBulkReadQuietDispatch(t *testing.T) {
 	buf := make([]byte, 32)
 	q := &quietDispatchTransport{}
@@ -407,7 +394,7 @@ func TestBulkReadQuietDispatch(t *testing.T) {
 }
 
 // abortableTransport blocks BulkRead until AbortRead (or the read timeout) and counts the
-// ReadAborter calls — the seam for the StopExposure-promptness contract test.
+// ReadAborter calls.
 type abortableTransport struct {
 	mu         sync.Mutex
 	aborted    chan struct{}
@@ -455,10 +442,9 @@ func (a *abortableTransport) ArmRead() {
 	}
 }
 
-// TestStopExposureBreaksBlockedRead pins the abort-promptness contract at the Camera level:
-// a GetDataAfterExp blocked in a multi-second transport read must return within moments of
-// StopExposure (via ReadAborter), reporting an abort — not run out its read timeout. Also
-// asserts the ArmRead/AbortRead lifecycle: StartExposure re-arms, StopExposure aborts.
+// TestStopExposureBreaksBlockedRead: a GetDataAfterExp blocked in a multi-second transport read
+// returns promptly after StopExposure (via ReadAborter) with an abort error, and StartExposure /
+// StopExposure make one ArmRead / AbortRead call each.
 func TestStopExposureBreaksBlockedRead(t *testing.T) {
 	at := newAbortableTransport()
 	Register(ZWO.VID, 0x00D3, Model{Name: "Abort", Sensor: &armSensor})
@@ -475,8 +461,7 @@ func TestStopExposureBreaksBlockedRead(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		// The generic read path's timeout is 2·exp+3 s ≈ 3 s per attempt: without the
-		// abort break this read sits for seconds.
+		// The generic read path's timeout is 2·exp+3 s ≈ 3 s per attempt.
 		_, err := c.GetDataAfterExp(make([]byte, c.FrameBytes()))
 		done <- err
 	}()
@@ -501,8 +486,8 @@ func TestStopExposureBreaksBlockedRead(t *testing.T) {
 	}
 }
 
-// TestStubImplementsAbortAndQuiet: StubTransport keeps capability parity with the hardware
-// backends so camera-level tests exercise the same dispatch.
+// TestStubImplementsAbortAndQuiet: StubTransport implements ReadAborter and QuietBulkReader,
+// and its abort latch works.
 func TestStubImplementsAbortAndQuiet(t *testing.T) {
 	var tr Transport = NewStubTransport()
 	if _, ok := tr.(ReadAborter); !ok {
@@ -522,8 +507,8 @@ func TestStubImplementsAbortAndQuiet(t *testing.T) {
 	}
 }
 
-// TestStartVideoUsesSensorArm: a profile with its own Arm hook (the DDR cameras) has StartVideo
-// run that choreography instead of the generic SendCMD/FPGA/master sequence.
+// TestStartVideoUsesSensorArm: StartVideo runs a profile's own Arm hook instead of the generic
+// SendCMD/FPGA/master sequence.
 func TestStartVideoUsesSensorArm(t *testing.T) {
 	calls := 0
 	s := Sensor{
@@ -549,6 +534,265 @@ func TestStartVideoUsesSensorArm(t *testing.T) {
 	for _, x := range f.out {
 		if x.bRequest == cmdStreamStop || x.bRequest == cmdStreamStart {
 			t.Fatalf("generic arm command 0x%02x issued despite Sensor.Arm: %+v", x.bRequest, f.out)
+		}
+	}
+}
+
+// TestSumBinRAW8 checks the RAW8 software bin: block sum clipped at 255.
+func TestSumBinRAW8(t *testing.T) {
+	// 4×2 frame, bin 2 → 2×1: blocks {1,2,3,4}=10 and {100,100,100,100}=400 → 255.
+	buf := []byte{1, 2, 100, 100, 3, 4, 100, 100}
+	if n := sumBinRAW8(buf, 4, 2, 2); n != 2 || buf[0] != 10 || buf[1] != 255 {
+		t.Errorf("sumBinRAW8 = n %d, out %v, want 2, [10 255]", n, buf[:2])
+	}
+}
+
+// TestBinSplit: binning is host-side by default (the sensor SetROI sees the bin-scaled region at
+// bin 1, FrameBytes is the wire size, the delivered RAW8 frame is the clipped block sum); with
+// SetHardwareBin(true) the sensor takes the largest HWBins divisor and the host bins the rest
+// (bin 4 on a {2,3} profile = sensor 2 × host 2; bin 3 = sensor 3 alone).
+func TestBinSplit(t *testing.T) {
+	var gotBin, gotW, gotH int
+	s := &Sensor{
+		Name:        "BSPL",
+		Info:        CameraInfo{MaxWidth: 96, MaxHeight: 48, BitDepth: 12, Bins: []int{1, 2, 3, 4}},
+		HWBins:      []int{2, 3},
+		SetROI:      func(_ Regmap, x, y, w, h, bin int) error { gotW, gotH, gotBin = w, h, bin; return nil },
+		SetExposure: func(Regmap, time.Duration) error { return nil },
+	}
+	Register(ZWO.VID, 0x0CE8, Model{Name: "BinSplit", Sensor: s})
+	st := NewStubTransport()
+	st.Frame = func(buf []byte) {
+		for i := range buf {
+			buf[i] = 100 // every RAW8 pixel 100 → 2×2 block sum 400 → 255
+		}
+	}
+	c, err := Open(st, ZWO.VID, 0x0CE8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetOutputDepth(1); err != nil {
+		t.Fatal(err)
+	}
+	set := func(bin, w, h int) {
+		t.Helper()
+		if err := c.SetBinning(bin); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.SetROI(0, 0, w, h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Default: host bin. bin 2 over 48×24 → sensor 96×48 at bin 1, wire 4608 B, delivered 1152 B
+	// of 255.
+	set(2, 48, 24)
+	if gotBin != 1 || gotW != 96 || gotH != 48 {
+		t.Errorf("host bin 2: sensor SetROI got %dx%d bin %d, want 96x48 bin 1", gotW, gotH, gotBin)
+	}
+	if fb := c.FrameBytes(); fb != 4608 {
+		t.Errorf("host bin 2: FrameBytes = %d, want 4608 (96×48×1 wire)", fb)
+	}
+	buf := make([]byte, c.FrameBytes())
+	if err := c.StartExposure(true); err != nil {
+		t.Fatal(err)
+	}
+	n, err := c.GetDataAfterExp(buf)
+	if err != nil || n != 1152 {
+		t.Fatalf("host bin 2: GetDataAfterExp = %d, %v, want 1152 bytes (48×24 RAW8)", n, err)
+	}
+	for i := 0; i < n; i++ {
+		if buf[i] != 255 {
+			t.Fatalf("host bin 2: pixel %d = %d, want 255 (clipped sum of four 100s)", i, buf[i])
+		}
+	}
+	// Hardware bin on: bin 2 goes to the sensor whole; bin 4 = sensor 2 over 2w×2h + host 2;
+	// bin 3 = sensor 3 alone.
+	c.SetHardwareBin(true)
+	set(2, 48, 24)
+	if gotBin != 2 || gotW != 48 || gotH != 24 || c.FrameBytes() != 1152 {
+		t.Errorf("hw bin 2: sensor got %dx%d bin %d, FrameBytes %d; want 48x24 bin 2, 1152", gotW, gotH, gotBin, c.FrameBytes())
+	}
+	set(4, 24, 12)
+	if gotBin != 2 || gotW != 48 || gotH != 24 {
+		t.Errorf("hw bin 4: sensor got %dx%d bin %d, want 48x24 bin 2 (bin-2 table over 2w×2h)", gotW, gotH, gotBin)
+	}
+	if fb := c.FrameBytes(); fb != 1152 {
+		t.Errorf("hw bin 4: FrameBytes = %d, want 1152 (48×24 wire, host-binned 2× to 24×12)", fb)
+	}
+	if m := ModeOf(c.rm); m.Bin != 2 || m.SoftBin != 2 || m.Width != 48 || m.Height != 24 {
+		t.Errorf("hw bin 4: mode Bin %d SoftBin %d %dx%d, want 2/2 48x24", m.Bin, m.SoftBin, m.Width, m.Height)
+	}
+	set(3, 32, 16)
+	if gotBin != 3 || gotW != 32 || gotH != 16 || ModeOf(c.rm).SoftBin != 1 {
+		t.Errorf("hw bin 3: sensor got %dx%d bin %d SoftBin %d, want 32x16 bin 3 / 1", gotW, gotH, gotBin, ModeOf(c.rm).SoftBin)
+	}
+	// When the sensor bins, the rule counts output pixels: a 20-wide window is refused though its
+	// 40-wide sensor extent would satisfy the host-bin form. ASISetROIFormat behaves the same way
+	// (4788×3194 at bin 2 is accepted host-binned and rejected under ASI_HARDWARE_BIN).
+	if err := c.SetROI(0, 0, 20, 6); err == nil {
+		t.Error("hw bin 2 20x6 accepted; want rejected (20 is not a multiple of 8)")
+	}
+	// Back to host bin: bin 3 → sensor 96×48 at bin 1.
+	c.SetHardwareBin(false)
+	set(3, 32, 16)
+	if gotBin != 1 || gotW != 96 || gotH != 48 {
+		t.Errorf("host bin 3: sensor got %dx%d bin %d, want 96x48 bin 1", gotW, gotH, gotBin)
+	}
+}
+
+// TestColorBinRule pins the color host bin to the SDK's mapping: each 2·bin × 2·bin block of the
+// mosaic gives one 2×2 output cell whose pixels combine the bin² same-color samples (RAW16 mean,
+// RAW8 clipped sum), so the output keeps the RGGB phase and its level per phase.
+func TestColorBinRule(t *testing.T) {
+	// 8×8 RAW8 mosaic with per-phase constants R=1 G=2 G=3 B=4 (rows even/odd × cols even/odd).
+	const w, h = 8, 8
+	mk := func() []byte {
+		b := make([]byte, w*h)
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				b[y*w+x] = byte(1 + (y&1)*2 + (x & 1))
+			}
+		}
+		return b
+	}
+	buf := mk()
+	if n := colorSumBinRAW8(buf, w, h, 2); n != 16 {
+		t.Fatalf("colorSumBinRAW8 bin2 n = %d, want 16", n)
+	}
+	// bin 2: 4×4 block → 2×2 cell, each = 4 same-color samples → 4×phase.
+	for oy := 0; oy < 4; oy++ {
+		for ox := 0; ox < 4; ox++ {
+			want := byte(4 * (1 + (oy&1)*2 + (ox & 1)))
+			if got := buf[oy*4+ox]; got != want {
+				t.Errorf("RAW8 bin2 out(%d,%d) = %d, want %d", oy, ox, got, want)
+			}
+		}
+	}
+	buf = mk()
+	if n := colorSumBinRAW8(buf, w, h, 4); n != 4 {
+		t.Fatalf("colorSumBinRAW8 bin4 n = %d, want 4", n)
+	}
+	// bin 4: 8×8 block → one 2×2 cell of 16-sample sums: 16, 32, 48, 64.
+	if buf[0] != 16 || buf[1] != 32 || buf[2] != 48 || buf[3] != 64 {
+		t.Errorf("RAW8 bin4 cell = %v, want [16 32 48 64]", buf[:4])
+	}
+	// RAW16 bin 2 keeps the phase level (mean of 4 equal samples).
+	b16 := make([]byte, w*h*2)
+	for i, v := range mk() {
+		u := int(v) * 100
+		b16[2*i], b16[2*i+1] = byte(u), byte(u>>8)
+	}
+	if n := colorBinRAW16(b16, w, h, 2); n != 32 {
+		t.Fatalf("colorBinRAW16 bin2 n = %d, want 32", n)
+	}
+	for oy := 0; oy < 4; oy++ {
+		for ox := 0; ox < 4; ox++ {
+			want := 100 * (1 + (oy&1)*2 + (ox & 1))
+			o := (oy*4 + ox) * 2
+			if got := int(b16[o]) | int(b16[o+1])<<8; got != want {
+				t.Errorf("RAW16 bin2 out(%d,%d) = %d, want %d", oy, ox, got, want)
+			}
+		}
+	}
+}
+
+// colorBinRAW16Ref / colorSumBinRAW8Ref are colorBinRAW16 / colorSumBinRAW8 computed into a
+// separate output buffer: the reference the in-place versions must match.
+func colorBinRAW16Ref(src []byte, fullW, fullH, bin int) []byte {
+	outW, outH := fullW/bin, fullH/bin
+	out := make([]byte, outW*outH*2)
+	for oy := 0; oy < outH; oy++ {
+		row0 := 2*bin*(oy/2) + oy&1
+		for ox := 0; ox < outW; ox++ {
+			col0 := 2*bin*(ox/2) + ox&1
+			sum, cnt := 0, 0
+			for i := 0; i < bin; i++ {
+				r := row0 + 2*i
+				if r >= fullH {
+					break
+				}
+				for j := 0; j < bin; j++ {
+					cc := col0 + 2*j
+					if cc >= fullW {
+						break
+					}
+					p := (r*fullW + cc) * 2
+					sum += int(src[p]) | int(src[p+1])<<8
+					cnt++
+				}
+			}
+			v := 0
+			if cnt > 0 {
+				v = (sum + cnt/2) / cnt
+			}
+			o := (oy*outW + ox) * 2
+			out[o], out[o+1] = byte(v), byte(v>>8)
+		}
+	}
+	return out
+}
+
+func colorSumBinRAW8Ref(src []byte, fullW, fullH, bin int) []byte {
+	outW, outH := fullW/bin, fullH/bin
+	out := make([]byte, outW*outH)
+	for oy := 0; oy < outH; oy++ {
+		row0 := 2*bin*(oy/2) + oy&1
+		for ox := 0; ox < outW; ox++ {
+			col0 := 2*bin*(ox/2) + ox&1
+			sum := 0
+			for i := 0; i < bin; i++ {
+				r := row0 + 2*i
+				if r >= fullH {
+					break
+				}
+				for j := 0; j < bin; j++ {
+					cc := col0 + 2*j
+					if cc >= fullW {
+						break
+					}
+					sum += int(src[r*fullW+cc])
+				}
+			}
+			if sum > 0xff {
+				sum = 0xff
+			}
+			out[oy*outW+ox] = byte(sum)
+		}
+	}
+	return out
+}
+
+// TestColorBinInPlace: the in-place color bins (no scratch allocation, E3) equal the
+// scratch-buffer reference for every geometry the driver produces, including edge widths that
+// are not a multiple of 2·bin (partial blocks) and bin 3/4. The frame content varies per pixel
+// and per Bayer phase, so any read of an already-overwritten sample changes the result.
+func TestColorBinInPlace(t *testing.T) {
+	geoms := []struct{ w, h, bin int }{
+		{16, 8, 2}, {24, 12, 2}, {26, 10, 2}, {24, 12, 3}, {30, 14, 3}, {32, 16, 4}, {36, 18, 4},
+		{640, 480, 2}, {642, 482, 2}, {96, 60, 4},
+	}
+	for _, g := range geoms {
+		src16 := make([]byte, g.w*g.h*2)
+		src8 := make([]byte, g.w*g.h)
+		for y := 0; y < g.h; y++ {
+			for x := 0; x < g.w; x++ {
+				v := (x*7 + y*131 + (x&1)*3000 + (y&1)*12000 + (x*y)%97) & 0xffff
+				src16[(y*g.w+x)*2] = byte(v)
+				src16[(y*g.w+x)*2+1] = byte(v >> 8)
+				src8[y*g.w+x] = byte((x*3 + y*5 + (x&1)*40 + (y&1)*80) & 0x3f)
+			}
+		}
+		want16 := colorBinRAW16Ref(src16, g.w, g.h, g.bin)
+		buf16 := append([]byte(nil), src16...)
+		n := colorBinRAW16(buf16, g.w, g.h, g.bin)
+		if n != len(want16) || string(buf16[:n]) != string(want16) {
+			t.Errorf("colorBinRAW16 %dx%d bin %d: in-place result differs from the reference", g.w, g.h, g.bin)
+		}
+		want8 := colorSumBinRAW8Ref(src8, g.w, g.h, g.bin)
+		buf8 := append([]byte(nil), src8...)
+		n = colorSumBinRAW8(buf8, g.w, g.h, g.bin)
+		if n != len(want8) || string(buf8[:n]) != string(want8) {
+			t.Errorf("colorSumBinRAW8 %dx%d bin %d: in-place result differs from the reference", g.w, g.h, g.bin)
 		}
 	}
 }

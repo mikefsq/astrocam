@@ -13,10 +13,10 @@ import (
 type GuideDir uint8
 
 const (
-	GuideNorth GuideDir = iota // 0 — +Dec
-	GuideSouth                 // 1 — -Dec
-	GuideEast                  // 2 — +RA
-	GuideWest                  // 3 — -RA
+	GuideNorth GuideDir = iota // 0: +Dec
+	GuideSouth                 // 1: -Dec
+	GuideEast                  // 2: +RA
+	GuideWest                  // 3: -RA
 )
 
 func (d GuideDir) String() string {
@@ -33,13 +33,10 @@ func (d GuideDir) String() string {
 	return "?"
 }
 
-// st4Out issues one ST4 pulse command (the vendor's ST4On/ST4Off request, 0xB0/0xB1 on ZWO),
-// UNGATED when the transport offers it (see UngatedControlSender): a pulse edge must never queue
-// behind a whole-frame read holding ioMu; the SDK's own pulses are issued concurrently with its
-// capture thread's bulk stream (CCameraBase::pulseGuide, 0154_CCameraBase.o: SendCMD(0xB0) →
-// usleep(ms) → SendCMD(0xB1), and the capture thread never holds the API mutex). Falls back to
-// the gated ControlOut on backends without the capability. A vendor with the request not
-// decoded errors instead of sending another vendor's opcode.
+// st4Out issues one ST4 pulse command (the vendor's ST4On/ST4Off request, 0xB0/0xB1 on ZWO)
+// through UngatedControlSender when the transport offers it, else the gated ControlOut. The
+// SDK's shape is CCameraBase::pulseGuide: SendCMD(0xB0) → usleep(ms) → SendCMD(0xB1). A vendor
+// with the request not decoded errors instead of sending another vendor's opcode.
 func (c *Camera) st4Out(on bool, dir GuideDir) error {
 	code, what := c.vend.Cmds.ST4Off, "ST4Off"
 	if on {
@@ -69,8 +66,8 @@ func (c *Camera) PulseGuideOn(dir GuideDir) error {
 }
 
 // PulseGuideOff releases the ST4 line for dir (ZWO SendCMD 0xB1, wValue=dir). The line state
-// clears only when the release reached the camera; after an error the line may still be
-// asserted, so IsPulseGuiding keeps reporting true.
+// clears only when the release reached the camera, so after an error IsPulseGuiding keeps
+// reporting true.
 func (c *Camera) PulseGuideOff(dir GuideDir) error {
 	if dir > GuideWest {
 		return nil
@@ -84,8 +81,8 @@ func (c *Camera) PulseGuideOff(dir GuideDir) error {
 	return nil
 }
 
-// PulseGuide asserts dir, waits d (host-timed), then releases, the object's
-// CCameraBase::pulseGuide shape; the firmware does not gate the pulse width.
+// PulseGuide asserts dir, waits d (host-timed), then releases; the firmware does not gate the
+// pulse width.
 func (c *Camera) PulseGuide(dir GuideDir, d time.Duration) error {
 	c.mu.Lock()
 	c.st4Pulses++
@@ -102,9 +99,8 @@ func (c *Camera) PulseGuide(dir GuideDir, d time.Duration) error {
 	return c.PulseGuideOff(dir)
 }
 
-// IsPulseGuiding reports whether any ST4 line is asserted or a host-timed PulseGuide is
-// in flight (the ASCOM IsPulseGuiding backing state). Line state is tracked per direction, so
-// overlapping On/On/Off/Off from concurrent callers resolves correctly.
+// IsPulseGuiding reports whether any ST4 line is asserted or a host-timed PulseGuide is in
+// flight.
 func (c *Camera) IsPulseGuiding() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

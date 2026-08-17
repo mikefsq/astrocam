@@ -1,19 +1,13 @@
 package astrocam
 
-// Host-side TEC cooling control: regulation step, PID init, setpoint ramp,
-// power-to-DAC conversion, and the cooling worker goroutine. The temperature loop
-// runs on the host over camera primitives: read sensor temperature, set TEC drive,
-// fan and anti-dew heater on/off, read humidity.
+// Host-side TEC cooling control: regulation step, setpoint ramp, and the cooling goroutine,
+// over a Thermal seam (read sensor temperature, set TEC drive, fan and anti-dew heater, read
+// humidity). The seam is decoupled from USB, so the loop is unit-testable against a simulated
+// thermal plant; a real camera supplies a Thermal backed by control transfers.
 //
-// The controller drives a Thermal seam (decoupled from USB), so the loop is
-// unit-testable against a simulated thermal plant (see cooling_test.go). A real
-// camera supplies a Thermal backed by control transfers.
-//
-// The controller is the velocity (incremental) form of the PID: Δpower per tick,
-// with the TEC drive itself as the accumulator (see Step). A deep setpoint arrives
-// fast (the drive saturates during the descent) then settles at the correct holding
-// power for any depth without integral windup. Per-model gains (Kp/Ki/Kd) are
-// exposed as tunables with velocity-form defaults.
+// The controller is the velocity (incremental) form of the PID: Δpower per tick, with the TEC
+// drive itself as the accumulator (see Step). A deep setpoint arrives fast (the drive saturates
+// during the descent) and settles at the holding power for any depth without integral windup.
 
 import (
 	"context"
@@ -23,13 +17,13 @@ import (
 	"time"
 )
 
-// Thermal is the per-camera hardware seam the cooling loop drives. A real backend
-// maps these to control transfers; tests map them to a simulated plant.
+// Thermal is the per-camera hardware seam the cooling loop drives. A real backend maps these to
+// control transfers; tests map them to a simulated plant.
 type Thermal interface {
 	// ReadTemp returns the sensor temperature in °C (GetSensorTemp).
 	ReadTemp() (float64, error)
-	// SetTECPower sets the thermoelectric cooler drive, 0..100 % (SetPowerPerc →
-	// the power-to-DAC conversion → SendCMD 0xB2, or SetFPGACoolPower on FPGA-cooled models).
+	// SetTECPower sets the thermoelectric cooler drive, 0..100 % (SetPowerPerc → the
+	// power-to-DAC conversion → SendCMD 0xB2, or SetFPGACoolPower on FPGA-cooled models).
 	SetTECPower(percent float64) error
 	// SetFan turns the cooling fan on/off (SetFanOn).
 	SetFan(on bool) error
@@ -39,18 +33,17 @@ type Thermal interface {
 	ReadHumidity() (int, error)
 }
 
-// prevErrSentinel is the "no previous error yet" marker (−200 °C). While set, the
-// velocity form's difference terms (Kp on e−e₁, Kd on e−2e₁+e₂) are skipped so the
-// first ticks don't kick on a bogus error delta.
+// prevErrSentinel is the "no previous error yet" marker (−200 °C). While set, the velocity
+// form's difference terms (Kp on e−e₁, Kd on e−2e₁+e₂) are skipped so the first ticks do not
+// act on a bogus error delta.
 const prevErrSentinel = -200.0
 
-// CoolerConfig holds the cooling-loop tunables. Gains are per-model; set them from
-// the camera profile when known.
+// CoolerConfig holds the cooling-loop tunables. Gains are per-model; set them from the camera
+// profile when known.
 type CoolerConfig struct {
-	// Kp, Ki, Kd are the velocity-form PID gains (Δpower = Kp·(e−e₁) + Ki·e +
-	// Kd·(e−2e₁+e₂)). Ki sets how fast the drive ramps toward the setpoint (arrival
-	// speed); Kp and Kd damp the approach. Ki is a per-tick ramp rate, not an integral
-	// weight.
+	// Kp, Ki, Kd are the velocity-form PID gains (Δpower = Kp·(e−e₁) + Ki·e + Kd·(e−2e₁+e₂)).
+	// Ki paces the drive ramp toward the setpoint (a per-tick ramp rate, not an integral
+	// weight); Kp and Kd damp the approach.
 	Kp, Ki, Kd float64
 
 	// Tick is the regulation period (default 200 ms).
@@ -59,34 +52,29 @@ type CoolerConfig struct {
 	// MaxPower clamps TEC drive (≤100 %).
 	MaxPower float64
 
-	// SlewPerStep caps how far TEC power may move in one tick, a hard safety limit on
-	// top of the velocity form's own Ki-paced ramp. 0 disables (the form self-limits).
+	// SlewPerStep caps how far TEC power may move in one tick, a hard safety limit on top of the
+	// velocity form's own Ki-paced ramp. 0 disables.
 	SlewPerStep float64
 
-	// RampRate is the cooldown/warmup setpoint slew in °C per minute (tick-independent):
-	// the effective target walks toward the final target at this rate, seeded at the
-	// current temperature. The Alpaca-facing "cooldown rate" knob. 0 = jump straight to
-	// the target.
+	// RampRate is the cooldown/warmup setpoint slew in °C per minute (tick-independent): the
+	// effective target walks toward the final target at this rate, seeded at the current
+	// temperature. The Alpaca-facing "cooldown rate" knob. 0 = jump straight to the target.
 	RampRate float64
 
-	// RateGuard skips regulation when |dTemp/dt| exceeds this (°C/s), to avoid fighting a
-	// fast thermal swing. 0 disables.
+	// RateGuard skips regulation when |dTemp/dt| exceeds this (°C/s), to avoid fighting a fast
+	// thermal swing. 0 disables.
 	RateGuard float64
 
-	// MaxError clamps the error |temp − setpoint| the PID acts on, in °C (symmetric):
-	// the drive only creeps (Ki·MaxError per tick) so the approach in either direction is
-	// gentle and overshoot-free. Applies on cooldown and warmup. 0 disables (full error →
-	// fast arrival).
+	// MaxError clamps the error |temp − setpoint| the PID acts on, in °C (symmetric): the drive
+	// only creeps (Ki·MaxError per tick), so the approach in either direction is gentle and
+	// overshoot-free. 0 disables.
 	MaxError float64
 }
 
-// DefaultCoolerConfig returns conservative defaults. Gains are a starting point;
-// tune per model.
+// DefaultCoolerConfig returns conservative defaults: velocity-form PI (Kd = 0), Kp=0.6, Ki=0.2.
+// Gains are a starting point; tune per model.
 func DefaultCoolerConfig() CoolerConfig {
 	return CoolerConfig{
-		// Velocity-form PI (Kd = 0): Kp=0.6, Ki=0.2, with e = temp−setpoint and
-		// Δ = Kp·(e−e₁) + Ki·e + Kd·(e−2e₁+e₂). Ki paces the drive ramp (arrival speed),
-		// Kp damps the approach.
 		Kp:          0.6,
 		Ki:          0.20,
 		Kd:          0.0,
@@ -98,12 +86,14 @@ func DefaultCoolerConfig() CoolerConfig {
 	}
 }
 
-// Cooler is the host-side PID cooling loop over a Thermal. Safe for the Run
-// goroutine to regulate while others call SetTarget/Stop/Power/Target; all state
-// access is guarded by mu.
+// Cooler is the host-side PID cooling loop over a Thermal. Safe for the Run goroutine to
+// regulate while others call SetTarget/Power/Target; all mutable state is guarded by mu.
 type Cooler struct {
-	io  Thermal
 	cfg CoolerConfig
+
+	// io is the thermal seam the loop drives, fixed at construction: EnableCooling starts a new
+	// loop rather than moving a running one onto another backend.
+	io Thermal
 
 	mu       sync.Mutex
 	target   float64 // final target temperature, °C
@@ -136,9 +126,8 @@ func NewCooler(io Thermal, cfg CoolerConfig) *Cooler {
 	return &Cooler{io: io, cfg: normalizeCoolerConfig(cfg), prevErr: prevErrSentinel, prevErr2: prevErrSentinel}
 }
 
-// SetConfig applies new tunables to a running cooler (gains, limits, ramp, guard), with
-// the same zero-value normalization as NewCooler. Run reads Tick once at start, so a
-// Tick change takes effect only on a future Run. Safe to call while Run is regulating.
+// SetConfig applies new tunables to a running cooler, with the same zero-value normalization as
+// NewCooler. Run reads Tick once at start, so a Tick change takes effect only on a future Run.
 func (c *Cooler) SetConfig(cfg CoolerConfig) {
 	cfg = normalizeCoolerConfig(cfg)
 	c.mu.Lock()
@@ -146,28 +135,27 @@ func (c *Cooler) SetConfig(cfg CoolerConfig) {
 	c.mu.Unlock()
 }
 
-// SetTarget arms cooling toward target °C: seeds the effective target at the current
-// temperature so the ramp eases in from where we are, and clears the error history.
-// Does not reset power: in the velocity form the current drive is the accumulator,
-// so a retarget continues from the present power.
+// SetTarget arms cooling toward target °C: it seeds the effective target at the current
+// temperature (so the ramp starts from there) and clears the error history. Power is not
+// reset: the current drive is the accumulator, so a retarget continues from it. The
+// temperature read happens outside mu (a USB2 readout can hold the transfer for seconds, and
+// Power/Target polls must not wait behind it).
 func (c *Cooler) SetTarget(target float64) {
+	t, err := c.io.ReadTemp()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.target = target
 	c.on = true
 	c.prevErr = prevErrSentinel
 	c.prevErr2 = prevErrSentinel
-	if t, err := c.io.ReadTemp(); err == nil {
-		c.effTgt = t // anti-shock: start the ramp from the current temperature
+	if err == nil {
+		c.effTgt = t
 		c.lastT = t
 		c.primed = true
 	} else {
 		c.effTgt = target
 	}
 }
-
-// Stop disengages regulation (does not actively warm; call SetTarget to resume).
-func (c *Cooler) Stop() { c.mu.Lock(); c.on = false; c.mu.Unlock() }
 
 // Target returns the final target and the current ramped (effective) setpoint.
 func (c *Cooler) Target() (final, effective float64) {
@@ -179,17 +167,16 @@ func (c *Cooler) Target() (final, effective float64) {
 // Power returns the last TEC power % applied.
 func (c *Cooler) Power() float64 { c.mu.Lock(); defer c.mu.Unlock(); return c.power }
 
-// rampTarget advances the effective target toward the final target by RampRate (°C/min)
-// scaled to this tick's elapsed dt (a time-based anti-shock ramp). RampRate 0 = jump
-// straight to the target.
+// rampTarget advances the effective target toward the final target by RampRate (°C/min) scaled
+// to this tick's elapsed dt. RampRate 0 = jump straight to the target.
 func (c *Cooler) rampTarget(dt time.Duration) {
 	if c.cfg.RampRate <= 0 {
-		c.effTgt = c.target // no ramp configured: go straight to the target
+		c.effTgt = c.target
 		return
 	}
 	step := c.cfg.RampRate / 60 * dt.Seconds() // °C of setpoint movement this tick
 	if step <= 0 {
-		return // dt ≤ 0 (clock stall / degenerate tick): hold; never collapse the anti-shock ramp
+		return // dt ≤ 0 (clock stall): hold rather than collapse the ramp
 	}
 	if d := c.target - c.effTgt; math.Abs(d) <= step {
 		c.effTgt = c.target
@@ -200,63 +187,81 @@ func (c *Cooler) rampTarget(dt time.Duration) {
 	}
 }
 
-// SetRampRate sets the cooldown/warmup setpoint slew in °C per minute, the Alpaca
-// "cooldown rate" setting. 0 disables the ramp. Safe to call while Run is regulating.
+// SetRampRate sets the cooldown/warmup setpoint slew in °C per minute (CoolerConfig.RampRate).
+// 0 disables the ramp.
 func (c *Cooler) SetRampRate(degPerMin float64) {
 	c.mu.Lock()
 	c.cfg.RampRate = degPerMin
 	c.mu.Unlock()
 }
 
-// SeedPower sets the current TEC drive to pct %: in the velocity form the power is
-// the accumulator, so this warm-starts (or restores on reconnect) the controller at
-// a known drive instead of from 0. The loop then regulates from there. Safe to call
-// while Run runs.
+// SeedPower sets the current TEC drive to pct %: the power is the accumulator, so this
+// warm-starts (or restores on reconnect) the controller at a known drive instead of from 0.
 func (c *Cooler) SeedPower(pct float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.power = clampf(pct, 0, c.cfg.MaxPower) // power IS the accumulator
+	c.power = clampf(pct, 0, c.cfg.MaxPower)
 }
 
-// Step runs one regulation cycle: read temperature, (optionally) guard against a
-// fast transient, advance the setpoint ramp, run the PID, clamp + slew-limit the
-// TEC power, and apply it. dt is the elapsed time since the previous Step, used
-// only by the rate guard. It returns the temperature read this cycle.
+// Step runs one regulation cycle: read temperature, guard against a fast transient, advance the
+// setpoint ramp, run the PID, clamp + slew-limit the TEC power, and apply it. dt is the elapsed
+// time since the previous Step (used by the rate guard and the ramp). It returns the temperature
+// read this cycle. Run is its only caller in the driver (tests drive it directly); the two USB
+// transfers (the temperature read and the
+// drive write) run outside mu so Power/Target/SetTarget never wait behind a gated readout.
 func (c *Cooler) Step(dt time.Duration) (float64, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	temp, err := c.io.ReadTemp()
 	if err != nil {
 		return 0, err
 	}
-	if !c.on {
-		c.lastT, c.primed = temp, true
+	target, e, apply := c.plan(temp, dt)
+	if !apply {
 		return temp, nil
+	}
+	if err := c.io.SetTECPower(target); err != nil {
+		return temp, err
+	}
+	c.mu.Lock()
+	c.power = target
+	c.prevErr2, c.prevErr = c.prevErr, e
+	c.mu.Unlock()
+	return temp, nil
+}
+
+// plan is Step's state update under mu: it records the temperature, applies the rate guard and
+// the setpoint ramp, and runs the PID; it returns the drive to apply and whether to apply it
+// (false: regulation off, or the rate guard skipped this cycle).
+func (c *Cooler) plan(temp float64, dt time.Duration) (target, err float64, apply bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// The temperature history belongs to the reading, so it advances on every successful read
+	// whatever becomes of the drive write: measuring one tick of drift over two ticks of dt
+	// would read a steady ramp as a transient.
+	prevT, primed := c.lastT, c.primed
+	c.lastT, c.primed = temp, true
+	if !c.on {
+		return 0, 0, false
 	}
 
 	// Rate-of-change guard: during a fast swing, skip this step.
-	if c.cfg.RateGuard > 0 && c.primed && dt > 0 {
-		if rate := math.Abs(temp-c.lastT) / dt.Seconds(); rate > c.cfg.RateGuard {
-			c.lastT = temp
-			return temp, nil
+	if c.cfg.RateGuard > 0 && primed && dt > 0 {
+		if rate := math.Abs(temp-prevT) / dt.Seconds(); rate > c.cfg.RateGuard {
+			return 0, 0, false
 		}
 	}
 
 	c.rampTarget(dt)
 
-	// Velocity (incremental) PID: the output power is the accumulator (clamped to
-	// [0, MaxPower]), so it cannot wind up and holds its value at zero error, settling at
-	// the steady-state holding power for any setpoint depth.
+	// Velocity (incremental) PID: the output power is the accumulator (clamped to [0, MaxPower]),
+	// so it cannot wind up and holds its value at zero error.
 	//
 	//	Δpower = Kp·(e − e₁) + Ki·e + Kd·(e − 2·e₁ + e₂)
 	//
-	// On the first tick only Ki·e applies (no e₁ yet); on the second, the Kp term joins;
-	// from the third the Kd term joins.
+	// The first tick applies Ki·e alone (no e₁ yet), the second adds the Kp term, and the third
+	// adds Kd.
 	e := temp - c.effTgt // error: positive = too warm, cool harder
 	if c.cfg.MaxError > 0 {
-		// Clamp the error symmetrically: the loop never acts on more than MaxError, so the
-		// drive only creeps and the approach in either direction is gentle. prevErr stores
-		// the clamped error so the damping term stays consistent.
+		// prevErr stores the clamped error so the damping term stays consistent.
 		e = clampf(e, -c.cfg.MaxError, c.cfg.MaxError)
 	}
 	du := c.cfg.Ki * e
@@ -266,30 +271,25 @@ func (c *Cooler) Step(dt time.Duration) (float64, error) {
 			du += c.cfg.Kd * (e - 2*c.prevErr + c.prevErr2)
 		}
 	}
-	c.prevErr2 = c.prevErr
-	c.prevErr = e
-
-	target := clampf(c.power+du, 0, c.cfg.MaxPower)
+	// e is returned rather than stored: the difference terms above are differences against the
+	// increment the TEC actually received, so the history moves only once Step's drive write
+	// lands (a failed write leaves this tick out of the history entirely).
+	target = clampf(c.power+du, 0, c.cfg.MaxPower)
 	if c.cfg.SlewPerStep > 0 {
 		target = slew(c.power, target, c.cfg.SlewPerStep)
 	}
-	if err := c.io.SetTECPower(target); err != nil {
-		return temp, err
-	}
-	c.power = target
-	c.lastT, c.primed = temp, true
-	return temp, nil
+	return target, e, true
 }
 
-// runMaxConsecFails is how many consecutive Step failures Run tolerates before it gives up.
-// One transient EP0 error (a timeout during a capture-recovery bus reset, say) must not kill
-// regulation with the TEC still energized; ~30 s of solid failures means the device is gone.
+// runMaxConsecFails is how many consecutive Step failures Run tolerates before it gives up: one
+// transient EP0 error (a timeout during a capture-recovery bus reset) must not stop regulation
+// with the TEC energized; 15 in a row (3 s of immediate failures at the 200 ms tick, ~10 s when
+// each is a control-transfer timeout) means the device is gone.
 const runMaxConsecFails = 15
 
-// Run drives Step on the configured Tick until ctx is canceled. Call it in its own
-// goroutine. Transient Step errors are tolerated (the loop keeps ticking and re-tries);
-// after runMaxConsecFails consecutive failures it drives the TEC to zero (best-effort;
-// never leave an unregulated TEC at its last power) and returns the last error.
+// Run drives Step on the configured Tick until ctx is canceled. Call it in its own goroutine.
+// Transient Step errors are tolerated; after runMaxConsecFails consecutive failures it drives
+// the TEC to zero (best-effort) and returns the last error.
 func (c *Cooler) Run(ctx context.Context) error {
 	c.mu.Lock()
 	tick := c.cfg.Tick
@@ -303,10 +303,9 @@ func (c *Cooler) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
-			// dt from the wall clock, not the tick timestamp: a Step blocked behind a long
-			// readout (ioMu) leaves a stale tick in the channel, and its old timestamp would
-			// understate dt; the rate guard then reads a slow real drift as a fast swing
-			// (Δtemp over 30 s divided by 200 ms) and skips regulation.
+			// dt comes from the wall clock, not the tick timestamp: a Step blocked behind a
+			// long readout (ioMu) leaves a stale tick in the channel whose timestamp understates
+			// dt, and the rate guard would then read a slow drift as a fast swing.
 			now := time.Now()
 			if _, err := c.Step(now.Sub(last)); err != nil {
 				fails++

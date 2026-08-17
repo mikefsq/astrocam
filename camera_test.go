@@ -5,8 +5,7 @@ import (
 	"time"
 )
 
-// fakeTransport records control transfers and serves canned IN replies, so the
-// protocol is testable with no hardware and no libusb.
+// fakeTransport records control transfers and serves canned IN replies.
 type fakeTransport struct {
 	out     []ctrlCall
 	inReply map[uint8][]byte
@@ -30,8 +29,8 @@ func (f *fakeTransport) ControlIn(b uint8, _, _ uint16, d []byte) (int, error) {
 func (f *fakeTransport) BulkRead(_ []byte, _ time.Duration) (int, error) { return 0, nil }
 func (f *fakeTransport) Close() error                                    { return nil }
 
-// testSensor is a minimal in-package profile for exercising Open + the control
-// flow without importing the sensors package.
+// testSensor is a minimal in-package profile for exercising Open + the control flow without
+// importing the sensors package.
 var testSensor = Sensor{
 	Name:    "TEST",
 	Info:    CameraInfo{MaxWidth: 100, MaxHeight: 100, BitDepth: 12},
@@ -72,8 +71,8 @@ func TestWriteRegBits(t *testing.T) {
 	}
 }
 
-// TestFPGAandVMAX checks the FPGA register space and the SetVMAX helper match
-// WriteFPGAREG (0xBD) / SetFPGAVMAX (strobe + 0x10/11/12).
+// TestFPGAandVMAX: SetVMAX emits WriteFPGAREG (0xBD) strobe open, 0x10/0x11/0x12 little-endian,
+// strobe close.
 func TestFPGAandVMAX(t *testing.T) {
 	f := &fakeTransport{}
 	rm := &zwoRegmap{t: f}
@@ -85,7 +84,7 @@ func TestFPGAandVMAX(t *testing.T) {
 		{reqWriteFPGAReg, 0x10, 0x56}, // VMAX byte 0
 		{reqWriteFPGAReg, 0x11, 0x34}, // VMAX byte 1
 		{reqWriteFPGAReg, 0x12, 0x12}, // VMAX byte 2
-		{reqWriteFPGAReg, 0x01, 0},    // strobe close (commit; pcap-confirmed)
+		{reqWriteFPGAReg, 0x01, 0},    // strobe close (commit; wire-confirmed)
 	}
 	if len(f.out) != len(want) {
 		t.Fatalf("SetVMAX produced %d calls, want %d: %+v", len(f.out), len(want), f.out)
@@ -97,7 +96,7 @@ func TestFPGAandVMAX(t *testing.T) {
 	}
 }
 
-// TestCameraBus confirms a BusCamera sensor routes WriteReg to 0xA6, not 0xB6.
+// TestCameraBus: a BusCamera sensor routes WriteReg to 0xA6, not 0xB6.
 func TestCameraBus(t *testing.T) {
 	f := &fakeTransport{}
 	rm := &zwoRegmap{t: f, bus: BusCamera}
@@ -118,9 +117,8 @@ func TestFirmwareVersion(t *testing.T) {
 	}
 }
 
-// TestSerialNumber locks GetSerialNumber: a single vendor
-// control-IN, bRequest 0xC8 / wValue 0 / wIndex 0, returning the 8 raw ASI_ID
-// bytes verbatim (no little-endian register fold), formatted as lowercase hex.
+// TestSerialNumber: GetSerialNumber is a single vendor control-IN, bRequest 0xC8 / wValue 0 /
+// wIndex 0, returning the 8 raw ASI_ID bytes verbatim, formatted as lowercase hex.
 func TestSerialNumber(t *testing.T) {
 	st := NewStubTransport()
 	st.Serial = Serial{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}

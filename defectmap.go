@@ -6,9 +6,8 @@ import (
 )
 
 // DefectMap is the camera's factory hot/dead-pixel map: the per-unit list of defective sensor
-// pixels burned into SPI flash at manufacture. Read once from flash (LoadDefectMap),
-// decompressed, then optionally applied to a captured frame to substitute each defect with its
-// neighbours. Not applied by default; callers opt in.
+// pixels burned into SPI flash at manufacture. Read once from flash (LoadDefectMap), then
+// optionally applied to a captured frame (ApplyRAW16). Not applied by default.
 type DefectMap struct {
 	W, H    int    // full-sensor dimensions the map is indexed in
 	Color   bool   // Bayer sensor → same-colour neighbour stride 2 (mono → 1)
@@ -29,7 +28,9 @@ func (m *DefectMap) isDefect(p int) bool {
 
 // LoadDefectMap reads and decompresses the factory defect map from SPI flash (FlashHPCMapAddr).
 // fullW×fullH are the full-sensor dimensions the map is indexed in. The blob is an "ASID" header
-// (magic + big-endian payload length) followed by a sparse-RLE 1-bit-per-pixel bitmap. Returns
+// (magic + a big-endian length that counts the header too, not just the payload: the decoder
+// rejects < 9 and rounds it up to a 2048 boundary) followed by a sparse-RLE 1-bit-per-pixel
+// bitmap. Returns
 // an error if no valid "ASID" map is present.
 func (c *Camera) LoadDefectMap(fullW, fullH int) (*DefectMap, error) {
 	head, err := c.ReadSPIFlash(FlashHPCMapAddr, 2048)
@@ -51,8 +52,8 @@ func (c *Camera) LoadDefectMap(fullW, fullH int) (*DefectMap, error) {
 	return parseDefectMap(blob, length, fullW, fullH, c.Color()), nil
 }
 
-// parseDefectMap decompresses an "ASID" blob (header included) into a DefectMap, the
-// pure parsing half of LoadDefectMap, split out so it is testable without flash I/O.
+// parseDefectMap decompresses an "ASID" blob (header included) into a DefectMap: the parsing
+// half of LoadDefectMap, testable without flash I/O.
 func parseDefectMap(blob []byte, length, fullW, fullH int, color bool) *DefectMap {
 	m := &DefectMap{W: fullW, H: fullH, Color: color}
 	m.bitmap = decompressASID(blob, length, fullW*fullH)
@@ -64,8 +65,7 @@ func parseDefectMap(blob []byte, length, fullW, fullH int, color bool) *DefectMa
 		for bit := 0; bit < 8; bit++ {
 			if b&(1<<uint(bit)) != 0 {
 				// Tail bits of the last bitmap byte are padding, not pixels (0xFF flash fill
-				// would otherwise flag p ≥ W·H and ApplyRAW16's setpx would write past the
-				// frame end).
+				// would flag p ≥ W·H and ApplyRAW16 would write past the frame end).
 				if p := k*8 + bit; p < npix {
 					m.Defects = append(m.Defects, p)
 				}

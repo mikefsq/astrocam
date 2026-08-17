@@ -2,10 +2,8 @@ package astrocam
 
 import "testing"
 
-// TestColorMonoShareSensor verifies the core architecture: one sensor profile
-// serves both a color (MC) and a mono (MM) model. The die is mono; the CFA
-// pattern is surfaced by Info only when Model.Color is set. Color is a Model
-// flag, not a different register profile.
+// TestColorMonoShareSensor: one sensor profile serves both a color (MC) and a mono (MM) model;
+// the CFA pattern is surfaced by Info only when Model.Color is set.
 func TestColorMonoShareSensor(t *testing.T) {
 	die := Sensor{Name: "DIE", Info: CameraInfo{MaxWidth: 1936, MaxHeight: 1216, BitDepth: 12, Bayer: "RGGB"}}
 	Register(ZWO.VID, 0x0C01, Model{Name: "Mono", Sensor: &die, Color: false})
@@ -34,7 +32,7 @@ func TestColorMonoShareSensor(t *testing.T) {
 		t.Error("color model should report Color() == true")
 	}
 
-	// Both bind the same sensor profile — the difference is purely the Model flag.
+	// Both bind the same sensor profile; the difference is the Model flag.
 	if mono.Sensor() != color.Sensor() {
 		t.Error("mono and color models should share one sensor profile")
 	}
