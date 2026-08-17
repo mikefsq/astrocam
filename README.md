@@ -1,17 +1,14 @@
 # astrocam: Go astronomy camera driver
 
 astrocam is a Go driver for astronomy CMOS cameras built on the Cypress FX3 bridge and Sony
-sensors. It speaks the cameras' USB protocol directly, with no vendor SDK in the process.
+sensors. It implements this USB protocol directly, so no vendor SDK is needed.
 
-The driver is cgo-free except for the macOS USB backend. Linux and Windows build with
-`CGO_ENABLED=0`; macOS uses IOUSBHost through cgo.
 
 ## Vendor independence
 
 A `(VID,PID) → Model` registry and a `VID → Vendor` dialect map let one sensor profile, keyed by
-the Sony die, serve every vendor that uses that die. ZWO and PlayerOne share the IMX455 and
-IMX571 profiles. The vendors differ in their register-map opcodes (`Regmap`) and their
-gain/offset unit scale, selected at call time from the regmap's VID. Each vendor registers itself
+the Sony die, serve every vendor that uses that die. Vendors differ in their register-map opcodes 
+(`Regmap`) and their gain/offset unit scale. Each supported vendor registers its dialect
 from `init()`: ZWO in `protocol.go`, PlayerOne in `protocol_poa.go`.
 
 ## Layout
@@ -40,9 +37,6 @@ sensors/               per-die sensor profiles (data templates over the shared e
 cmd/gosnap/            bring-up + capture CLI
 ```
 
-macOS, Linux and Windows have a USB backend. Other platforms compile and run the stub transport
-and tests; `OpenHost`, `OpenLocation` and `Enumerate` return an error there.
-
 ## Driver status
 
 The driver covers the control and data plane, cooling PID, ST4 guiding, and snap/stream
@@ -53,18 +47,16 @@ exposures.
 Hardware-validated on the wire:
 
 - **ASI6200MM/MC Pro (IMX455)**: full frame pixel-matched to the SDK, optical-black crop, FX3
-  DDR frame-marker repair (on by default), factory hot-pixel map repair (off by default).
+  DDR frame-marker repair, factory hot-pixel map repair.
 - **ASI290MM Mini (IMX290)**.
-- **ASI462MC (IMX462)**: 12-bit and 10-bit high-speed; FX3 frame-marker repair (a per-sensor
-  opt-in).
+- **ASI462MC (IMX462)**: 12-bit and 10-bit high-speed; FX3 frame-marker repair.
 - **ASI174MM Mini (IMX174)**: global shutter, no hardware binning.
 
 Decoded but not validated on hardware:
 
 - **ASI2600 family (IMX571)**: tracks the IMX455 profile.
 - **IMX178**, **IMX585**.
-- **PlayerOne models** (Apollo, Sedna, Mars/Ceres, Zeus, Poseidon, Uranus): registered over the
-  shared profiles through the PlayerOne regmap dialect; no PlayerOne camera has been driven.
+-
 
 ## Build and test
 
