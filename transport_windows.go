@@ -876,6 +876,8 @@ func OpenHost(vid, pid uint16) (Transport, error) {
 func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 	var out []DeviceInfo
 	for _, n := range scanWinUSB(vid, 0) {
+		// Attachment stays 0: the device-interface path is the same after a replug and WinUSB
+		// offers no per-enumeration identity here, so presence is judged by Location alone.
 		out = append(out, DeviceInfo{VID: n.vid, PID: n.pid, Location: pathLocation(n.path)})
 	}
 	return out, nil

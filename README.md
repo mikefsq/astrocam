@@ -31,6 +31,9 @@ from `init()`: ZWO in `protocol.go`, PlayerOne in `protocol_poa.go`.
   transport_linux.go   Linux   (usbfs, pure Go; needs udev access to the camera VID)
   transport_windows.go Windows (WinUSB, pure Go)
   transport_stub.go    in-memory stub transport for hardware-free tests (all platforms)
+  hotplug.go           Hotplug: attach and detach notifications; hotplug_darwin.go (IOKit
+                       matching notifications), hotplug_linux.go (uevent netlink),
+                       hotplug_windows.go (CM_Register_Notification)
   *_test.go            unit + e2e tests (stdlib only, no hardware)
 sensors/               per-die sensor profiles (data templates over the shared engine)
   imx174 imx178 imx290 imx455 imx462 imx571 imx585  + models.go, sensors_test.go

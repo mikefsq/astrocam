@@ -12,6 +12,13 @@ type DeviceInfo struct {
 	VID, PID uint16
 	Name     string // USB product-name string, e.g. "ASI6200MC Pro"
 	Location uint32 // platform USB location id, stable per physical port; pass to OpenLocation
+	// Attachment identifies this plugging-in of the device: the OS assigns a new value every
+	// time the device enumerates, so a camera unplugged and replugged at the same port keeps
+	// its Location and gets a new Attachment. Compare it to the open handle's (Camera.Attachment)
+	// to tell continued presence from a replug that left the handle dead. macOS: the IORegistry
+	// entry id; Linux: busnum/devnum, the same value as Location; 0 where the platform offers
+	// no such identity (Windows), in which case only Location can be compared.
+	Attachment uint64
 }
 
 func (d DeviceInfo) String() string {

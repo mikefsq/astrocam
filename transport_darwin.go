@@ -44,6 +44,9 @@ typedef struct {
     IOUSBDeviceInterface**    dev;
     IOUSBInterfaceInterface** intf;
     UInt8 inPipe;
+    // entry is the IORegistry entry id of the opened device service: a fresh id on every
+    // enumeration, so a replug at the same locationID is told from continued presence.
+    uint64_t entry;
     // abort_gen is the ReadAborter latch: a generation AbortRead bumps, not a level it sets.
     // Each frame read snapshots it at entry and the reap loops abort the pipe once it no longer
     // matches. A clearable flag loses the abort when ArmRead lands inside the loops' 100 ms poll
@@ -178,6 +181,7 @@ static int open_svc(io_service_t svc, asicam_dev* out, asicam_diag* diag) {
         return -3;
     }
     out->dev = dev; out->intf = intf; out->inPipe = inPipe;
+    IORegistryEntryGetRegistryEntryID(svc, &out->entry);
     diag->inPipe = inPipe;
     return 0; // success: keep dev + intf
 }
@@ -207,6 +211,7 @@ static int reg_str(io_service_t svc, CFStringRef key, char* buf, int n) {
 typedef struct {
     uint16_t pid;
     uint32_t location;
+    uint64_t entry; // IORegistry entry id: new on every plugging-in
     char name[64];
 } asicam_devinfo;
 
@@ -233,6 +238,8 @@ static int asi_enumerate(uint16_t vid, asicam_devinfo* out, int max) {
                 reg_u32(svc, CFSTR("locationID"), &loc);
                 out[count].pid = (uint16_t)pid;
                 out[count].location = loc;
+                out[count].entry = 0;
+                IORegistryEntryGetRegistryEntryID(svc, &out[count].entry);
                 out[count].name[0] = 0;
                 reg_str(svc, CFSTR("USB Product Name"), out[count].name, (int)sizeof(out[count].name));
             }
@@ -1106,6 +1113,9 @@ const (
 type darwinDevice struct {
 	d    *C.asicam_dev
 	diag C.asicam_diag
+	// entry is the IORegistry entry id the handle was opened on, copied out at open so
+	// Attachment needs no access to d after Close.
+	entry uint64
 
 	// ioMu serializes gated EP0 control transfers against the whole-frame reads BulkRead,
 	// BulkReadQuiet (after its quiet window) and ReadFrameStreamPrequeued, so a control transfer
@@ -1165,6 +1175,7 @@ func openIOUSBHost(vid, pid uint16) (*darwinDevice, error) {
 		C.free(unsafe.Pointer(dev))
 		return nil, openError(vid, pid, &t.diag)
 	}
+	t.entry = uint64(dev.entry)
 	return t, nil
 }
 
@@ -1184,10 +1195,11 @@ func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 	out := make([]DeviceInfo, 0, n)
 	for i := 0; i < n; i++ {
 		out = append(out, DeviceInfo{
-			VID:      vid,
-			PID:      uint16(arr[i].pid),
-			Location: uint32(arr[i].location),
-			Name:     C.GoString(&arr[i].name[0]),
+			VID:        vid,
+			PID:        uint16(arr[i].pid),
+			Location:   uint32(arr[i].location),
+			Attachment: uint64(arr[i].entry),
+			Name:       C.GoString(&arr[i].name[0]),
 		})
 	}
 	return out, nil
@@ -1210,8 +1222,12 @@ func OpenLocation(vid uint16, loc uint32) (Transport, error) {
 		return nil, fmt.Errorf("astrocam: device at location 0x%08x found but interface/bulk setup failed (rc %d, %d endpoints, inPipe %d)",
 			loc, int(t.diag.ifaceKR), int(t.diag.numEndpoints), int(t.diag.inPipe))
 	}
+	t.entry = uint64(dev.entry)
 	return t, nil
 }
+
+// Attachment is the IORegistry entry id of the device this handle was opened on.
+func (t *darwinDevice) Attachment() uint64 { return t.entry }
 
 func openError(vid, pid uint16, d *C.asicam_diag) error {
 	switch {

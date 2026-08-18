@@ -100,6 +100,9 @@ const (
 // usbfsDevice is a usbfs-backed Transport for one open camera.
 type usbfsDevice struct {
 	f *os.File
+	// attachment is the busnum/devnum the node was opened at, DeviceInfo.Attachment's value:
+	// devnum is reassigned on every plugging-in.
+	attachment uint64
 	// closeMu is the Close interlock: every public I/O method holds it shared for the whole
 	// I/O (URB drain included) and Close takes it exclusively, so Close cannot close the fd
 	// under a drain and leave kernel-held pointers into the caller's buffer. Lock order:
@@ -207,6 +210,9 @@ func openNodeAndClaim(path string) (*usbfsDevice, uint16, uint16, error) {
 	vid := uint16(desc[8]) | uint16(desc[9])<<8
 	pid := uint16(desc[10]) | uint16(desc[11])<<8
 	d := &usbfsDevice{f: f, inPace: inPacer{min: usb2InPace}}
+	if bus, dev, err := busDevFromPath(path); err == nil {
+		d.attachment = uint64(usbNode{bus: bus, dev: dev}.location())
+	}
 	// Negotiated link speed from the bulk-IN endpoint's max packet size (SuperSpeed 1024,
 	// HighSpeed 512). The node read returns the active config/interface/endpoint descriptors,
 	// which reflect the negotiated speed, so a USB3 camera on a HighSpeed link reads as USB2 and
@@ -260,6 +266,9 @@ func openUSBFS(vid, pid uint16) (*usbfsDevice, error) {
 	}
 	return nil, fmt.Errorf("astrocam: no usbfs device for %04x:%04x (check udev permissions)", vid, pid)
 }
+
+// Attachment is the busnum/devnum this handle was opened at.
+func (d *usbfsDevice) Attachment() uint64 { return d.attachment }
 
 func (d *usbfsDevice) ioctl(req uintptr, arg unsafe.Pointer) error {
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.f.Fd(), req, uintptr(arg))
@@ -1026,7 +1035,7 @@ func OpenHost(vid, pid uint16) (Transport, error) {
 func enumerateRaw(vid uint16) ([]DeviceInfo, error) {
 	var out []DeviceInfo
 	for _, n := range scanUSB(vid, 0) {
-		out = append(out, DeviceInfo{VID: n.vid, PID: n.pid, Location: n.location()})
+		out = append(out, DeviceInfo{VID: n.vid, PID: n.pid, Location: n.location(), Attachment: uint64(n.location())})
 	}
 	return out, nil
 }

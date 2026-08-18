@@ -39,6 +39,12 @@ type Transport interface {
 	Close() error
 }
 
+// Attached is implemented by a Transport that knows which attachment of the device it holds
+// (DeviceInfo.Attachment). 0 means the platform offers no such identity.
+type Attached interface {
+	Attachment() uint64
+}
+
 // FrameStreamer reads one whole frame with a window of transfers cycling on EP 0x81. Large USB3
 // frames (IMX455/571) need it: a one-shot BulkRead truncates them.
 type FrameStreamer interface {

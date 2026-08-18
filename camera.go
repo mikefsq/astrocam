@@ -192,6 +192,17 @@ func (c *Camera) ST4() bool { return c.model.ST4 }
 // driving open-loop at its last power. A blocked GetDataAfterExp is not joined: its
 // generation-guarded writes are no-ops and the transport's Close interlock covers the I/O. Call
 // once.
+// Attachment is the identity of the plugging-in this camera's handle was opened on
+// (DeviceInfo.Attachment), or 0 when the transport offers none. Enumerate reports the current
+// attachment at the same location; a difference means the device was replugged and this
+// handle is dead.
+func (c *Camera) Attachment() uint64 {
+	if a, ok := c.t.(Attached); ok {
+		return a.Attachment()
+	}
+	return 0
+}
+
 func (c *Camera) Close() error {
 	c.mu.Lock()
 	busy := c.status == ExpWorking
