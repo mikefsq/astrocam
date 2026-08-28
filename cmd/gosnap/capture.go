@@ -199,7 +199,9 @@ func captureBurst(cam *astrocam.Camera, o captureOpts, w, h int, hooks *exitHook
 	b.idle, b.total = o.exposure+time.Second, 2*o.exposure+3*time.Second
 	b.buf = make([]byte, b.fbytes)
 	b.process = func(frame []byte, n int) int {
-		cam.RepairFrame(frame[:n])    // FX3 marker corners
+		if !cam.RepairFrame(frame[:n]) { // FX3 marker corners
+			fmt.Printf("  warning  : frame desynced (FX3 markers not at the boundaries)\n")
+		}
 		return cam.BinFrame(frame, n) // host bin (no-op at bin 1)
 	}
 	if !o.discard {

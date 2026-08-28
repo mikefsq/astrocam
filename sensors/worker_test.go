@@ -11,9 +11,10 @@ import (
 // fakeCtl is a minimal WorkerCtl for band/​timing tests: every read succeeds and returns a
 // full buffer, no aborts, register writes land in the embedded fakeRegmap.
 type fakeCtl struct {
-	rm     *fakeRegmap
-	fb     int
-	lastTO time.Duration // timeout of the most recent frame read
+	rm      *fakeRegmap
+	fb      int
+	lastTO  time.Duration // timeout of the most recent frame read
+	drained int           // DrainPipe calls, to assert the pipe is emptied before the arm
 }
 
 func (f *fakeCtl) Rm() Regmap            { return f.rm }
@@ -21,6 +22,10 @@ func (f *fakeCtl) VendorCmd(FX3Op) error { return nil }
 func (f *fakeCtl) ResetEndpoint() error  { return nil }
 func (f *fakeCtl) ResetDevice() error    { return nil }
 func (f *fakeCtl) NoteStall()            {}
+func (f *fakeCtl) DrainPipe(time.Duration) int {
+	f.drained++
+	return 0
+}
 func (f *fakeCtl) ReapplyOffset() error  { return nil }
 func (f *fakeCtl) Aborted() bool         { return false }
 func (f *fakeCtl) FrameBytes() int       { return f.fb }
@@ -96,6 +101,7 @@ func (s *scriptCtl) Rm() Regmap {
 func (s *scriptCtl) VendorCmd(FX3Op) error { return nil }
 func (s *scriptCtl) ResetEndpoint() error  { s.resetEP++; return nil }
 func (s *scriptCtl) ResetDevice() error    { s.resetDev++; return nil }
+func (s *scriptCtl) DrainPipe(time.Duration) int { return 0 }
 func (s *scriptCtl) NoteStall()            { s.stalls++ }
 func (s *scriptCtl) ReapplyOffset() error  { s.reapplied++; return nil }
 func (s *scriptCtl) Aborted() bool         { return s.abortAfter > 0 && s.idx >= s.abortAfter }
@@ -592,5 +598,16 @@ func TestWorkerHaltsAfterAFailedArm(t *testing.T) {
 		if failed == 0 {
 			t.Errorf("%s: no injected failure reached the worker; the test proves nothing", tc.name)
 		}
+	}
+}
+
+// TestIMX455WorkerDrainsBeforeArm asserts the worker empties the bulk pipe before it arms. The
+// FX3 keeps committing DMA buffers until the previous capture's deferred halt lands, and
+// ResetEndpoint discards none of them, so anything left heads this frame and shifts every pixel.
+func TestIMX455WorkerDrainsBeforeArm(t *testing.T) {
+	ctl := &fakeCtl{rm: &fakeRegmap{}, fb: 64}
+	_, _ = imx455Worker(ctl, make([]byte, ctl.fb), time.Millisecond)
+	if ctl.drained == 0 {
+		t.Error("imx455Worker armed without draining the bulk pipe first")
 	}
 }

@@ -25,6 +25,7 @@ type usbfsStream struct {
 	next   uint64 // segment to consume next
 	submit uint64 // segment number for the next submission
 	segOff int    // bytes already consumed from the current `next` segment
+	desync bool   // a Next ended mid-frame: the segment stream no longer aligns
 	closed bool
 	mu     sync.Mutex // Next vs Close from different goroutines
 }
@@ -119,6 +120,16 @@ func (st *usbfsStream) reapOne() (bool, error) {
 // frame boundaries (segOff carries the remainder to the next call). Returns a short count with a
 // nil error on an idle stall (no completion for idle), an error on a hard URB status or a closed
 // session.
+// markDesync latches the session when a Next is about to return short. Matching darwinStream:
+// a partial frame poisons the stream only if it actually consumed something, or left a segment
+// part drained -- a Next that returned nothing and touched no segment leaves the stream aligned,
+// so an idle poll on a quiet camera is not a desync.
+func (st *usbfsStream) markDesync(copied, want int) {
+	if copied < want && (copied > 0 || st.segOff > 0) {
+		st.desync = true
+	}
+}
+
 func (st *usbfsStream) Next(buf []byte, idle time.Duration) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
@@ -130,6 +141,12 @@ func (st *usbfsStream) Next(buf []byte, idle time.Duration) (int, error) {
 	}
 	if st.d.broken.Load() {
 		return 0, errTransportBroken
+	}
+	// A previous Next stopped part way through a frame, so `next`/`segOff` point into the middle
+	// of the stream and every frame from here would start at the wrong offset. In-place realign
+	// is not possible: the caller closes the session and starts a new one.
+	if st.desync {
+		return 0, ErrStreamDesynced
 	}
 	if idle <= 0 { // see the backend contract in transport.go
 		idle = defaultIdleBound
@@ -152,6 +169,7 @@ func (st *usbfsStream) Next(buf []byte, idle time.Duration) (int, error) {
 			s := &st.slots[cur]
 			if s.st != 0 && s.st != -int32(syscall.ENOENT) {
 				// A halted or babbled URB: surface it; the caller resets the endpoint.
+				st.markDesync(copied, len(buf))
 				return copied, fmt.Errorf("astrocam: stream urb status %d", s.st)
 			}
 			avail := s.n - st.segOff
@@ -179,14 +197,17 @@ func (st *usbfsStream) Next(buf []byte, idle time.Duration) (int, error) {
 			break
 		}
 		if st.d.readAborted.Load() {
+			st.markDesync(copied, len(buf))
 			return copied, nil
 		}
 		got, err := st.reapOne()
 		if err != nil {
+			st.markDesync(copied, len(buf))
 			return copied, err
 		}
 		if !got {
 			if !progressed && time.Since(lastReal) > idle {
+				st.markDesync(copied, len(buf))
 				break // stall
 			}
 			time.Sleep(200 * time.Microsecond)

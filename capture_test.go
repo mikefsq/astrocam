@@ -796,3 +796,51 @@ func TestColorBinInPlace(t *testing.T) {
 		}
 	}
 }
+
+// TestFX3DesyncDetection covers the frame-boundary detector against the signature measured on
+// two desynced ASI6200MC frames: the previous frame's footer word immediately ahead of this
+// frame's header word, 32-bit aligned, at a whole multiple of 16 KiB.
+func TestFX3DesyncDetection(t *testing.T) {
+	const n = 1 << 20
+	synced := func() []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte(i * 7)
+		}
+		b[0], b[1], b[2], b[3] = 0x7E, 0x5A, 0x01, 0x00
+		b[n-4], b[n-3], b[n-2], b[n-1] = 0x00, 0x00, 0xF0, 0x3C
+		return b
+	}
+
+	if b := synced(); !repairFX3DMAMarkers(b, 2, 256, 2) {
+		t.Error("a frame with markers at both boundaries must repair")
+	}
+	if got := fx3MarkerOffset(synced()); got != -1 {
+		t.Errorf("a synced frame has no interior boundary, got offset %d", got)
+	}
+
+	// A desync: K bytes of the previous frame's tail ahead of this frame's start.
+	for _, K := range []int{16384, 13 * 16384, 14 * 16384} {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte(i * 11)
+		}
+		b[K-4], b[K-3], b[K-2], b[K-1] = 0x00, 0x00, 0xF0, 0x3C
+		b[K], b[K+1], b[K+2], b[K+3] = 0x7E, 0x5A, 0x01, 0x00
+		if repairFX3DMAMarkers(b, 2, 256, 2) {
+			t.Errorf("K=%d: a desynced frame must not pass the boundary check", K)
+		}
+		if got := fx3MarkerOffset(b); got != K {
+			t.Errorf("K=%d: fx3MarkerOffset = %d, want %d", K, got, K)
+		}
+	}
+
+	// A lone 0x7E 0x5A pair in sensor noise, with no footer ahead of it, is not a boundary.
+	b := make([]byte, n)
+	for i := 0; i < n; i += 4 {
+		b[i], b[i+1] = 0x7E, 0x5A
+	}
+	if got := fx3MarkerOffset(b); got != -1 {
+		t.Errorf("header words without a preceding footer are noise, got offset %d", got)
+	}
+}

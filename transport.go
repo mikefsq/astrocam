@@ -14,9 +14,17 @@
 package astrocam
 
 import (
+	"errors"
 	"sync"
 	"time"
 )
+
+// ErrStreamDesynced is returned by a session Next after an earlier Next ended part way through a
+// frame. The segment stream cannot be realigned in place, so the caller must Close the session
+// and StartStream again rather than abandon the capture. Every backend latches it: a short read
+// that consumed anything, or that left a segment part drained, makes every later frame in the
+// session start at the wrong offset.
+var ErrStreamDesynced = errors.New("astrocam: stream session desynced by a short read; close and restart it")
 
 // Default bounds, substituted when a caller passes a non-positive value.
 const (

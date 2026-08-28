@@ -123,6 +123,9 @@ type WorkerCtl interface {
 	Rm() Regmap               // sensor + FPGA register R/W
 	VendorCmd(op FX3Op) error // FX3StreamStop/Start/Flush
 	ResetEndpoint() error     // clear the bulk-IN pipe (EP 0x81)
+	// DrainPipe discards data the device already queued on EP 0x81 and returns the byte
+	// count, so a frame cannot start behind an earlier frame's tail. Call it before arming.
+	DrainPipe(budget time.Duration) int
 	ResetDevice() error       // USB device reset (last resort)
 	NoteStall()               // record one readout stall
 	// ReapplyOffset rewrites the last offset set (Camera.SetOffset / the init default) through

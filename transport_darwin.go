@@ -1091,11 +1091,6 @@ var errTransportBroken = errors.New("astrocam: transport broken (abandoned in-fl
 // stream cannot feed two windows (see StartStream).
 var errStreamBusy = errors.New("astrocam: a stream session is already open on this device")
 
-// ErrStreamDesynced is returned by a session Next after an earlier Next ended part way through a
-// frame. The segment stream cannot be realigned in place, so the caller must Close the session
-// and StartStream again rather than abandon the capture.
-var ErrStreamDesynced = errors.New("astrocam: stream session desynced by a short read; close and restart it")
-
 // darwinLeakedIO pins Go buffers the kernel may still DMA into (a read returned rc -6); they
 // must never be reused or collected. Never cleared.
 var (

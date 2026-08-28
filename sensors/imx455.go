@@ -293,6 +293,12 @@ func imx455Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		_ = ctl.ResetEndpoint()
 	}()
 	// --- arm (imx455Arm) ---
+	// Empty the pipe before arming, not after. The previous capture's deferred halt races the
+	// FX3, which keeps committing DMA buffers until it stops, and ResetEndpoint does not discard
+	// them. Anything left heads this frame and shifts every pixel by that many bytes.
+	if n := ctl.DrainPipe(250 * time.Millisecond); n > 0 {
+		ctl.NoteStall()
+	}
 	if err := imx455Arm(ctl); err != nil {
 		return 0, err
 	}
