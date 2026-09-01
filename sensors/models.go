@@ -45,7 +45,7 @@ func init() {
 	p(0x5715, "Poseidon-M PRO", &IMX571, false, true, true, false)
 	p(0x5850, "Uranus-C", &IMX585, true, true, false, true) // IMX585 STARVIS 2
 	p(0x5851, "Uranus-M", &IMX585, false, true, false, true)
-	p(0x5853, "Uranus-M (v2)", &IMX585, false, true, false, true)
+	p(0x5853, "Xena 585M", &IMX585, false, true, false, true) // the body this die was brought up on
 	p(0x5854, "Uranus-C (v2)", &IMX585, true, true, false, true)
 	p(0x5855, "Uranus-M (v3)", &IMX585, false, true, false, true)
 }

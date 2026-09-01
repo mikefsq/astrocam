@@ -234,18 +234,31 @@ func TestCoolerRateGuard(t *testing.T) {
 
 // flakyPlant wraps fakePlant, failing ReadTemp for the first failN calls (transient) or forever
 // (failN < 0). It records the last TEC power applied so the fail-safe zero is observable.
+//
+// The mutex matters because TestCameraCoolerRetires hands this plant to Camera.EnableCooling,
+// which regulates on its own goroutine while the test goroutine calls SetTarget — so the read
+// counter is touched from both, exactly as in rtPlant.
 type flakyPlant struct {
 	fakePlant
+	mu    sync.Mutex
 	failN int // >0: fail this many ReadTemps then recover; <0: fail forever
 	reads int
 }
 
 func (p *flakyPlant) ReadTemp() (float64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.reads++
 	if p.failN < 0 || p.reads <= p.failN {
 		return 0, errTransient
 	}
 	return p.fakePlant.ReadTemp()
+}
+
+func (p *flakyPlant) SetTECPower(pct float64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fakePlant.SetTECPower(pct)
 }
 
 var errTransient = fmt.Errorf("transient EP0 error")

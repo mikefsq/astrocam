@@ -944,7 +944,13 @@ static int asi_stream_next_zc(asicam_stream* s, char** outBuf, uint32_t idleMs, 
         pthread_mutex_unlock(&sd->qlk);
         if (cur) {
             if (ASI_HARD_KR(cur->kr)) { *outKr = cur->kr; return -1; }
-            if (cur->len == 0) { // ZLP frame-boundary marker: skip it, recycle, keep going
+            // A completion shorter than the chunk is a frame-boundary marker, not a frame. On
+            // this path the chunk IS one frame, so anything short cannot be one. ZWO marks the
+            // boundary with a zero-length packet; PlayerOne's FX3 sends a SHORT one — sixteen
+            // bytes — and taking that for a frame is what made every sub-MiB burst return
+            // "16 of 614400" on the first frame while larger frames, which use the copying path
+            // and simply accumulate over the marker, streamed fine.
+            if (cur->len < s->chunk) {
                 s->next_seq++;
                 asi_stream_claim(s);
                 asi_stream_rearm(s, cur);
@@ -1141,6 +1147,13 @@ type darwinDevice struct {
 	// readAborted is the Go-side entry latch of ReadAborter: while set, new frame reads return
 	// (0, nil) without taking ioMu. Breaking a read already blocked in cgo is abort_gen's job.
 	readAborted atomic.Bool
+	// padBuf is scratch for a frame whose length is not a multiple of dmaAlign. Reused across
+	// reads; a frame read holds closeMu shared and ioMu exclusively, so only one read touches it.
+	padBuf []byte
+	// forcedUSB2 makes SuperSpeed() report false on a SuperSpeed link (LinkForcer), so the USB2
+	// configuration can be exercised without a USB2 cable.
+	forcedUSB2 atomic.Bool
+
 	// readActive counts frame reads in flight, including open stream sessions. On a USB2 link the
 	// IN control path paces itself while it is non-zero.
 	readActive atomic.Int32
@@ -1259,7 +1272,15 @@ func (t *darwinDevice) Describe() string {
 
 // SuperSpeed reports whether the bulk-IN endpoint negotiated USB3 SuperSpeed (1024-byte
 // max packet) rather than USB2 HighSpeed (512).
-func (t *darwinDevice) SuperSpeed() bool { return int(t.diag.inMaxPacket) >= 1024 }
+func (t *darwinDevice) SuperSpeed() bool {
+	if t.forcedUSB2.Load() {
+		return false
+	}
+	return int(t.diag.inMaxPacket) >= 1024
+}
+
+// ForceUSB2 implements LinkForcer.
+func (t *darwinDevice) ForceUSB2(on bool) { t.forcedUSB2.Store(on) }
 
 func (t *darwinDevice) control(reqType, bRequest uint8, wValue, wIndex uint16, data []byte) (int, error) {
 	t.closeMu.RLock()
@@ -1475,10 +1496,33 @@ func (t *darwinDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 		totalMs = defaultTotalBound.Milliseconds()
 	}
 	const chunk = 1 << 20 // 1 MiB per transfer (SDK xferLen)
+	// A frame whose length is not a multiple of dmaAlign stalls on this path: the read returns the
+	// whole chunks and never the tail. Measured across fifteen geometries on a PlayerOne body,
+	// with no exception either way. Ask for the rounded-up length into scratch and hand back only
+	// the frame, so the caller's buffer and byte count are unchanged.
+	dst, want := buf, len(buf)
+	if pad := (dmaAlign - len(buf)%dmaAlign) % dmaAlign; pad != 0 {
+		if cap(t.padBuf) < want+pad {
+			t.padBuf = make([]byte, want+pad)
+		}
+		dst = t.padBuf[:want+pad]
+	}
 	var n C.uint32_t
 	var kr C.IOReturn
-	rc := C.asi_read_frame_stream(t.d, unsafe.Pointer(&buf[0]), C.uint32_t(len(buf)),
+	rc := C.asi_read_frame_stream(t.d, unsafe.Pointer(&dst[0]), C.uint32_t(len(dst)),
 		C.uint32_t(chunk), C.uint32_t(idleMs), C.uint32_t(totalMs), &n, &kr)
+	padded := &dst[0] != &buf[0]
+	if padded {
+		if int(n) >= want {
+			// The frame arrived. The request ran past it by design, so the pipe erroring on the
+			// tail that was never going to come is expected, not a failure.
+			n = C.uint32_t(want)
+			if rc == -7 {
+				rc = 0
+			}
+		}
+		copy(buf, dst[:min(int(n), want)])
+	}
 	if rc == -6 {
 		// The abandoned transfers target C-side scratch (leaked there), not buf, so no pin;
 		// the pipe is poisoned all the same.
@@ -1493,6 +1537,12 @@ func (t *darwinDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (i
 	}
 	return int(n), nil
 }
+
+// dmaAlign is the granularity a frame read has to be asked for on this backend. A length that is
+// not a multiple of it returns the whole 1 MiB chunks and never the tail — measured on a
+// PlayerOne body across fifteen geometries, with no exception either way. The mechanism is not
+// established; the constraint is.
+const dmaAlign = 1024
 
 // ReadFrameStreamPrequeued queues the whole frame's transfers before the frame arrives, so the
 // read overlaps the sensor readout. This is the USB2 path. total bounds the whole read; idle

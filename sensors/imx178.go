@@ -2,16 +2,15 @@
 // is a raw 16-bit code (the 0.1 dB value written directly, not the Sony /3 analog code), latch
 // 0x3007, offset 0x3015/16, SHS 0x3034-36, ROI window/start in the 0x319x/0x31ax block.
 // Exposure uses the shared STARVIS ShutterModel with a baked HMAX (420), not the 290/455
-// bandwidth throttle. Not hardware-validated. SDK op → profile function:
+// bandwidth throttle. Not hardware-validated. Profile entry points:
 //
-//	InitCamera                 imx178Init, imx178InitFPGA
-//	Cam_SetResolution          imx178SetROI (mode bytes, window, FPGA geometry, HMAX)
-//	SetStartPos                imx178SetROI (ROI start)
-//	SetGain                    imx178SetGain
-//	SetExp                     imx178SetExposure
-//	SetBrightness              imx178SetOffset
-//	Start/StopSensorStreaming  StreamStart/StreamStop (standby 0x3000: 6 on, 0 off)
-//	WorkingFunc                imx178Worker
+//	imx178Init, imx178InitFPGA  sensor and FPGA bringup
+//	imx178SetROI                window start, mode bytes, window, FPGA geometry, HMAX
+//	imx178SetGain               analog gain
+//	imx178SetExposure           frame length and shutter position
+//	imx178SetOffset             black level
+//	StreamStart / StreamStop    standby 0x3000: 6 on, 0 off
+//	imx178Worker                the single-shot capture worker
 
 package sensors
 
@@ -38,9 +37,9 @@ const (
 	imx178RegWidthH  = 0x31a3
 	imx178RegHeightL = 0x319e
 	imx178RegHeightH = 0x319f
-	imx178RegMode0   = 0x300e // window-mode byte: 0 at bin1, 0x23 at bin2/4 (Cam_SetResolution)
+	imx178RegMode0   = 0x300e // window-mode byte: 0 at bin1, 0x23 at bin2/4
 	imx178RegMode1   = 0x3010 // window-mode byte: 0 at bin1, 1 at bin2/4
-	imx178RegClkByte = 0x3101 // SetCMOSClk clock byte: 0x30 (27 MHz, bin1), 0x32 (6750 kHz, bin2/4)
+	imx178RegClkByte = 0x3101 // clock byte: 0x30 (27 MHz, bin1), 0x32 (6750 kHz, bin2/4)
 
 	imx178RegSHS0 = 0x3034
 	imx178RegSHS1 = 0x3035
@@ -69,7 +68,7 @@ const (
 	imx178VBLK       = 15    // SetFPGAVBLK(15) at bin1; bin2/4 = 11
 )
 
-// imx178Init is InitCamera's sensor-write sequence: the 89-entry reglist (reg 0xffff = delay
+// imx178Init is the sensor-write half of camera bringup: the 89-entry reglist (reg 0xffff = delay
 // ms) then the explicit tail. FPGA bringup is in imx178InitFPGA.
 var imx178Init = []RegVal{
 	// --- reglist table (in order) ---
@@ -96,7 +95,7 @@ var imx178Init = []RegVal{
 	{Reg: 0x32fc, Val: 0x02}, {Reg: 0x3310, Val: 0x11}, {Reg: 0x3338, Val: 0x81}, {Reg: 0x333d, Val: 0x00},
 	{Reg: 0x3362, Val: 0x00}, {Reg: 0x336b, Val: 0x02}, {Reg: 0x336e, Val: 0x11}, {Reg: 0x33b4, Val: 0xfe},
 	{Reg: 0x33b5, Val: 0x06}, {Reg: 0x33b9, Val: 0x00}, {Reg: 0x3018, Val: 0x00},
-	// --- explicit tail (InitCamera), in order ---
+	// --- explicit bringup tail, in order ---
 	{Reg: 0x3059, Val: 0x00}, {Reg: 0x300d, Val: 0x00}, {Reg: 0x3004, Val: 0x00},
 	{Reg: 0x31a4, Val: 0x01}, {Reg: 0x31a5, Val: 0x01},
 	// (FPGAReset + SendCMD(0xAF) here; see imx178InitFPGA / Camera.Init)
@@ -128,7 +127,7 @@ var IMX178 = Sensor{
 	StreamStop:    func(rm Regmap) error { return rm.WriteReg(imx178RegStandby, 6) }, // standby on
 	StreamStart:   func(rm Regmap) error { return rm.WriteReg(imx178RegStandby, 0) }, // standby off
 	Worker:        imx178Worker,
-	ROIStartAlign: func(int) (int, int) { return 4, 2 }, // SetStartPos masks
+	ROIStartAlign: func(int) (int, int) { return 4, 2 }, // window-start masks
 }
 
 // imx178Worker is the host-timed single-shot capture worker. XHSStop is FPGA reg 0x0b bit4
@@ -139,7 +138,7 @@ var IMX178 = Sensor{
 //	expose: EnableFPGATriggerSignal(1)+EnableFPGAXHSStop(1)·hold for the exposure·
 //	        EnableFPGAXHSStop(0)+EnableFPGATriggerSignal(0)
 //	read:   one BulkRead of FrameBytes
-//	stop:   FPGAStop·SendCMD(0xAA)·ResetEndPoint (WorkingFunc exit)
+//	stop:   FPGAStop·SendCMD(0xAA)·ResetEndPoint (the SDK's exit)
 func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 	arm := func(full bool) error {
@@ -179,8 +178,8 @@ func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		return SetFPGABit(rm, 0x0b, 0x01, false) // EnableFPGATriggerSignal(0)
 	}
 
-	// Halt the readout on every return, the arm's own failures included, as WorkingFunc's
-	// exit does (0131_CCameraS178MM.o):
+	// Halt the readout on every return, the arm's own failures included, as the SDK does on its
+	// way out:
 	// StopSensorStreaming (FPGAStop only, no sensor register), SendCMD(0xAA), ResetEndPoint.
 	// Best-effort; a sensor left free-running with no reader backs up the FX3 GPIF.
 	defer func() {
@@ -217,7 +216,7 @@ func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		return 0, err
 	}
 	_ = ctl.ResetEndpoint()
-	// Read the frame byte count only, as WorkingFunc does (startAsyncXfer's size argument is
+	// Read the frame byte count only, as the SDK does (its windowed read's size argument is
 	// the image size): an oversized read runs into the next free-run frame or times out short.
 	want := ctl.FrameBytes()
 	if want > len(buf) {
@@ -234,10 +233,13 @@ func imx178Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	return n, err
 }
 
-// imx178InitFPGA is the FPGA bringup after the Sony init (InitCamera): FPGAReset, 20 ms,
+// imx178InitFPGA is the FPGA bringup after the Sony init: FPGAReset, 20 ms,
 // SetFPGAAsMaster(1), FPGAStop, EnableFPGADDR(0), SetFPGAADCWidthOutputWidth (bit4 = RAW16
 // from the live ReadoutMode), SetFPGAGain(0x80×4).
 func imx178InitFPGA(rm Regmap, subtype int) error {
+	if err := poaUnsupported(rm, "imx178", "FPGA bringup"); err != nil {
+		return err
+	}
 	_ = subtype
 	if err := FPGAClearBits(rm, 0x00, 0x01); err != nil { // FPGAReset
 		return err
@@ -273,6 +275,9 @@ func imx178InitFPGA(rm Regmap, subtype int) error {
 // imx178SetGain (SetGain) clamps to [0, 510] and writes, under the 0x3007 latch, the conv-gain
 // byte (0 LCG, 0x1e HCG above gain 30) and the raw 0.1 dB value as the 16-bit code.
 func imx178SetGain(rm Regmap, gain int) error {
+	if err := poaUnsupported(rm, "imx178", "SetGain"); err != nil {
+		return err
+	}
 	if gain > imx178GainMax {
 		gain = imx178GainMax
 	}
@@ -321,14 +326,17 @@ func imx178SetExposure(rm Regmap, d time.Duration) error {
 	return ApplyExposure(rm, imx178Shutter, imx178RegLatch, d)
 }
 
-// imx178SetOffset (SetBrightness) writes the offset 16-bit LE to 0x3015/0x3016;
-// imx178GetOffset reads it back.
+// imx178GetOffset reads the offset back from 0x3015/0x3016, the pair imx178SetOffset writes
+// 16-bit little-endian.
 func imx178GetOffset(rm Regmap) (int, error) {
 	v, err := ReadRegLE(rm, []uint16{0x3015, 0x3016})
 	return int(v), err
 }
 
 func imx178SetOffset(rm Regmap, offset int) error {
+	if err := poaUnsupported(rm, "imx178", "SetOffset"); err != nil {
+		return err
+	}
 	v := uint16(offset)
 	if err := rm.WriteReg(0x3016, (v>>8)&0xff); err != nil {
 		return err
@@ -336,10 +344,13 @@ func imx178SetOffset(rm Regmap, offset int) error {
 	return rm.WriteReg(0x3015, v&0xff)
 }
 
-// imx178SetROI: SetStartPos (X aligned to 4, Y to 2) + Cam_SetResolution (bin1 mode bytes,
+// imx178SetROI: the window start (X aligned to 4, Y to 2) + the window write (bin1 mode bytes,
 // window, FPGA geometry, HMAX). Bin 1 only; bin2/4 (mode 0x23/1, VBLK 11, clock 6750) is the
-// other Cam_SetResolution branch, not decoded.
+// other window-setup branch, not decoded.
 func imx178SetROI(rm Regmap, x, y, w, h, bin int) error {
+	if err := poaUnsupported(rm, "imx178", "SetROI"); err != nil {
+		return err
+	}
 	if bin != 1 {
 		return fmt.Errorf("imx178: bin %d not supported (binning mode bytes not yet decoded)", bin)
 	}
@@ -368,7 +379,7 @@ func imx178SetROI(rm Regmap, x, y, w, h, bin int) error {
 	}
 
 	// Resolution-mode regs (SetResolution bin1 branch: 0x300d=2, 0x3059=2; bin2/4 writes
-	// 0x300d=9), clock byte (SetCMOSClk 27 MHz), bin1 mode bytes 0 (Cam_SetResolution), window.
+	// 0x300d=9), clock byte (27 MHz), bin1 mode bytes 0, window.
 	for _, rv := range []RegVal{
 		{Reg: 0x300d, Val: 0x02}, {Reg: 0x3059, Val: 0x02},
 		{Reg: imx178RegClkByte, Val: 0x30},

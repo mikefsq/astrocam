@@ -39,6 +39,10 @@ type Sensor struct {
 	// ExpMinUs/ExpMaxUs bound SetExposure in microseconds, surfaced by Camera.ExposureRange.
 	// ExpMaxUs 0 means undeclared.
 	ExpMinUs, ExpMaxUs int64
+	// ExpCaps, when set, returns the vendor-specific exposure bounds for a die the vendors
+	// advertise differently, the same seam as GainCaps/OffsetCaps. nil falls back to the static
+	// fields above; a max of 0 means undeclared.
+	ExpCaps func(vid uint16) (minUs, maxUs int64)
 
 	// Bus selects which vendor request WriteReg/ReadReg use. Zero value is BusSony (WriteSONYREG
 	// 0xB6 / ReadSONYREG 0xB7); non-Sony dies (Aptina/ON, Panasonic, SmartSens) use the generic
@@ -46,11 +50,11 @@ type Sensor struct {
 	Bus RegBus
 
 	// ROIStartAlign, when set, reports the sensor-pixel alignment of the readout window start
-	// for a sensor bin factor (the SDK's SetStartPos masks: X to 16 on the IMX455/571, to 4 on
+	// for a sensor bin factor (the SDK's window-start masks: X to 16 on the IMX455/571, to 4 on
 	// the IMX290/462 and the 174, to 2 on the IMX585; Y to 2, to 4 on the 585, or 4/6 for the
-	// 455/571 bin-2/3 tables). Camera.SetROI
-	// aligns the requested start down by it and reports the aligned start from ROI, so a caller
-	// sees the window it gets. nil = the profile aligns silently.
+	// 455/571 bin-2/3 tables). Camera.SetROI aligns the requested start down by it and reports
+	// the aligned start from ROI, so a caller sees the window it gets. nil = the profile aligns
+	// silently.
 	ROIStartAlign func(bin int) (x, y int)
 
 	// HWBins lists the binning factors the profile has a hardware (on-sensor) readout mode for;
@@ -60,17 +64,64 @@ type Sensor struct {
 	// split into the largest listed divisor on the sensor and the rest on the host (the SDK's
 	// bin 4 on the IMX455/571 = the bin-2 table over 2w×2h, host-binned 2×). nil = no hardware
 	// binning.
+	//
+	// On a vendor whose camera bins itself at every factor (Vendor.deviceBins, PlayerOne) nothing
+	// is left for the host; there this list says only how much of the factor the DIE takes and
+	// how much the FPGA does (Camera.sensorSplit).
 	HWBins []int
 
 	// FX3DMAMarkers marks a sensor whose FX3 readout brackets every frame with fixed DDR
 	// header/footer marker words (see repairFX3DMAMarkers). Hardware-confirmed on the IMX455,
 	// IMX462, IMX290 and IMX174; the IMX571 sets it from the 455's behaviour without a camera to
-	// check it on. Leave
-	// false on unverified sensors.
+	// check it on. Leave false on unverified sensors.
 	FX3DMAMarkers bool
 
 	// Init is the sensor-side init sequence.
 	Init []RegVal
+	// InitByVID overrides Init for a vendor whose firmware frames the same Sony tuning
+	// differently. The two decoded vendors agree on the die's analog table almost register for
+	// register — where they overlap on the IMX455 and IMX585, not one value differs — but they
+	// disagree on which registers belong in the table versus the init sequence around it, and on
+	// the IMX571 two values differ outright, so the table has to be vendor-selected. A VID with
+	// no entry uses Init.
+	InitByVID map[uint16][]RegVal
+
+	// SizeByVID overrides Info's MaxWidth/MaxHeight for a vendor that reads out a different area
+	// of the same die. The IMX585's effective array is 3856x2180 and PlayerOne exposes all of it;
+	// the ZWO transcription this profile came from programs the 3840x2160 UHD crop. Only the
+	// geometry varies, so the rest of Info stays shared.
+	SizeByVID map[uint16][2]int
+
+	// BinsByVID overrides Info.Bins for a vendor whose camera offers binning the other's does not.
+	BinsByVID map[uint16][]int
+
+	// EGainBase is the sensor's electrons-per-ADU at gain 0. The conversion falls off with gain
+	// as base / 10^(gain/200), which is where the SDK's 0.1 dB gain unit shows itself: 200 units
+	// per decade of voltage gain. Zero means the die's value has not been read out.
+	EGainBase float64
+
+	// SensorModes, when set, returns the alternative readout programmes the die offers on this
+	// vendor's body, index 0 being the normal mode (POAGetSensorModeCount / POAGetSensorModeInfo).
+	// It is vendor-keyed for the same reason the caps are: the mode list is what a vendor's
+	// firmware exposes over the die, not a property of the silicon. nil, or a result of fewer
+	// than two entries, means the profile offers no mode selection.
+	SensorModes func(vid uint16) []SensorModeInfo
+	// Presets, when set, returns the vendor's preset gain/offset operating points for this die.
+	// They are vendor policy over one part, like the caps, so they travel by VID. ok false means
+	// the profile has not decoded them for that vendor.
+	Presets func(vid uint16) (GainOffsetPresets, bool)
+	// SetSensorMode programs the sensor-side block for a mode index (POASetSensorMode). The
+	// geometry half of a mode change belongs to SetROI, which reads the mode off the ReadoutMode;
+	// this writes only what the sensor itself holds. It must return an error for a mode the
+	// profile has not decoded at the current sample size rather than reuse a neighbouring
+	// combination. nil = no mode selection.
+	SetSensorMode func(rm Regmap, mode int) error
+
+	// PreInit, if set, runs BEFORE the Init table. It exists because PlayerOne resets the FPGA
+	// and pulses the sensor reset line as the first thing it does, and a sensor reset after the
+	// register table has been applied would discard it. ZWO resets in InitFPGA instead, which is
+	// after the table, so it leaves this nil.
+	PreInit func(rm Regmap) error
 
 	// InitFPGA, if set, runs the FPGA-side init after the Init table (FPGAReset /
 	// SetFPGAAsMaster / FPGAStop / EnableFPGADDR / SetFPGAADCWidthOutputWidth as FPGA-register
@@ -116,18 +167,29 @@ type Sensor struct {
 	Worker func(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error)
 }
 
+// SensorModeInfo names one readout programme the die offers (POASensorModeInfo). Name is short
+// enough for a control, Desc is the tooltip-length explanation.
+type SensorModeInfo struct {
+	Name string
+	Desc string
+}
+
 // WorkerCtl gives a per-sensor Worker the generic FX3/FPGA/transport primitives it needs around
 // its own sensor-register choreography. Implemented by *Camera; see the Camera methods of the
 // same names for the fallbacks.
 type WorkerCtl interface {
 	Rm() Regmap               // sensor + FPGA register R/W
 	VendorCmd(op FX3Op) error // FX3StreamStop/Start/Flush
-	ResetEndpoint() error     // clear the bulk-IN pipe (EP 0x81)
+	// FPGARun starts and stops the readout pipeline through the vendor's encoding. A profile
+	// must not open-code it: ZWO clears bit 4 of FPGA register 0 to run, PlayerOne writes 0x10
+	// to the same register to run, so the literal that starts one camera stops the other.
+	FPGARun(start bool) error
+	ResetEndpoint() error // clear the bulk-IN pipe (EP 0x81)
 	// DrainPipe discards data the device already queued on EP 0x81 and returns the byte
 	// count, so a frame cannot start behind an earlier frame's tail. Call it before arming.
 	DrainPipe(budget time.Duration) int
-	ResetDevice() error       // USB device reset (last resort)
-	NoteStall()               // record one readout stall
+	ResetDevice() error // USB device reset (last resort)
+	NoteStall()         // record one readout stall
 	// ReapplyOffset rewrites the last offset set (Camera.SetOffset / the init default) through
 	// the profile's SetOffset, for a die whose black-level register does not survive the
 	// capture cycle (IMX174).
@@ -149,7 +211,7 @@ type WorkerCtl interface {
 	StreamFramePrequeued(buf []byte, idle, total time.Duration) (int, error)
 }
 
-// ExposureStatus mirrors ASI_EXPOSURE_STATUS (the int at the SDK camera object's +0x254).
+// ExposureStatus mirrors ASI_EXPOSURE_STATUS.
 type ExposureStatus int
 
 const (
@@ -171,4 +233,37 @@ func (s ExposureStatus) String() string {
 		return "failed"
 	}
 	return "unknown"
+}
+
+// GainOffsetPresets are the operating points a client uses to choose a gain without knowing the
+// sensor (POAGetGainsAndOffsets). Each gain has the offset that belongs with it.
+type GainOffsetPresets struct {
+	GainHighestDR int // usually 0: the most dynamic range
+	GainHCG       int // where high conversion gain engages
+	GainUnity     int // e/ADU == 1
+	GainLowestRN  int // maximum analog gain, the least read noise
+	OffsetHighestDR,
+	OffsetHCG,
+	OffsetUnity,
+	OffsetLowestRN int
+}
+
+// ImageFormat is a pixel layout the driver can deliver off the wire. The vendor SDKs also define
+// debayered outputs (RGB24, MONO8) but those are host-side conversions of a raw frame, not
+// readout modes, and this driver returns the raw frame.
+type ImageFormat int
+
+const (
+	FormatRAW8  ImageFormat = 1 // 1 byte per pixel
+	FormatRAW16 ImageFormat = 2 // 2 bytes per pixel
+)
+
+func (f ImageFormat) String() string {
+	switch f {
+	case FormatRAW8:
+		return "RAW8"
+	case FormatRAW16:
+		return "RAW16"
+	}
+	return "?"
 }

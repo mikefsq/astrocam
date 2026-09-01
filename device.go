@@ -63,18 +63,18 @@ func filterCameras(raw []DeviceInfo) []DeviceInfo {
 	return out
 }
 
-// readSerial reads the 8-byte factory serial off a Transport (the vendor's SerialNumber request,
-// 0xC8 on ZWO) without binding a full Camera.
+// readSerial reads the factory serial off a Transport (the vendor's SerialNumber request, 0xC8
+// on ZWO and 0xA3 on PlayerOne) without binding a full Camera.
 func readSerial(t Transport, vid uint16) (Serial, error) {
 	v, ok := VendorOf(vid)
 	if !ok || v.Cmds.SerialNumber == 0 {
-		return Serial{}, fmt.Errorf("astrocam: serial-number request not decoded for VID 0x%04x", vid)
+		return "", fmt.Errorf("astrocam: serial-number request not decoded for VID 0x%04x", vid)
 	}
-	var s Serial
-	if _, err := t.ControlIn(v.Cmds.SerialNumber, 0, 0, s[:]); err != nil {
-		return Serial{}, err
+	raw := make([]byte, v.Cmds.serialBytes())
+	if _, err := t.ControlIn(v.Cmds.SerialNumber, 0, 0, raw); err != nil {
+		return "", err
 	}
-	return s, nil
+	return decodeSerial(raw, v.Cmds.SerialASCII), nil
 }
 
 // OpenSerial finds and opens the attached camera whose factory serial matches (hex, as

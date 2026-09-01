@@ -16,6 +16,19 @@ type fakeRegmap struct {
 	writes     []RegVal // sensor bus (WriteSONYREG / camera-reg)
 	fpgaWrites []RegVal // FPGA bus (WriteFPGAREG)
 	vid        uint16   // vendor the profile should dispatch on (0 → ZWO path)
+	// fpgaBursts records multi-register FPGA loads, keyed by first register. PlayerOne's
+	// geometry, crop and timing registers are burst-only, so a profile driving that vendor needs
+	// the fake to satisfy astrocam.FPGABurstWriter or it fails before writing anything.
+	fpgaBursts map[uint16][]byte
+}
+
+// WriteFPGABurst implements astrocam.FPGABurstWriter.
+func (f *fakeRegmap) WriteFPGABurst(reg uint16, data []byte) error {
+	if f.fpgaBursts == nil {
+		f.fpgaBursts = map[uint16][]byte{}
+	}
+	f.fpgaBursts[reg] = append([]byte(nil), data...)
+	return nil
 }
 
 // VID defaults to ZWO so the single-vendor sensor tests dispatch to the ZWO encoding without
@@ -395,7 +408,7 @@ func TestIMX455ROISubFrame(t *testing.T) {
 	}
 }
 
-// TestIMX455Bin2 asserts the bin-2 readout geometry (InitSensorMode / Cam_SetResolution): SetROI
+// TestIMX455Bin2 asserts the bin-2 readout geometry (mode table and window setup): SetROI
 // at bin 2 applies the bin-2 mode table (reg 0x0001 = 0x85, vs 0x00 full-res), writes the binned
 // output dims to the FPGA width/height, and programs HMAX = the bin-2 timing base VBin2 (625).
 func TestIMX455Bin2(t *testing.T) {
@@ -441,7 +454,7 @@ func TestSensorOffset(t *testing.T) {
 	}
 }
 
-// TestIMX290Binning asserts the IMX290 2× binning (Cam_SetResolution): mode byte 0x3006 = 0x22;
+// TestIMX290Binning asserts the IMX290 2× binning (the window setup): mode byte 0x3006 = 0x22;
 // the sensor window regs (0x3042/3 width, 0x303e/f height) take the physical region =
 // output·bin; the FPGA geometry takes the output dims. bin 3 is rejected.
 func TestIMX290Binning(t *testing.T) {
@@ -471,7 +484,7 @@ func TestIMX290Binning(t *testing.T) {
 	}
 }
 
-// TestIMX571Binning asserts the IMX571 binning (Cam_SetResolution / InitSensorMode): bin 1
+// TestIMX571Binning asserts the IMX571 binning (the window setup / the mode init): bin 1
 // writes HEIGHT to 0x0a and the ×4-aligned WIDTH+0x18 to 0x1dd; bin 2 applies the bin-2 mode
 // table (reg 0x0001=0x05), sets window-mode 0x1d8=0, and programs the binned FPGA geometry.
 func TestIMX571Binning(t *testing.T) {
@@ -512,7 +525,7 @@ func TestIMX571Binning(t *testing.T) {
 		t.Errorf("bin2: FPGA width = 0x%02x%02x, want 0x0c28 (3112)", fp2[0x05], fp2[0x04])
 	}
 	// HMAX 0x13/0x14 = the mode's V (bin 1: imx571VBin1, bin 2: imx571VBin2), the DDR-branch
-	// SetFPSPerc value SetExposure's line time is derived from.
+	// the SDK's bandwidth formula value SetExposure's line time is derived from.
 	fp1 := lastVals(f1.fpgaWrites)
 	if got := int(fp1[0x13]) | int(fp1[0x14])<<8; got != imx571VBin1 {
 		t.Errorf("bin1: HMAX = %d, want V %d", got, imx571VBin1)
@@ -708,7 +721,7 @@ func TestVendorGainDispatch(t *testing.T) {
 
 // TestVendorCaps asserts the advertised gain/offset ranges per vendor (the dual of the
 // dispatched SetGain/SetOffset). PlayerOne uses a unified 0..550 gain / 0..2000 offset scale
-// across both dies (CamAttributesInit + the SetGain/SetOffset clamp).
+// across both dies (the SDK + the SetGain/SetOffset clamp).
 func TestVendorCaps(t *testing.T) {
 	for _, tc := range []struct {
 		s          Sensor
@@ -740,7 +753,7 @@ func TestVendorCaps(t *testing.T) {
 	}
 }
 
-// TestIMX571GainPOA asserts PlayerOne's IMX571 gain bands (CamGainSet, M=125): the per-band 0x2f
+// TestIMX571GainPOA asserts PlayerOne's IMX571 gain bands (the SDK's gain setup, M=125): the per-band 0x2f
 // conv-gain mode and 0x67f setup, the analog-code mirror (0x30/0x31 → 0x32/0x33), and the code
 // reset at each conversion-gain boundary. The 571 has no 0x3a4/5/6.
 func TestIMX571GainPOA(t *testing.T) {
@@ -784,7 +797,7 @@ func TestIMX571GainPOA(t *testing.T) {
 	}
 }
 
-// TestIMX455GainPOA asserts PlayerOne's IMX455 gain bands (CamGainSet, M=125): the per-band 0x2d
+// TestIMX455GainPOA asserts PlayerOne's IMX455 gain bands (the SDK's gain setup, M=125): the per-band 0x2d
 // conv-gain mode, 0x67f setup, and 0x3a4/5/6 config, plus the analog-code mirror (0x2e/0x2f →
 // 0x30/0x31) and its reset to 0 at each conversion-gain boundary.
 func TestIMX455GainPOA(t *testing.T) {
@@ -891,7 +904,7 @@ func (m *modeRegmap) ReadReg(reg uint16) (uint16, error) {
 }
 
 // clockSelCase runs one profile op and asserts the final 0x3009 value, the clock/FRSEL select
-// the tail SetCMOSClk write must leave: FRSEL 0x01 for the 12-bit normal clock, 0x00 for 10-bit
+// the tail the clock select write must leave: FRSEL 0x01 for the 12-bit normal clock, 0x00 for 10-bit
 // high-speed (the flag with RAW8 output only), preserving the conversion-gain bit 0x10. It
 // returns the regmap so a caller can assert the format block too.
 func clockSelCase(t *testing.T, name string, highSpeed bool, bpp int, hcgIn uint16, want uint16, op func(rm Regmap) error) *modeRegmap {
@@ -906,7 +919,7 @@ func clockSelCase(t *testing.T, name string, highSpeed bool, bpp int, hcgIn uint
 	return rm
 }
 
-// assertOutputFormat checks the SetOutput16Bits block a SetROI left: the 10-bit reformat
+// assertOutputFormat checks the the 16-bit output select block a SetROI left: the 10-bit reformat
 // (0x3046=0xf0, 0x3005=0, 0x3129=0x1d, 0x317c=0x12, FPGA 0x0a bit0 = 0) for high-speed, else the
 // 12-bit block (0x3046=0xf1, 0x3005=1, 0x3129=0, 0x317c=0, 0x31ec=0x0e, bit0 = 1).
 func assertOutputFormat(t *testing.T, name string, rm *modeRegmap, tenBit bool) {
@@ -930,7 +943,7 @@ func assertOutputFormat(t *testing.T, name string, rm *modeRegmap, tenBit bool) 
 	}
 }
 
-// TestIMX462ClockSelect: SetExposure and SetROI end with the SetCMOSClk write: normal restores
+// TestIMX462ClockSelect: SetExposure and SetROI end with the the clock select write: normal restores
 // FRSEL 1, high-speed (RAW8) runs FRSEL 0 with the 10-bit format, high-speed with RAW16 stays on
 // the 12-bit clock and format, and the HCG bit is preserved.
 func TestIMX462ClockSelect(t *testing.T) {
@@ -945,8 +958,8 @@ func TestIMX462ClockSelect(t *testing.T) {
 	assertOutputFormat(t, "SetROI highspeed RAW16", clockSelCase(t, "SetROI highspeed RAW16", true, 2, 0x00, 0x01, roi), false)
 }
 
-// TestIMX290ClockSelect: the same contract for the 290 (0003_CCameraS290MM_Mini.o), including
-// the SetOutput16Bits block ported from the 462.
+// TestIMX290ClockSelect: the same contract for the 290, including
+// the the 16-bit output select block ported from the 462.
 func TestIMX290ClockSelect(t *testing.T) {
 	exp := func(rm Regmap) error { return imx290SetExposure(rm, 10*time.Millisecond) }
 	roi := func(rm Regmap) error { return imx290SetROI(rm, 0, 0, 1936, 1096, 1) }
@@ -959,7 +972,7 @@ func TestIMX290ClockSelect(t *testing.T) {
 	assertOutputFormat(t, "SetROI highspeed RAW16", clockSelCase(t, "SetROI highspeed RAW16", true, 2, 0x00, 0x01, roi), false)
 }
 
-// TestIMX455ADCBitFollowsTable asserts SetOutput16Bits: FPGA reg 0xa bit0 (ADC_BIT) is 1 for the
+// TestIMX455ADCBitFollowsTable asserts the 16-bit output select: FPGA reg 0xa bit0 (ADC_BIT) is 1 for the
 // 16-bit readout table and 0 for the 12-bit tables (high-speed at bin 1, hardware bin 2/4), with
 // bit4 = RAW16. Wire-checked on the ASI6200MC: ADC_BIT left at 1 on a 12-bit table delivers
 // unreadable frames; the SDK's high-speed RAW8 clears it.

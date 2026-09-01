@@ -4,7 +4,6 @@ package astrocam
 // capture pipeline (Init → SetROI → SetGain → SetExposure → StartExposure → data read),
 // exercising the per-sensor Workers and all four read entry points (BulkRead, BulkReadQuiet,
 // ReadFrameStream, ReadFrameStreamPrequeued) on every platform.
-//
 
 import (
 	"sync"
@@ -31,8 +30,9 @@ type StubTransport struct {
 	// the default 0x5056 is the real ASI6200 value (subtype 0x50 ≥ 0x12, the all-FPGA init
 	// path). Set before Init to exercise a different branch.
 	Firmware uint16
-	// Serial is returned for the GetSerialNumber read (0xC8), the 8-byte ASI_ID.
-	Serial Serial
+	// Serial is the raw factory-serial bytes returned for a serial-number read, whichever
+	// vendor asks: ZWO's 0xC8 (8 raw ASI_ID bytes) or PlayerOne's 0xA3 (20 ASCII characters).
+	Serial []byte
 	// Frame fills a caller buffer with synthetic pixel data; default is a 16-bit ramp.
 	Frame func(buf []byte)
 	// Log records every control transfer, in order.
@@ -89,8 +89,8 @@ func (t *StubTransport) ControlIn(bRequest uint8, wValue, wIndex uint16, data []
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.Log = append(t.Log, StubXfer{In: true, BRequest: bRequest, WValue: wValue, WIndex: wIndex, Len: len(data)})
-	if bRequest == reqSerialNumber { // 8 raw bytes, not a little-endian register
-		n := copy(data, t.Serial[:])
+	if bRequest == reqSerialNumber || bRequest == poaReqSerial { // raw bytes, not a register
+		n := copy(data, t.Serial)
 		return n, nil
 	}
 	var v uint16

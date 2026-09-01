@@ -6,8 +6,10 @@ import (
 )
 
 // DefectMap is the camera's factory hot/dead-pixel map: the per-unit list of defective sensor
-// pixels burned into SPI flash at manufacture. Read once from flash (LoadDefectMap), then
-// optionally applied to a captured frame (ApplyRAW16). Not applied by default.
+// pixels burned into SPI flash at manufacture. Read once from flash (LoadDefectMap) and applied
+// to each captured frame by ApplyWindow, which Camera.RepairFrame calls when the vendor's map is
+// trusted (Vendor.defectMapTrusted) and RepairDefects is on. ApplyRAW16 is the full-frame
+// RAW16-only form.
 type DefectMap struct {
 	W, H    int    // full-sensor dimensions the map is indexed in
 	Color   bool   // Bayer sensor → same-colour neighbour stride 2 (mono → 1)
@@ -30,9 +32,13 @@ func (m *DefectMap) isDefect(p int) bool {
 // fullW×fullH are the full-sensor dimensions the map is indexed in. The blob is an "ASID" header
 // (magic + a big-endian length that counts the header too, not just the payload: the decoder
 // rejects < 9 and rounds it up to a 2048 boundary) followed by a sparse-RLE 1-bit-per-pixel
-// bitmap. Returns
-// an error if no valid "ASID" map is present.
+// bitmap. Returns an error if no valid "ASID" map is present.
 func (c *Camera) LoadDefectMap(fullW, fullH int) (*DefectMap, error) {
+	// The blob layout is the vendor's, not the die's. A vendor with its own reader takes it from
+	// here; the ASID path below is ZWO's.
+	if c.vend.loadDefectMap != nil {
+		return c.vend.loadDefectMap(c, fullW, fullH)
+	}
 	head, err := c.ReadSPIFlash(FlashHPCMapAddr, 2048)
 	if err != nil {
 		return nil, err
@@ -139,6 +145,72 @@ func (m *DefectMap) ApplyRAW16(frame []byte) {
 			setpx(p, sum/cnt)
 		} else if p > 0 {
 			setpx(p, px(p-1))
+		}
+	}
+}
+
+// ApplyWindow repairs the defects that fall inside a readout window, for either sample size. The
+// map is indexed in FULL-ARRAY pixels, so (x0,y0) is where the window sits in the array and w×h
+// is its size; a full frame is (0,0,W,H). Each defect takes the mean of its four same-colour
+// neighbours — stride 2 on a Bayer sensor, 1 on mono — skipping neighbours that are themselves
+// uncorrected defects, and skipping any that fall outside the window.
+//
+// Binned frames are NOT handled and must not be passed: a binned pixel already averages a block,
+// so a defect is diluted rather than isolated, and the map's coordinates no longer address the
+// samples being written.
+func (m *DefectMap) ApplyWindow(frame []byte, bpp, x0, y0, w, h int) {
+	if bpp != 1 && bpp != 2 || w <= 0 || h <= 0 || len(frame) < w*h*bpp {
+		return
+	}
+	s := 1
+	if m.Color {
+		s = 2
+	}
+	px := func(p int) int {
+		if bpp == 1 {
+			return int(frame[p])
+		}
+		return int(frame[p*2]) | int(frame[p*2+1])<<8
+	}
+	setpx := func(p, v int) {
+		if bpp == 1 {
+			if v > 0xff {
+				v = 0xff
+			}
+			frame[p] = byte(v)
+			return
+		}
+		frame[p*2], frame[p*2+1] = byte(v), byte(v>>8)
+	}
+	for _, d := range m.Defects {
+		dx, dy := d%m.W-x0, d/m.W-y0
+		if dx < 0 || dy < 0 || dx >= w || dy >= h {
+			continue // this defect is outside the window
+		}
+		p := dy*w + dx
+		sum, cnt := 0, 0
+		use := func(qx, qy int) {
+			// A neighbour that is itself a defect is usable only once repaired, which for an
+			// ascending defect list means one that sorts before this pixel.
+			if qi := (qy+y0)*m.W + qx + x0; qi <= d || !m.isDefect(qi) {
+				sum += px(qy*w + qx)
+				cnt++
+			}
+		}
+		if dy-s >= 0 {
+			use(dx, dy-s)
+		}
+		if dx-s >= 0 {
+			use(dx-s, dy)
+		}
+		if dx+s < w {
+			use(dx+s, dy)
+		}
+		if dy+s < h {
+			use(dx, dy+s)
+		}
+		if cnt > 0 {
+			setpx(p, (sum+cnt/2)/cnt)
 		}
 	}
 }

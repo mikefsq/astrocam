@@ -136,6 +136,8 @@ type usbfsDevice struct {
 	// superSpeed is the negotiated link speed (bulk-IN max packet ≥1024 = USB3 SuperSpeed),
 	// read from the endpoint descriptor at open. The readout's bandwidth budget follows it.
 	superSpeed bool
+	// forcedUSB2 makes SuperSpeed() report false on a SuperSpeed link (LinkForcer).
+	forcedUSB2 atomic.Bool
 }
 
 // AbortRead / ArmRead implement ReadAborter (see readAborted).
@@ -247,7 +249,10 @@ func bulkInMaxPacket(b []byte, ep uint8) int {
 
 // SuperSpeed reports whether the bulk-IN endpoint negotiated USB3 SuperSpeed (≥1024-byte max
 // packet); false = USB2 HighSpeed. The Camera readout follows this, not the model capability.
-func (d *usbfsDevice) SuperSpeed() bool { return d.superSpeed }
+func (d *usbfsDevice) SuperSpeed() bool { return d.superSpeed && !d.forcedUSB2.Load() }
+
+// ForceUSB2 implements LinkForcer.
+func (d *usbfsDevice) ForceUSB2(on bool) { d.forcedUSB2.Store(on) }
 
 // openUSBFS finds the first device matching vid/pid under /dev/bus/usb, claims
 // interface 0, and returns the transport (OpenHost is the public entry).
@@ -800,7 +805,7 @@ func (d *usbfsDevice) ReadFrameStream(buf []byte, idle, total time.Duration) (in
 }
 
 // ReadFrameStreamPrequeued reads one frame with the SDK's async-transfer model
-// (initAsyncXfer/startAsyncXfer): bulk-IN URBs cover buf exactly, slot i targeting buf[i·1MiB:]
+// bulk-IN URBs cover buf exactly, slot i targeting buf[i·1MiB:]
 // and the last sized to the remainder, so the pipe is armed while the sensor integrates and the
 // GPIF never streams without a reader. usbfs pins every in-flight URB's buffer against a per-fd
 // cap, so only the first urbWindow slots (12 MiB) are queued before the frame arrives and
@@ -895,7 +900,7 @@ func (d *usbfsDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dura
 	cursor, frameEnd := 0, false // in-order scan for the frame-ending short/failed slot
 	// idle gates only after the first completion. The pre-frame quiet is the integration: URBs are
 	// armed before the exposure and the first slot completes only once ~1 MiB has streamed, so
-	// only total bounds it, as in startAsyncXfer.
+	// only total bounds it, as the SDK's own read does.
 	gotFirst := false
 	for done := 0; done < nslots; {
 		if time.Now().After(deadline) || d.readAborted.Load() {

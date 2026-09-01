@@ -130,8 +130,9 @@ func doHeater(tg target, pct int) error {
 	return nil
 }
 
-// doThermal reads temperature and humidity and dumps the raw 0xB3 temperature bytes.
-// Read-only: it does not drive the TEC, fan, or heater.
+// doThermal reads temperature and humidity through the vendor's Thermal backend, and on ZWO also
+// dumps the raw 0xB3 bytes with both candidate decodings. Read-only: it does not drive the TEC,
+// fan, or heater.
 func doThermal(tg target) error {
 	raw, cam, tg, err := openCamera(tg)
 	if err != nil {
@@ -140,18 +141,22 @@ func doThermal(tg target) error {
 	defer raw.Close()
 	fmt.Printf("connected %04x:%04x  %s  cooled=%v\n", tg.vid, tg.pid, cam.Name(), cam.Cooled())
 
-	// Raw 0xB3 bytes, with both candidate decodings.
-	var b [2]byte
-	if _, err := raw.ControlIn(0xB3, 0, 0, b[:]); err != nil {
-		return fmt.Errorf("read temp (0xB3): %w", err)
+	// The raw dump is ZWO's temperature request and ZWO's packing. It must not be sent to another
+	// vendor: 0xB3 is PlayerOne's protected sensor-register write, so issuing it here as a
+	// control-IN is exactly the cross-vendor mistake the driver refuses to make elsewhere.
+	if tg.vid == astrocam.ZWO.VID {
+		var b [2]byte
+		if _, err := raw.ControlIn(0xB3, 0, 0, b[:]); err != nil {
+			return fmt.Errorf("read temp (0xB3): %w", err)
+		}
+		fmt.Printf("  raw 0xB3 : % x   (lo=%d hi=%d)\n", b, b[0], b[1])
+		fmt.Printf("    int8(hi)+lo/16 : %.3f °C\n", float64(int8(b[1]))+float64(b[0])/16.0)
+		s12 := int(b[1])<<4 | int(b[0])>>4
+		if s12 >= 0x800 {
+			s12 -= 0x1000
+		}
+		fmt.Printf("    signed12×0.0625: %.3f °C\n", float64(s12)*0.0625)
 	}
-	fmt.Printf("  raw 0xB3 : % x   (lo=%d hi=%d)\n", b, b[0], b[1])
-	fmt.Printf("    int8(hi)+lo/16 : %.3f °C\n", float64(int8(b[1]))+float64(b[0])/16.0)
-	s12 := int(b[1])<<4 | int(b[0])>>4
-	if s12 >= 0x800 {
-		s12 -= 0x1000
-	}
-	fmt.Printf("    signed12×0.0625: %.3f °C\n", float64(s12)*0.0625)
 
 	th := cam.HardwareThermal()
 	if t, err := th.ReadTemp(); err != nil {
@@ -664,5 +669,179 @@ func doWedge(tg target, o captureOpts, iters int, antagonist bool, intervalMs, m
 	_ = cam.SetExposure(exp)
 	n, err := captureBounded(5 * time.Second)
 	fmt.Printf("  post-recovery probe: %d/%d B (err %v) -> recovered=%v\n", n, fb, err, err == nil && n >= fb)
+	return nil
+}
+
+// doDumpRegs reads sensor and FPGA registers back and prints them, writing nothing. It exists to
+// read a mode block off a camera the VENDOR SDK has just programmed: run the SDK tool, leave the
+// camera powered, then dump. The register file survives the SDK closing the device, so this
+// recovers what the vendor wrote without a USB analyzer in the path.
+//
+// spec is a comma-separated list; a bare number is a sensor register (vendor read 0xB2) and an
+// "f:" prefix an FPGA register (0xC2). Ranges are written lo-hi. Everything is hex, 0x optional:
+//
+//	-dumpregs 0x301a,0x3069,f:0x14-0x18
+func doDumpRegs(tg target, spec string) error {
+	raw, cam, tg, err := openCamera(tg)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	fmt.Printf("connected %04x:%04x  %s\n", tg.vid, tg.pid, cam.Name())
+
+	parse := func(s string) (uint16, error) {
+		v, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimSpace(s), "0x"), 16, 16)
+		return uint16(v), err
+	}
+	rm := cam.Rm()
+	for _, item := range strings.Split(spec, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		fpga := strings.HasPrefix(item, "f:")
+		item = strings.TrimPrefix(item, "f:")
+		lo, hi := item, item
+		if a, b, ok := strings.Cut(item, "-"); ok {
+			lo, hi = a, b
+		}
+		first, err := parse(lo)
+		if err != nil {
+			return fmt.Errorf("bad register %q: %w", lo, err)
+		}
+		last, err := parse(hi)
+		if err != nil {
+			return fmt.Errorf("bad register %q: %w", hi, err)
+		}
+		for r := first; r <= last; r++ {
+			var v uint16
+			var err error
+			if fpga {
+				v, err = rm.ReadFPGAReg(r)
+			} else {
+				v, err = rm.ReadReg(r)
+			}
+			bus := "sensor"
+			if fpga {
+				bus = "fpga  "
+			}
+			if err != nil {
+				fmt.Printf("  %s 0x%04x = error: %v\n", bus, r, err)
+				continue
+			}
+			fmt.Printf("  %s 0x%04x = 0x%02x  (%d)\n", bus, r, v, v)
+			if r == last {
+				break // guard the uint16 wrap at 0xffff
+			}
+		}
+	}
+	return nil
+}
+
+// doFlashAt dumps a raw SPI flash range, "addr,len" in hex. The layout differs per vendor — ZWO
+// keeps its defect map behind an ASID header at 0x40000, PlayerOne an "HPC:" header at 0x42000 —
+// so this reads whatever address is asked for and leaves interpretation to the caller.
+func doFlashAt(tg target, spec string) error {
+	raw, cam, tg, err := openCamera(tg)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	a, l, ok := strings.Cut(spec, ",")
+	if !ok {
+		return fmt.Errorf("want addr,len (hex), got %q", spec)
+	}
+	addr, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimSpace(a), "0x"), 16, 32)
+	if err != nil {
+		return fmt.Errorf("bad address %q: %w", a, err)
+	}
+	n, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimSpace(l), "0x"), 16, 32)
+	if err != nil {
+		return fmt.Errorf("bad length %q: %w", l, err)
+	}
+	fmt.Printf("connected %04x:%04x  %s\n", tg.vid, tg.pid, cam.Name())
+	b, err := cam.ReadSPIFlash(uint32(addr), int(n))
+	if err != nil {
+		return err
+	}
+	fmt.Printf("flash @0x%x  %d bytes\n", addr, len(b))
+	for i := 0; i < len(b); i += 16 {
+		e := i + 16
+		if e > len(b) {
+			e = len(b)
+		}
+		fmt.Printf("  %06x  % x  |%s|\n", int(addr)+i, b[i:e], printable(b[i:e]))
+	}
+	return nil
+}
+
+func printable(b []byte) string {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if c >= 0x20 && c < 0x7f {
+			out[i] = c
+		} else {
+			out[i] = '.'
+		}
+	}
+	return string(out)
+}
+
+// doDefects reads the factory defect map and reports it, writing nothing to the camera.
+func doDefects(tg target) error {
+	raw, cam, tg, err := openCamera(tg)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	info := cam.Info()
+	fmt.Printf("connected %04x:%04x  %s  array %dx%d\n", tg.vid, tg.pid, cam.Name(), info.MaxWidth, info.MaxHeight)
+	m, err := cam.LoadDefectMap(info.MaxWidth, info.MaxHeight)
+	if err != nil {
+		return err
+	}
+	px := info.MaxWidth * info.MaxHeight
+	fmt.Printf("defect map: %d pixels (%.4f%% of %d)\n", m.Count(), 100*float64(m.Count())/float64(px), px)
+	for _, p := range m.Defects {
+		fmt.Printf("%d %d\n", p%info.MaxWidth, p/info.MaxWidth)
+	}
+	return nil
+}
+
+// doGuide issues one ST4 pulse and reports the transfers it took. The guide lines are outputs to
+// a mount's ST4 port; with nothing plugged in the pulse is electrically a no-op, so this is safe
+// to run as a wire check.
+func doGuide(tg target, spec string) error {
+	raw, cam, tg, err := openCamera(tg)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	dirName, durStr, ok := strings.Cut(spec, ",")
+	if !ok {
+		return fmt.Errorf("want dir,duration (e.g. N,250ms), got %q", spec)
+	}
+	dirs := map[string]astrocam.GuideDir{
+		"N": astrocam.GuideNorth, "S": astrocam.GuideSouth,
+		"E": astrocam.GuideEast, "W": astrocam.GuideWest,
+	}
+	dir, okDir := dirs[strings.ToUpper(strings.TrimSpace(dirName))]
+	if !okDir {
+		return fmt.Errorf("direction %q: want N, S, E or W", dirName)
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(durStr))
+	if err != nil {
+		return fmt.Errorf("bad duration %q: %w", durStr, err)
+	}
+	if !cam.ST4() {
+		return fmt.Errorf("%s has no ST4 port", cam.Name())
+	}
+	fmt.Printf("connected %04x:%04x  %s  ST4=%v\n", tg.vid, tg.pid, cam.Name(), cam.ST4())
+	t0 := time.Now()
+	if err := cam.PulseGuide(dir, d); err != nil {
+		return fmt.Errorf("pulse %s for %v: %w", dirName, d, err)
+	}
+	fmt.Printf("  pulsed %s for %v (took %v); guiding now: %v\n",
+		strings.ToUpper(dirName), d, time.Since(t0).Round(time.Millisecond), cam.IsPulseGuiding())
 	return nil
 }

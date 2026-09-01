@@ -2,12 +2,15 @@ package astrocam
 
 // Snap (single-frame) data plane: arm, host-time the exposure, read one whole frame.
 //
-// Arm sequence: SendCMD 0xAA (stop) → FPGAStop (reg0 bit4 set: → 0x71) → sensor StreamStop
-// (WriteSONYREG 0x200=1) → SendCMD 0xA9 (start) → sensor StreamStart (0x200=0) → FPGAStart (reg0
-// bit4 clear: → 0x61) → ResetEndPoint(0x81) → bulk read.
+// The generic arm sequence, shown with ZWO's opcodes (Camera.arm resolves them through the
+// vendor's command table, and a profile with its own Sensor.Arm or Sensor.Worker replaces it):
+// SendCMD 0xAA (stop) → FPGAStop (reg0 bit4 set: → 0x71) → sensor StreamStop (WriteSONYREG
+// 0x200=1) → SendCMD 0xA9 (start) → sensor StreamStart (0x200=0) → FPGAStart (reg0 bit4 clear:
+// → 0x61) → ResetEndPoint(0x81) → bulk read.
 //
 // Delivered bulk data is raw pixels from offset 0: the FX3 strips its internal 0xBB00AA11 frame
-// delimiter, so frames are validated by size, not a header.
+// delimiter, so frames are validated by size, not a header. Both vendors' firmware then writes a
+// fixed marker over the first pixels, which RepairFrame puts back.
 
 import (
 	"errors"
@@ -46,16 +49,18 @@ const (
 	fpgaStopBit  = 0x10
 )
 
-func (c *Camera) fpgaSetReg0(mask, val uint16) error {
-	v, err := c.rm.ReadFPGAReg(fpgaModeReg0)
-	if err != nil {
-		return fmt.Errorf("astrocam: read FPGA reg0: %w", err)
-	}
-	return c.rm.WriteFPGAReg(fpgaModeReg0, ((v&^mask)|val)&0xff)
+// zwoFPGARun is ZWO's readout run control: bit 4 of FPGA register 0 is the STOP flag, set to
+// halt and cleared to run, read-modify-written so the rest of the mode byte survives.
+func zwoFPGARun(rm Regmap, start bool) error {
+	return SetFPGABit(rm, fpgaModeReg0, fpgaStopBit, !start)
 }
 
-func (c *Camera) fpgaStop() error  { return c.fpgaSetReg0(fpgaStopBit, fpgaStopBit) }
-func (c *Camera) fpgaStart() error { return c.fpgaSetReg0(fpgaStopBit, 0) }
+// FPGARun implements WorkerCtl: the readout run control, in the vendor's encoding.
+func (c *Camera) FPGARun(start bool) error { return c.vend.fpgaRun(c.rm, start) }
+
+// fpgaStop / fpgaStart drive the readout through the vendor's encoding (Vendor.fpgaRun).
+func (c *Camera) fpgaStop() error  { return c.vend.fpgaRun(c.rm, false) }
+func (c *Camera) fpgaStart() error { return c.vend.fpgaRun(c.rm, true) }
 
 // --- WorkerCtl: generic primitives a per-sensor capture Worker (Sensor.Worker) calls. ---
 
@@ -76,7 +81,7 @@ const drainScratch = 256 << 10
 // The FX3 keeps pushing into its DMA buffers between a read returning and the readout halting,
 // and ResetEndpoint does not empty them: on Linux it is a bare USBDEVFS_CLEAR_HALT, which resets
 // the data toggle and clears a stall but discards nothing. The leftover then heads the next
-// frame, shifting every pixel by that many bytes -- measured at 14 and 13 whole 16 KiB units on
+// frame, shifting every pixel by that many bytes — measured at 14 and 13 whole 16 KiB units on
 // an ASI6200MC, with the FX3 DDR header word found that far into the buffer instead of at 0.
 //
 // Flush the FX3 pipeline, read the endpoint dry with a short timeout, then clear the pipe. An
@@ -134,7 +139,12 @@ func (c *Camera) BulkReadQuiet(buf []byte, quiet, to time.Duration) (int, error)
 }
 
 // NoteStall records one readout stall (a short/failed bulk read that triggered a re-arm).
-func (c *Camera) NoteStall() { c.stalls.Add(1) }
+func (c *Camera) NoteStall() {
+	c.stalls.Add(1)
+	// A stalled read during a free-running capture is a frame the sensor produced and the host
+	// failed to collect, which is what the SDK counts as a dropped image.
+	c.dropped.Add(1)
+}
 
 // ReapplyOffset rewrites the cached offset through the profile (WorkerCtl); a no-op for a
 // profile without SetOffset.
@@ -343,6 +353,7 @@ func averageBinRAW16(buf []byte, fullW, fullH, bin int) int {
 // frame once GetExpStatus reports Success. light is accepted for API parity: none of the supported
 // cameras has a mechanical shutter.
 func (c *Camera) StartExposure(light bool) error {
+	c.dropped.Store(0) // the count is per capture, as the SDK's is
 	if c.dead.Load() {
 		return ErrDeviceWedged
 	}
@@ -453,6 +464,7 @@ func (c *Camera) arm() error {
 // SetExposure left it: the 174 stream runs at reg0=0x61. Short exposures only, since
 // long-exposure trigger mode stays single-shot.
 func (c *Camera) StartVideo(light bool) error {
+	c.dropped.Store(0) // the count is per capture, as the SDK's is
 	if c.dead.Load() {
 		return ErrDeviceWedged
 	}
@@ -588,16 +600,42 @@ func (c *Camera) markerRows() int {
 func (c *Camera) BinFrame(buf []byte, n int) int { return c.binFrame(buf, n) }
 
 // RepairFrame applies the FX3 DDR frame-marker repair when the profile has the markers and
-// RepairDMAMarkers is on. GetDataAfterExp applies it itself; callers pulling frames from the
-// free-run paths call it per frame. In free-run the header word's third byte is a frame counter,
-// so an unrepaired stream shows the corner pixel stepping 1, 2, 3, and on.
+// RepairDMAMarkers is on, then the vendor's own frame marker and the factory defect map. In
+// free-run the header word's third byte is a frame counter, so an unrepaired stream shows the
+// corner pixel stepping 1, 2, 3, and on.
+//
+// It reports whether the FX3 markers sat at the frame boundaries. False means the read started
+// mid-frame; the caller locates the boundary with fx3MarkerOffset and drops the frame. A profile
+// with no FX3 markers, or the repair switched off, reports true — there is nothing to check.
 func (c *Camera) RepairFrame(buf []byte) bool {
-	if RepairDMAMarkers && c.sensor.FX3DMAMarkers {
-		m := ModeOf(c.rm)
-		return repairFX3DMAMarkers(buf, m.BytesPerPx, m.Width, c.markerRows())
+	if !RepairDMAMarkers {
+		return true
 	}
-	return true
+	m := ModeOf(c.rm)
+	aligned := true
+	if c.sensor.FX3DMAMarkers {
+		aligned = repairFX3DMAMarkers(buf, m.BytesPerPx, m.Width, c.markerRows())
+	}
+	if c.vend.frameMarker != nil {
+		c.vend.frameMarker(buf, m.BytesPerPx, m.Width, c.markerRows())
+	}
+	// The factory defect map, as the vendor SDKs apply it: on every frame, not on request. It is
+	// skipped for binned frames, where a defect is diluted into a block average and the map's
+	// coordinates no longer address the samples in the buffer.
+	if c.defects != nil && RepairDefects {
+		c.mu.Lock()
+		x, y, bin := c.roiX, c.roiY, c.bin
+		c.mu.Unlock()
+		if bin <= 1 {
+			c.defects.ApplyWindow(buf, m.BytesPerPx, x, y, m.Width, m.Height)
+		}
+	}
+	return aligned
 }
+
+// RepairDefects controls whether captured frames have their factory hot-pixel map applied. On by
+// default, matching both vendor SDKs; set false for the uncorrected sensor output.
+var RepairDefects = true
 
 // Wedged reports whether the camera has been marked dead by the firmware-crash check (see
 // ErrDeviceWedged / checkDead).
@@ -665,16 +703,13 @@ func (c *Camera) GetDataAfterExp(buf []byte) (int, error) {
 			}
 			return n, fmt.Errorf("astrocam: short frame (%d of %d bytes)", n, c.FrameBytes())
 		}
-		if RepairDMAMarkers && c.sensor.FX3DMAMarkers {
-			m := ModeOf(c.rm)
-			if !repairFX3DMAMarkers(buf[:n], m.BytesPerPx, m.Width, c.markerRows()) {
-				// Only a located frame boundary proves a desync. A frame carrying no markers at
-				// all says nothing (an undecoded mode, a stub), so it passes as it always did.
-				if at := fx3MarkerOffset(buf[:n]); at > 0 {
-					c.setStatusIfGen(gen, ExpFailed)
-					return n, fmt.Errorf("%w: frame starts at byte %d of %d, so the read began %d bytes (%d x 16 KiB) early",
-						ErrFrameDesynced, at, n, n-at, (n-at)/16384)
-				}
+		if !c.RepairFrame(buf[:n]) { // vendor frame markers, before any host-side binning
+			// Only a located frame boundary proves a desync. A frame carrying no markers at
+			// all says nothing (an undecoded mode, a stub), so it passes as it always did.
+			if at := fx3MarkerOffset(buf[:n]); at > 0 {
+				c.setStatusIfGen(gen, ExpFailed)
+				return n, fmt.Errorf("%w: frame starts at byte %d of %d, so the read began %d bytes (%d x 16 KiB) early",
+					ErrFrameDesynced, at, n, n-at, (n-at)/16384)
 			}
 		}
 		n = c.binFrame(buf, n)         // RAW16 host-side bin (no-op unless SoftBin>1)
@@ -756,8 +791,8 @@ func (c *Camera) ReadFrame(buf []byte, reset bool) (int, error) {
 	n, err := c.t.BulkRead(buf, to)
 	if err == nil && n > 0 && n == c.FrameBytes() {
 		if !c.RepairFrame(buf[:n]) {
-			// A desynced free-run frame is dropped, not returned: the caller retries and the
-			// next read starts on a boundary. Returning it would publish shifted pixels.
+			// A desynced free-run frame is reported, not returned as good: the caller retries
+			// and the next read starts on a boundary. Publishing it would ship shifted pixels.
 			if at := fx3MarkerOffset(buf[:n]); at > 0 {
 				return n, fmt.Errorf("%w: frame starts at byte %d of %d, so the read began %d bytes early",
 					ErrFrameDesynced, at, n, n-at)

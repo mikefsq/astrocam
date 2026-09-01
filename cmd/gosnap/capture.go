@@ -27,16 +27,26 @@ func run(tg target, capture, verbose bool, o captureOpts) error {
 	if verbose {
 		t = &logT{t: raw, w: os.Stderr, start: t0}
 	}
+	// Forcing the link has to happen BEFORE Open, which reads the reported speed to pick the
+	// bandwidth percentage default (90 on PlayerOne either way, 40/100 on ZWO) and to decide
+	// whether EP0 needs pacing during a readout.
+	if o.usb2 {
+		if lf, ok := raw.(astrocam.LinkForcer); ok {
+			lf.ForceUSB2(true)
+		} else {
+			fmt.Println("  warning: -usb2 not supported by this transport; only the budget is forced")
+		}
+	}
 	cam, err := astrocam.Open(t, tg.vid, tg.pid)
 	if err != nil {
 		return fmt.Errorf("bind PID 0x%04x: %w", tg.pid, err)
 	}
 	if o.usb2 {
-		cam.SetUSB3(false) // USB2 bandwidth budget
-		fmt.Println("  link mode: FORCED USB2 (bwUSB2) via -usb2")
+		cam.SetUSB3(false) // belt and braces: the readout mode too, whatever the transport said
+		fmt.Println("  link mode: FORCED USB2 (budget, GPIF divider and EP0 pacing) via -usb2")
 	}
 	if o.fpsPerc != 0 {
-		cam.SetFPSPercent(o.fpsPerc) // 40..100
+		cam.SetFPSPercent(o.fpsPerc) // clamped to the vendor's range
 		fmt.Printf("  fps percent: %d (bandwidth-overload override)\n", o.fpsPerc)
 	}
 	printIdentity(cam, raw, tg)
@@ -99,6 +109,40 @@ func printIdentity(cam *astrocam.Camera, raw astrocam.Transport, tg target) {
 	fmt.Printf("  geometry : %d x %d px, %.2f µm pixel, %d-bit\n", info.MaxWidth, info.MaxHeight, info.PixelUm, info.BitDepth)
 	fmt.Printf("  color    : %v (bayer %q)\n", cam.Color(), info.Bayer)
 	fmt.Printf("  cooled   : %v\n", cam.Cooled())
+	// Advertised control ranges. These are vendor policy over a shared die, so they are the
+	// cheapest thing to diff against the vendor SDK's own caps dump.
+	gmin, gmax := cam.GainRange()
+	fmt.Printf("  gain     : %d..%d\n", gmin, gmax)
+	if omin, omax, odef, ok := cam.OffsetRange(); ok {
+		fmt.Printf("  offset   : %d..%d default %d\n", omin, omax, odef)
+	}
+	// PlayerOne carries a second version behind the FX3 bridge — the camera FPGA's own — plus a
+	// status byte, both read-only. ZWO's equivalents are not decoded, so this is vendor-gated.
+	if tg.vid == astrocam.POA.VID {
+		if v, err := astrocam.POAFPGAVersion(cam.Rm()); err == nil {
+			fmt.Printf("  fpga     : version 0x%02x\n", v)
+		}
+		if v, err := astrocam.POAFPGAStatus(cam.Rm()); err == nil {
+			fmt.Printf("  fpga stat: 0x%02x\n", v)
+		}
+	}
+	fmt.Printf("  formats  : %v\n", cam.ImageFormats())
+	if p, ok := cam.GainOffsetPresets(); ok {
+		fmt.Printf("  presets  : gain highestDR=%d HCG=%d unity=%d lowestRN=%d\n",
+			p.GainHighestDR, p.GainHCG, p.GainUnity, p.GainLowestRN)
+		fmt.Printf("             offset highestDR=%d HCG=%d unity=%d lowestRN=%d\n",
+			p.OffsetHighestDR, p.OffsetHCG, p.OffsetUnity, p.OffsetLowestRN)
+	}
+	if lim, ok := cam.WhiteBalanceRange(); ok {
+		fmt.Printf("  wb range : +-%d per channel\n", lim)
+	}
+	if m := cam.SensorModes(); len(m) > 0 {
+		names := make([]string, len(m))
+		for i, mi := range m {
+			names[i] = fmt.Sprintf("%d=%s", i, mi.Name)
+		}
+		fmt.Printf("  modes    : %s\n", strings.Join(names, " "))
+	}
 	if v, err := cam.FirmwareVersion(); err != nil {
 		fmt.Printf("  firmware : read failed: %v\n", err)
 	} else {
@@ -119,11 +163,33 @@ func configureCapture(cam *astrocam.Camera, o captureOpts) (w, h int, err error)
 			return 0, 0, err
 		}
 	}
+	// The sensor mode goes after the sample size and before the window: the mode block is
+	// indexed by both, and the geometry a mode programs depends on which mode is selected.
+	if o.sensorMode != 0 {
+		if err := step("SetSensorMode", cam.SetSensorMode(o.sensorMode)); err != nil {
+			return 0, 0, err
+		}
+		if m := cam.SensorModes(); o.sensorMode < len(m) {
+			fmt.Printf("  sensor mode  : %d (%s)\n", o.sensorMode, m[o.sensorMode].Name)
+		}
+	}
 	if o.highspeed {
 		if err := step("SetHighSpeedMode", cam.SetHighSpeedMode(true)); err != nil {
 			return 0, 0, err
 		}
 		fmt.Println("  high-speed   : 10-bit readout (2× clock)")
+	}
+	// The frame-rate cap is programmed with the frame period, so it only has to be set before
+	// SetExposure; bin-sum is part of the window, so it goes before SetROI.
+	if o.frameLimit > 0 {
+		cam.SetFrameRateLimit(o.frameLimit)
+		fmt.Printf("  frame limit  : %d fps\n", o.frameLimit)
+	}
+	if o.binsum {
+		if err := step("SetBinSum", cam.SetBinSum(true)); err != nil {
+			return 0, 0, err
+		}
+		fmt.Println("  binned pixels: summed (not averaged)")
 	}
 	if o.bin > 1 {
 		if err := step("SetHardwareBin", cam.SetHardwareBin(o.hwbin)); err != nil {
@@ -484,9 +550,6 @@ func captureSingle(cam *astrocam.Camera, o captureOpts, el func() string) error 
 	if cam.Color() {
 		bayer = info.Bayer
 	}
-	if o.fixDefects {
-		fixDefects(cam, buf[:n], x, y, w, h, depth)
-	}
 	// FITS records the effective exposure and gain (what the sensor was programmed with), not
 	// the requested values.
 	if werr := writeFrameFile(o.out, buf[:n], w, h, depth, bayer, info.PixelUm, cam.Exposure(), cam.Gain(), cam.Name()); werr != nil {
@@ -523,23 +586,6 @@ func readBounded(cam *astrocam.Camera, buf []byte, watchdog time.Duration) (n in
 		_ = cam.StopExposure()
 		return 0, nil, false
 	}
-}
-
-// fixDefects applies the factory defect map to a full-frame RAW16 capture (the only geometry
-// the map addresses); anything else is reported and left raw.
-func fixDefects(cam *astrocam.Camera, frame []byte, x, y, w, h, depth int) {
-	info := cam.Info()
-	if depth != 2 || x != 0 || y != 0 || w != info.MaxWidth || h != info.MaxHeight {
-		fmt.Printf("  -fixdefects: only full-frame RAW16 is supported; frame left raw\n")
-		return
-	}
-	dm, err := cam.LoadDefectMap(info.MaxWidth, info.MaxHeight)
-	if err != nil {
-		fmt.Printf("  -fixdefects: %v (frame left raw)\n", err)
-		return
-	}
-	dm.ApplyRAW16(frame)
-	fmt.Printf("  -fixdefects: corrected %d factory defect pixels\n", dm.Count())
 }
 
 // frameStats returns min, max, mean and standard deviation of the samples in frame (RAW16

@@ -1,6 +1,7 @@
 package astrocam
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -452,5 +453,153 @@ func TestSetROISizeRuleSplitsOnHardwareBin(t *testing.T) {
 				t.Errorf("SetROI(%dx%d) at bin %d hw=%v: %v", tc.w, tc.h, tc.bin, tc.hw, err)
 			}
 		})
+	}
+}
+
+// TestFPSPercentIsVendorPolicy: the bandwidth-percentage floor and the per-link default are the
+// vendor's, not the driver's. PlayerOne accepts 35 and defaults to 90 on both links (poasnap
+// -caps: USBBandWidthLimit min=35 max=100 def=90); ZWO clamps at 40 and runs USB3 flat out. The
+// default is not just a throughput preference — the drive register and the GPIF bandwidth are
+// both computed from it, so a driver defaulting differently disagrees with the vendor on every
+// frame's timing.
+func TestFPSPercentIsVendorPolicy(t *testing.T) {
+	s := &Sensor{Name: "FPSV", Info: CameraInfo{MaxWidth: 64, MaxHeight: 32, BitDepth: 12}}
+	Register(ZWO.VID, 0x0DA0, Model{Name: "z", Sensor: s})
+	Register(POA.VID, 0x0DA1, Model{Name: "p", Sensor: s})
+	Register(ZWO.VID, 0x0DA2, Model{Name: "z3", Sensor: s, USB3: true})
+	Register(POA.VID, 0x0DA3, Model{Name: "p3", Sensor: s, USB3: true})
+	cz, err := Open(NewStubTransport(), ZWO.VID, 0x0DA0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp, err := Open(NewStubTransport(), POA.VID, 0x0DA1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mn, mx := cz.FPSPercentRange(); mn != 40 || mx != 100 {
+		t.Errorf("ZWO FPS range = %d..%d, want 40..100", mn, mx)
+	}
+	if mn, mx := cp.FPSPercentRange(); mn != 35 || mx != 100 {
+		t.Errorf("PlayerOne FPS range = %d..%d, want 35..100", mn, mx)
+	}
+	if got := cz.FPSPercent(); got != 40 {
+		t.Errorf("ZWO USB2 default = %d, want 40", got)
+	}
+	if got := cp.FPSPercent(); got != 90 {
+		t.Errorf("PlayerOne USB2 default = %d, want 90 (the SDK's)", got)
+	}
+	// On USB3 the two diverge the other way: ZWO runs the link flat out, PlayerOne still 90.
+	cz3, err := Open(NewStubTransport(), ZWO.VID, 0x0DA2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp3, err := Open(NewStubTransport(), POA.VID, 0x0DA3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cz3.FPSPercent(); got != 100 {
+		t.Errorf("ZWO USB3 default = %d, want 100", got)
+	}
+	if got := cp3.FPSPercent(); got != 90 {
+		t.Errorf("PlayerOne USB3 default = %d, want 90", got)
+	}
+	// 35 is legal on PlayerOne and must not be raised; on ZWO it clamps to 40.
+	cp.SetFPSPercent(35)
+	if got := cp.FPSPercent(); got != 35 {
+		t.Errorf("PlayerOne SetFPSPercent(35) = %d, want 35", got)
+	}
+	cz.SetFPSPercent(35)
+	if got := cz.FPSPercent(); got != 40 {
+		t.Errorf("ZWO SetFPSPercent(35) = %d, want the 40 floor", got)
+	}
+}
+
+// TestDroppedFramesResetPerCapture: DroppedFrames counts within the current capture and resets
+// when one starts, matching POAGetDroppedImagesCount. StallCount is the lifetime total and must
+// keep counting — a caller porting from the SDK will reach for one expecting the other's
+// semantics, so the two have to stay visibly different.
+func TestDroppedFramesResetPerCapture(t *testing.T) {
+	s := &Sensor{
+		Name: "DROP", Info: CameraInfo{MaxWidth: 64, MaxHeight: 32, BitDepth: 12},
+		SetExposure: func(Regmap, time.Duration) error { return nil },
+	}
+	Register(POA.VID, 0x0DB0, Model{Name: "p", Sensor: s})
+	c, err := Open(NewStubTransport(), POA.VID, 0x0DB0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.NoteStall()
+	c.NoteStall()
+	if c.DroppedFrames() != 2 || c.StallCount() != 2 {
+		t.Fatalf("dropped=%d stalls=%d, want 2 and 2", c.DroppedFrames(), c.StallCount())
+	}
+	if err := c.StartExposure(true); err != nil {
+		t.Fatal(err)
+	}
+	if c.DroppedFrames() != 0 {
+		t.Errorf("dropped = %d after StartExposure, want 0 (per-capture)", c.DroppedFrames())
+	}
+	if c.StallCount() != 2 {
+		t.Errorf("stalls = %d after StartExposure, want 2 (lifetime, never reset)", c.StallCount())
+	}
+}
+
+// TestSetOutputDepthOnAVendorWithoutModes: a shared die declares one SetSensorMode that refuses
+// for the vendor it has not decoded. SetOutputDepth must not call it on that vendor's body — the
+// depth change has nothing to do with mode selection there, and failing it would break RAW8 on a
+// camera whose profile merely happens to be shared with one that has modes.
+func TestSetOutputDepthOnAVendorWithoutModes(t *testing.T) {
+	s := &Sensor{
+		Name: "SHAREDMODE", Info: CameraInfo{MaxWidth: 64, MaxHeight: 32, BitDepth: 12},
+		SensorModes: func(vid uint16) []SensorModeInfo {
+			if vid != POA.VID {
+				return nil // this vendor's body has no mode selection
+			}
+			return []SensorModeInfo{{Name: "Normal"}, {Name: "HDR"}}
+		},
+		SetSensorMode: func(rm Regmap, _ int) error {
+			if rm.VID() != POA.VID {
+				return errors.New("modes not decoded for this vendor")
+			}
+			return nil
+		},
+		SetROI: func(Regmap, int, int, int, int, int) error { return nil },
+	}
+	Register(ZWO.VID, 0x0DC0, Model{Name: "z", Sensor: s})
+	c, err := Open(NewStubTransport(), ZWO.VID, 0x0DC0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetOutputDepth(1); err != nil {
+		t.Errorf("SetOutputDepth(RAW8) on a vendor without modes: %v", err)
+	}
+	if c.OutputDepth() != 1 {
+		t.Errorf("output depth = %d, want 1", c.OutputDepth())
+	}
+}
+
+// TestBinsFollowsTheVendor: BinsByVID exists because the two makers of one die need not offer the
+// same binning. Bins() must report the vendor's, not the profile's static default — reading the
+// raw field made an Alpaca client see MaxBinX 1 on a camera that bins 1 to 4.
+func TestBinsFollowsTheVendor(t *testing.T) {
+	s := &Sensor{
+		Name: "BINV", Info: CameraInfo{MaxWidth: 64, MaxHeight: 32, BitDepth: 12, Bins: []int{1}},
+		BinsByVID: map[uint16][]int{POA.VID: {1, 2, 3, 4}},
+	}
+	Register(ZWO.VID, 0x0DD0, Model{Name: "z", Sensor: s})
+	Register(POA.VID, 0x0DD1, Model{Name: "p", Sensor: s})
+	cz, err := Open(NewStubTransport(), ZWO.VID, 0x0DD0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp, err := Open(NewStubTransport(), POA.VID, 0x0DD1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cz.Bins(); len(got) != 1 || got[0] != 1 {
+		t.Errorf("ZWO Bins = %v, want [1] (the profile default)", got)
+	}
+	if got := cp.Bins(); len(got) != 4 {
+		t.Errorf("PlayerOne Bins = %v, want the vendor's [1 2 3 4]", got)
 	}
 }

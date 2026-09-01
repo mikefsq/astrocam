@@ -121,7 +121,7 @@ func TestFirmwareVersion(t *testing.T) {
 // wIndex 0, returning the 8 raw ASI_ID bytes verbatim, formatted as lowercase hex.
 func TestSerialNumber(t *testing.T) {
 	st := NewStubTransport()
-	st.Serial = Serial{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}
+	st.Serial = []byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}
 	Register(ZWO.VID, 0x0003, Model{Name: "Test3", Sensor: &testSensor})
 	c, _ := Open(st, ZWO.VID, 0x0003)
 
@@ -129,11 +129,8 @@ func TestSerialNumber(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s != st.Serial {
-		t.Errorf("SerialNumber() = % x, want % x", s, st.Serial)
-	}
 	if s.String() != "0123456789abcdef" {
-		t.Errorf("String() = %q, want 0123456789abcdef", s.String())
+		t.Errorf("SerialNumber() = %q, want 0123456789abcdef (% x)", s, st.Serial)
 	}
 
 	last := st.Log[len(st.Log)-1]

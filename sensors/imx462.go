@@ -4,16 +4,15 @@
 // frame markers bracket each frame (FX3DMAMarkers). Wire-verified against the SDK on an
 // ASI462MC over USB3 and a real USB2 link (RAW16, RAW8, high-speed; single-shot, trigger band,
 // host bin 2 at both depths per pixel; free-run streaming at the sensor rate on USB3 and at the
-// link rate on USB2, 10.2/20.4 fps at FPS% 100). SDK op → profile function:
+// link rate on USB2, 10.2/20.4 fps at FPS% 100). Profile entry points:
 //
-//	InitCamera         imx462Init, imx462InitFPGA
-//	SetCMOSClk         imx462WriteClockSel
-//	Cam_SetResolution  imx462SetROI (mode 0x3006, window, SetOutput16Bits, FPGA geometry, HMAX)
-//	SetStartPos        imx462SetROI (ROI start)
-//	SetGain            imx462SetGain
-//	SetExp             imx462SetExposure
-//	SetBrightness      imx462SetOffset
-//	WorkingFunc        imx462Worker
+//	imx462Init, imx462InitFPGA  sensor and FPGA bringup
+//	imx462WriteClockSel         pixel-clock select
+//	imx462SetROI                window start, mode 0x3006, window, output width, geometry, HMAX
+//	imx462SetGain               analog gain
+//	imx462SetExposure           frame length and shutter position
+//	imx462SetOffset             black level
+//	imx462Worker                the single-shot capture worker
 
 package sensors
 
@@ -30,13 +29,13 @@ const (
 	imx462RegGainMode = 0x3009 // bit 0x10 = high conversion gain; low bits = FRSEL clock select
 	imx462RegGainCode = 0x3014 // analog gain code (single byte)
 
-	// SetStartPos: X aligned to 4, Y to 2 before the write.
+	// Window start: X aligned to 4, Y to 2 before the write.
 	imx462RegStartXL = 0x3040
 	imx462RegStartXH = 0x3041
 	imx462RegStartYL = 0x303c
 	imx462RegStartYH = 0x303d
 
-	// Cam_SetResolution: output window size × binning.
+	// Window setup: output window size × binning.
 	imx462RegWidthL  = 0x3042
 	imx462RegWidthH  = 0x3043
 	imx462RegHeightL = 0x303e
@@ -58,10 +57,10 @@ const (
 	imx462FullWidth  = 1936 // ASI462MC reports 1936×1096, the same array as the 290
 	imx462FullHeight = 1096
 	imx462ClkKHz     = 18562 // 12-bit normal pixel clock (INCK/2)
-	// HMAX floor = REG_FRAME_LENGTH_PKG_MIN, written per clock by SetCMOSClk
-	// (0071_CCameraS462MC.o): 18562→261, 37124→245, 9281→145. HMAX = max(bandwidth candidate,
-	// floor)·100/FPSPercent (SetFPSPerc; HMAX/HMAXBW in fps.go, bwUSB2/bwUSB3 = MAX_DATASIZE·
-	// 10·100 with MAX_DATASIZE from SetOutput16Bits: USB3 360715, USB2 43272). On USB2 the
+	// HMAX floor = REG_FRAME_LENGTH_PKG_MIN, written per clock by the clock select
+	// (measured): 18562→261, 37124→245, 9281→145. HMAX = max(bandwidth candidate,
+	// floor)·100/FPSPercent (the SDK's bandwidth formula; HMAX/HMAXBW in fps.go, bwUSB2/bwUSB3 = MAX_DATASIZE·
+	// 10·100 with MAX_DATASIZE from the 16-bit output select: USB3 360715, USB2 43272). On USB2 the
 	// candidate dominates (1634 full-frame; HMAX 4085 at pct 40, wire-confirmed); on USB3 the
 	// floor pins HMAX (261 ≈ 64 fps full-frame RAW16, measured 63.4 fps on USB3).
 	imx462HMAXFloor   = 261
@@ -73,11 +72,11 @@ const (
 	imx462VBLK        = 9  // SetFPGAVBLK(9)
 )
 
-// imx462Init is InitCamera's sensor-write sequence: the 73-entry reglist (reg 0xffff = delay
+// imx462Init is the sensor-write half of camera bringup: the 73-entry reglist (reg 0xffff = delay
 // ms) then the explicit sensor-reg tail. FPGA bringup is in imx462InitFPGA; the SDK's
 // SendCMD(0xAF/0xAE) are not replayed.
 var imx462Init = []RegVal{
-	// --- reglist table (verbatim, file order) ---
+	// --- reglist table, in programming order ---
 	{Reg: 0x3003, Val: 0x01}, {Reg: 0xffff, Val: 20}, // delay 20 ms
 	{Reg: 0x3000, Val: 0x01}, {Reg: 0x3002, Val: 0x01}, {Reg: 0x3009, Val: 0x01}, {Reg: 0x300e, Val: 0x00},
 	{Reg: 0x300f, Val: 0x00}, {Reg: 0x3010, Val: 0x21}, {Reg: 0x3011, Val: 0x02}, {Reg: 0x3012, Val: 0x64},
@@ -97,7 +96,7 @@ var imx462Init = []RegVal{
 	{Reg: 0x3359, Val: 0xe1}, {Reg: 0x335a, Val: 0x11}, {Reg: 0x3360, Val: 0x1e}, {Reg: 0x3361, Val: 0x61},
 	{Reg: 0x3362, Val: 0x10}, {Reg: 0x33b0, Val: 0x50}, {Reg: 0x33b2, Val: 0x1a}, {Reg: 0x33b3, Val: 0x04},
 	{Reg: 0x3410, Val: 0x1a}, {Reg: 0x3480, Val: 0x49}, {Reg: 0x3000, Val: 0x01},
-	// --- explicit sensor-reg tail (InitCamera), overrides the reglist ---
+	// --- explicit sensor-reg bringup tail, overrides the reglist ---
 	{Reg: 0x305c, Val: 0x20}, // INCKSEL
 	{Reg: 0x305d, Val: 0x00},
 	{Reg: 0x305e, Val: 0x20},
@@ -118,7 +117,7 @@ var IMX462 = Sensor{
 	ExpMinUs: imx462ExpMinUs,
 	ExpMaxUs: imx462ExpMaxUs,
 	// ASI Brightness / black level: range from ASIGetControlCaps (SDK 1.41: min 0, max 500), and
-	// the default the SDK's InitCamera programs rather than the 1 its caps declare — poisoning
+	// the default the SDK's bringup programs rather than the 1 its caps declare — poisoning
 	// regs 0x300a/0x300b with 200, running the SDK at its own default and reading them back gives
 	// 30 (its log: "ASI462 SetBrightness 30-->30"). At 1 our frames sat 528 ADU below the SDK's.
 	// Offset→DN is floor 41/71/141 in 12-bit at offsets 0/30/100.
@@ -144,10 +143,10 @@ var IMX462 = Sensor{
 
 	FX3DMAMarkers: true, // FX3 brackets each frame with 0x5A7E/0x3CF0 marker words (HW-confirmed)
 	// No HWBins: the die's 2× readout (mode 0x3006=0x22, which SetROI still programs for a
-	// sensor bin 2) is one the SDK never selects (no ASI_HARDWARE_BIN control; Cam_SetResolution
+	// sensor bin 2) is one the SDK never selects (no ASI_HARDWARE_BIN control, and the window write
 	// programs it only under the hard-bin flag), and its frames differ from the SDK's host bin,
 	// so SetHardwareBin(true) host-bins here too, as the SDK does.
-	ROIStartAlign: func(int) (int, int) { return 4, 2 }, // SetStartPos masks
+	ROIStartAlign: func(int) (int, int) { return 4, 2 }, // window-start masks
 }
 
 // imx462Worker is the host-timed single-shot capture worker (STARVIS standby-0x3000 gate; the
@@ -156,7 +155,7 @@ var IMX462 = Sensor{
 //	arm:    SendCMD(0xAA)·FPGAStop·0x3000=1·SendCMD(0xA9)·0x3000=0·50ms·FPGAStart
 //	expose: >= 1 s only: EnableFPGATriggerSignal(1)·hold the full exposure·(0)
 //	read:   StreamFramePrequeued of FrameBytes with the retry ladder below; no pre-read sleep
-//	stop:   FPGAStop·0x3000=1·SendCMD(0xAA)·ResetEndPoint (WorkingFunc exit)
+//	stop:   FPGAStop·0x3000=1·SendCMD(0xAA)·ResetEndPoint (the SDK's exit)
 func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 	longExp := exposure >= imx462LongExpUs*time.Microsecond // >= 1 s, SetExposure's trigger band
@@ -219,7 +218,7 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := arm(true); err != nil {
 		return 0, err
 	}
-	// Halt the readout on every return, as WorkingFunc's exit does: StopSensorStreaming
+	// Halt the readout on every return, as the SDK does on its way out: StopSensorStreaming
 	// (FPGAStop + standby=1), SendCMD(0xAA), ResetEndPoint. A sensor left free-running with no
 	// reader backs up the FX3 GPIF until the firmware crashes. Best-effort: a failed stop must
 	// not fail a good frame.
@@ -235,7 +234,7 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 			return 0, err
 		}
 	}
-	// Free-run (< 1 s): no pre-read sleep and no FPGABufReload. WorkingFunc calls startAsyncXfer
+	// Free-run (< 1 s): no pre-read sleep and no FPGABufReload. the SDK calls its windowed read
 	// immediately after FPGAStart with timeout = exposure+1000 ms, so the URB batch waits on the
 	// pipe through the integration and the GPIF never streams without a reader (a sleep before
 	// the read backs up the FIFO and tears or stalls on USB2). The reg 0x18 control write is not
@@ -245,16 +244,16 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if target > len(buf) {
 		target = len(buf)
 	}
-	readTotal := exposure + time.Second // SDK free-run: startAsyncXfer timeout = exp + 1000 ms
+	readTotal := exposure + time.Second // SDK free-run: read timeout = exp + 1000 ms
 	if longExp {
 		readTotal = time.Second // SDK trigger mode: frame already integrated; 1000 ms
 	}
-	// Retry ladder, mirroring WorkingFunc's failure handling:
+	// Retry ladder, mirroring the SDK's failure handling:
 	//   short frame          -> ResetEndpoint, fresh full-frame read
 	//   trigger-mode short   -> if FPGA reg 0x23 bit2 says the frame is still buffered, pulse
 	//                           FPGABufReload (reg 0x18 bit0) and re-read without re-integrating
 	//   4 consecutive zeros  -> ResetDevice + full re-arm
-	// A frame short by 512 bytes counts as complete (startAsyncXfer treats completed+0x200 ==
+	// A frame short by 512 bytes counts as complete (the SDK treats completed+0x200 ==
 	// frameBytes as success); the missing tail is zeroed.
 	zeros, reloads := 0, 0
 	for attempt := 0; ; attempt++ {
@@ -262,7 +261,7 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 		if err != nil {
 			return n, err
 		}
-		// Complete = the exact byte count, or (startAsyncXfer tolerance) exactly 512 short.
+		// Complete = the exact byte count, or (the SDK's tolerance) exactly 512 short.
 		// `n >= target-512` would let a small-ROI frame (target <= 512) accept n=0 and
 		// fabricate an all-zero frame.
 		if n >= target || (target > 512 && n == target-512) {
@@ -294,7 +293,7 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 					// The re-arm put the FPGA back in wait mode (bit6 kept), so the recovery
 					// re-runs the trigger cycle; without it the reads below wait ~10 s for a
 					// frame that never arrives. Costs a full re-integration, as the SDK's
-					// re-entered WorkingFunc does. A fresh integration is a fresh buffer, so
+					// re-entered, as the SDK does. A fresh integration is a fresh buffer, so
 					// the reg 0x23 reload budget resets too.
 					if err := integrate(); err != nil {
 						return 0, err
@@ -323,10 +322,13 @@ func imx462Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	}
 }
 
-// imx462InitFPGA is the FPGA bringup after the Sony init writes (InitCamera): FPGAReset, 20 ms,
+// imx462InitFPGA is the FPGA bringup after the Sony init writes: FPGAReset, 20 ms,
 // SetFPGAAsMaster(1), FPGAStop, EnableFPGADDR(0), SetFPGAADCWidthOutputWidth (bit4 = RAW16 from
 // the live ReadoutMode), SetFPGAGain(0x80×4), WriteFPGAREG(0x1a, 0x04).
 func imx462InitFPGA(rm Regmap, subtype int) error {
+	if err := poaUnsupported(rm, "imx462", "FPGA bringup"); err != nil {
+		return err
+	}
 	_ = subtype
 	if err := FPGAClearBits(rm, 0x00, 0x01); err != nil { // FPGAReset
 		return err
@@ -366,6 +368,9 @@ func imx462InitFPGA(rm Regmap, subtype int) error {
 // with the HCG rebase above 80) via SonyAnalogGain, sets/clears the 0x3009 HCG bit and writes
 // the code byte to 0x3014, under the 0x3001 latch.
 func imx462SetGain(rm Regmap, gain int) error {
+	if err := poaUnsupported(rm, "imx462", "SetGain"); err != nil {
+		return err
+	}
 	if gain > imx462GainMax {
 		gain = imx462GainMax
 	}
@@ -384,7 +389,7 @@ func imx462SetGain(rm Regmap, gain int) error {
 			mode &= 0x0f
 		}
 		// The FRSEL low bits are left as-is: the clock select is owned by imx462WriteClockSel
-		// (SetCMOSClk), rewritten at the end of every SetExp/SetResolution.
+		// (the clock select), rewritten at the end of every SetExp/SetResolution.
 		if err := rm.WriteReg(imx462RegGainMode, mode); err != nil {
 			return err
 		}
@@ -392,7 +397,7 @@ func imx462SetGain(rm Regmap, gain int) error {
 	})
 }
 
-// imx462WriteClockSel is SetCMOSClk (0071_CCameraS462MC.o .text+0x1d50): program the 0x3009
+// imx462WriteClockSel programs the sensor clock: program the 0x3009
 // clock/FRSEL select for the live readout mode, preserving the conversion-gain bit that SetGain
 // maintains:
 //
@@ -402,7 +407,7 @@ func imx462SetGain(rm Regmap, gain int) error {
 //	                                 control sets on this die; bin 2 is host-binned)
 //	other                         -> FRSEL 0x02   (unused)
 //
-// The SDK calls it from SetExp, SetResolution, InitCamera and SetHighSpeedMode; the driver
+// The SDK calls it whenever the exposure, the window or the speed mode changes. The driver
 // mirrors the first two (init writes 0x3009=0x01 in the reglist; a HighSpeed toggle takes effect
 // at the next SetExposure/SetROI). Rewriting FRSEL at every tail gives normal captures after a
 // high-speed session bit0 back.
@@ -463,7 +468,7 @@ func imx462SetExposure(rm Regmap, d time.Duration) error {
 	}
 	// HMAX from the live ROI dimensions when set (a sub-frame ROI sustains a shorter line
 	// period; the bandwidth throttle scales with the frame size), else full-frame. HMAX =
-	// max(link-bandwidth candidate, floor)·100/FPSPercent (SetFPSPerc; see the floor constants).
+	// max(link-bandwidth candidate, floor)·100/FPSPercent (the SDK's bandwidth formula; see the floor constants).
 	hw, hh := imx462FullWidth, imx462FullHeight
 	if rd := ModeOf(rm); rd.Width > 0 && rd.Height > 0 { // zero Height collapses the candidate
 		hw, hh = rd.Width, rd.Height
@@ -475,19 +480,22 @@ func imx462SetExposure(rm Regmap, d time.Duration) error {
 	if err := ApplyExposure(rm, imx462Shutter, imx462RegLatch, d); err != nil {
 		return err
 	}
-	// SetCMOSClk at the tail, as SetExp does: the sensor clock select must track the live mode
+	// the clock select at the tail, as SetExp does: the sensor clock select must track the live mode
 	// or the HMAX/SHS math above runs at the wrong physical rate.
 	return imx462WriteClockSel(rm)
 }
 
-// imx462SetOffset (SetBrightness) writes the offset 16-bit LE to 0x300a/0x300b, no scaling;
-// imx462GetOffset reads it back.
+// imx462GetOffset reads the offset back from 0x300a/0x300b, the pair imx462SetOffset writes
+// 16-bit little-endian with no scaling.
 func imx462GetOffset(rm Regmap) (int, error) {
 	v, err := ReadRegLE(rm, []uint16{0x300a, 0x300b})
 	return int(v), err
 }
 
 func imx462SetOffset(rm Regmap, offset int) error {
+	if err := poaUnsupported(rm, "imx462", "SetOffset"); err != nil {
+		return err
+	}
 	v := uint16(offset)
 	if err := rm.WriteReg(0x300b, (v>>8)&0xff); err != nil {
 		return err
@@ -495,9 +503,12 @@ func imx462SetOffset(rm Regmap, offset int) error {
 	return rm.WriteReg(0x300a, v&0xff)
 }
 
-// imx462SetROI: SetStartPos (X aligned to 4, Y to 2) + Cam_SetResolution (mode 0x3006, window,
-// SetOutput16Bits, FPGA geometry, HMAX), then SetCMOSClk at the tail.
+// imx462SetROI: the window start (X aligned to 4, Y to 2) + the window write (mode 0x3006, window,
+// the 16-bit output select, FPGA geometry, HMAX), then the clock select at the tail.
 func imx462SetROI(rm Regmap, x, y, w, h, bin int) error {
+	if err := poaUnsupported(rm, "imx462", "SetROI"); err != nil {
+		return err
+	}
 	if bin < 1 {
 		bin = 1
 	}
@@ -547,7 +558,7 @@ func imx462SetROI(rm Regmap, x, y, w, h, bin int) error {
 		}
 	}
 
-	// SetOutput16Bits: the sensor output bit format, branching on the high-speed flag. Normal or
+	// the 16-bit output select: the sensor output bit format, branching on the high-speed flag. Normal or
 	// RAW16 uses the 12-bit ADBIT block (0x3005=1, OUTFMT 0x3046=0xf1, 0x3129=0, 0x317c=0,
 	// 0x31ec=0x0e) with FPGA ADC_BIT=1. High-speed and RAW8 uses the 10-bit reformat
 	// (0x3046=0xf0, 0x3005=0, 0x3129=0x1d, 0x317c=0x12, ADC_BIT=0): a shorter ADC ramp clocked
@@ -575,6 +586,6 @@ func imx462SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if err := ProgramHMAX(rm, w, h, clk, floor, imx462VBlankAdd); err != nil {
 		return err
 	}
-	// SetCMOSClk at the tail, as SetResolution does.
+	// the clock select at the tail, as SetResolution does.
 	return imx462WriteClockSel(rm)
 }

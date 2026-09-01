@@ -4,15 +4,14 @@
 // RAW16 full frame and offset levels, host bin 2 at both depths, a 640×480 ROI (level, 49.5 fps
 // stream, 2 s and 5 s bands), full-frame 100 ms / 2 s / 5 s and the 9.2 fps stream; the FX3
 // brackets each frame with the 0x5A7E/0x3CF0 marker words (FX3DMAMarkers). The black level holds
-// for one capture cycle, so the worker rewrites it on every arm. SDK op → profile function:
+// for one capture cycle, so the worker rewrites it on every arm. Profile entry points:
 //
-//	InitCamera         imx174Init, imx174InitFPGA
-//	Cam_SetResolution  imx174SetROI (window, VMAX, FPGA geometry, HMAX)
-//	SetStartPos        imx174SetROI (ROI start)
-//	SetGain            imx174SetGain
-//	SetExp             imx174SetExposure
-//	SetBrightness      imx174SetOffset
-//	WorkingFunc        imx174Worker
+//	imx174Init, imx174InitFPGA  sensor and FPGA bringup
+//	imx174SetROI                window start, window size, VMAX, FPGA geometry, HMAX
+//	imx174SetGain               analog gain
+//	imx174SetExposure           frame length and shutter position
+//	imx174SetOffset             black level
+//	imx174Worker                the single-shot capture worker
 
 package sensors
 
@@ -30,7 +29,7 @@ const (
 	imx174RegGainL = 0x404
 	imx174RegGainH = 0x405
 
-	// Cam_SetResolution: VMAX (frame length) = height·bin + 0x26, 16-bit.
+	// Window setup: VMAX (frame length) = height·bin + 0x26, 16-bit.
 	imx174RegVMAXL = 0x217
 	imx174RegVMAXH = 0x218
 
@@ -38,13 +37,13 @@ const (
 	imx174RegSHSL = 0x29a
 	imx174RegSHSH = 0x29b
 
-	// SetStartPos: ROI offset; X aligned to 4, Y to 2 before the write.
+	// Window start: ROI offset; X aligned to 4, Y to 2 before the write.
 	imx174RegStartXL = 0x301
 	imx174RegStartXH = 0x302
 	imx174RegStartYL = 0x303
 	imx174RegStartYH = 0x304
 
-	// Cam_SetResolution: output window size × binning.
+	// Window setup: output window size × binning.
 	imx174RegWidthL  = 0x305
 	imx174RegWidthH  = 0x306
 	imx174RegHeightL = 0x307
@@ -61,7 +60,7 @@ const (
 	// Line time = HMAX·1000/clock. HMAX comes from HMAXBW (imx174HMAX) with the floor, the
 	// H-term (height + 0x26) and the bandwidth constants below; USB2 RAW16 full-frame at
 	// FPSPercent 40 gives 4337 (0x10f1), the SDK value.
-	imx174ClkKHz    = 20000 // pixel clock in kHz (SetCMOSClk 0x4e20; master 0x1220a = 74250)
+	imx174ClkKHz    = 20000 // pixel clock in kHz (0x4e20; master 0x1220a = 74250)
 	imx174HMAXFloor = 780   // 0x30c
 	imx174FPGAHMAXL = 0x13  // SetFPGAHMAX -> FPGA 0x13/0x14
 	imx174FPGAHMAXH = 0x14
@@ -75,7 +74,7 @@ func imx174HMAX(rm Regmap, w, h int) uint16 {
 	return HMAXBW(w, h, imx174ClkKHz, imx174HMAXFloor, imx174VMAXOffset, imx174BWUSB2, imx174BWUSB3, ModeOf(rm))
 }
 
-// imx174Init is InitCamera's sensor-write sequence: the 31-entry reglist (reg 0xffff =
+// imx174Init is the sensor-write half of camera bringup: the 31-entry reglist (reg 0xffff =
 // InitDelayReg, delay = val ms) then the explicit WriteSONYREG tail. FPGA bringup is in
 // imx174InitFPGA; the SDK's trailing SendCMD(0xAE) is not replayed.
 var imx174Init = []RegVal{
@@ -89,7 +88,7 @@ var imx174Init = []RegVal{
 	{Reg: 0x58f, Val: 0x7c}, {Reg: 0x7b7, Val: 0x04}, {Reg: 0x7c5, Val: 0x85}, {Reg: 0x7d5, Val: 0x5a},
 	{Reg: 0x825, Val: 0x10}, {Reg: 0x82b, Val: 0xe0}, {Reg: 0x82c, Val: 0x0a}, {Reg: 0x830, Val: 0xaf},
 	{Reg: 0x831, Val: 0x10},
-	// --- explicit WriteSONYREG tail (InitCamera) ---
+	// --- explicit WriteSONYREG bringup tail ---
 	{Reg: 0x2a9, Val: 0x30}, {Reg: 0x2c2, Val: 0xa0}, {Reg: 0x205, Val: 0x20}, {Reg: 0x21c, Val: 0x41},
 	{Reg: 0x214, Val: 0x01}, {Reg: 0x300, Val: 0x03}, {Reg: 0x56a, Val: 0x21}, {Reg: 0x586, Val: 0x68},
 	{Reg: 0x587, Val: 0x10}, {Reg: 0x5a8, Val: 0x31}, {Reg: 0x62a, Val: 0x90}, {Reg: 0x62b, Val: 0x51},
@@ -126,7 +125,7 @@ var IMX174 = Sensor{
 	// FX3 marker words 0x5A7E/0x3CF0 in the first/last DMA word (wire-confirmed against the SDK
 	// on an ASI174MM Mini).
 	FX3DMAMarkers: true,
-	ROIStartAlign: func(int) (int, int) { return 4, 2 }, // SetStartPos masks
+	ROIStartAlign: func(int) (int, int) { return 4, 2 }, // window-start masks
 }
 
 // errExposureAborted is returned by a capture worker when StopExposure interrupts it, so the
@@ -145,7 +144,7 @@ var errExposureAborted = fmt.Errorf("exposure aborted")
 //	           capture cycle, so it is rewritten every arm)
 //	integrate: trigger band only: EnableFPGATriggerSignal(1)·poll-sleep until elapsed·(0)
 //	read:      BulkReadQuiet = async urb pump with exact-remainder tail; no FPGABufReload
-//	stop:      0x212=1·0x200=1·FPGAStop·SendCMD(0xAA)·ResetEndPoint (WorkingFunc exit)
+//	stop:      0x212=1·0x200=1·FPGAStop·SendCMD(0xAA)·ResetEndPoint (the SDK's exit)
 func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 	// FPGA reg0 bit4 = readout stop (FPGAStop/Start); reg 0x0b bit0 = the trigger signal.
@@ -267,7 +266,7 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	}
 	readFrame := func() (int, error) { return ctl.BulkReadQuiet(buf[:target], quiet, readTimeout) }
 
-	// Halt the readout on every return, as WorkingFunc's exit does (0054_CCameraS174MM_Mini.o):
+	// Halt the readout on every return, as the SDK does on its way out:
 	// StopSensorStreaming (0x212=1, master 0x200=1, FPGAStop), SendCMD(0xAA), ResetEndPoint.
 	// Best-effort: a failed stop must not fail a good frame.
 	defer func() {
@@ -297,7 +296,7 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	return n, err
 }
 
-// imx174InitFPGA is the FPGA bringup InitCamera performs after the Sony tail (firmware subtype
+// imx174InitFPGA is the FPGA bringup that follows after the Sony tail (firmware subtype
 // >= 0x12), using the FX3 register numbers:
 //
 //	FPGAReset                          reg0 bit0 -> 0
@@ -313,6 +312,9 @@ func imx174Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 //
 // The SDK's SendCMD(0xAE) is not replayed; the legacy (< 0x12) path is not reproduced.
 func imx174InitFPGA(rm Regmap, subtype int) error {
+	if err := poaUnsupported(rm, "imx174", "FPGA bringup"); err != nil {
+		return err
+	}
 	if subtype < 0x12 {
 		// Legacy < 0x12 path (raw FPGA 0x0c-0x0f + reg1/reg0xa pokes) not reproduced.
 		_ = subtype
@@ -360,14 +362,17 @@ func imx174InitFPGA(rm Regmap, subtype int) error {
 	return FPGAWriteBits(rm, 0x0a, 0x11, adcOut)
 }
 
-// imx174SetOffset (SetBrightness) writes the offset 16-bit little-endian to 0x458/0x459, no
-// scaling; imx174GetOffset reads it back.
+// imx174GetOffset reads the offset back from 0x458/0x459, the pair imx174SetOffset writes
+// 16-bit little-endian with no scaling.
 func imx174GetOffset(rm Regmap) (int, error) {
 	v, err := ReadRegLE(rm, []uint16{0x458, 0x459})
 	return int(v), err
 }
 
 func imx174SetOffset(rm Regmap, offset int) error {
+	if err := poaUnsupported(rm, "imx174", "SetOffset"); err != nil {
+		return err
+	}
 	v := uint16(offset)
 	if err := rm.WriteReg(0x459, (v>>8)&0xff); err != nil {
 		return err
@@ -378,6 +383,9 @@ func imx174SetOffset(rm Regmap, offset int) error {
 // imx174SetGain (SetGain) clamps the gain to [0, 400] and writes it as the 16-bit code under
 // the 0x20c latch.
 func imx174SetGain(rm Regmap, gain int) error {
+	if err := poaUnsupported(rm, "imx174", "SetGain"); err != nil {
+		return err
+	}
 	if gain > imx174GainMax {
 		gain = imx174GainMax
 	}
@@ -415,7 +423,7 @@ func imx174SetExposure(rm Regmap, d time.Duration) error {
 	us := uint64(d.Microseconds())
 	trigger := us >= imx174TriggerUs // >= 4 s: FPGA hardware-trigger band
 
-	// Normal readout HMAX for the live window (SetFPSPerc on the ROI geometry: a 640×480 window
+	// Normal readout HMAX for the live window (the SDK's bandwidth formula on the ROI geometry: a 640×480 window
 	// runs HMAX 780 against 1735 full-frame at USB2 FPS% 100), the same value SetROI programs, so
 	// the line time here and the FPGA's agree. In the trigger band HMAX is 0x1500 (SetExp writes
 	// it before the line-time read), so the VMAX/SHS math below uses the trigger line time.
@@ -447,7 +455,7 @@ func imx174SetExposure(rm Regmap, d time.Duration) error {
 	frameTimeUs := defaultVMAX * normalLineTimeNs / 1000
 	longFrame := us > frameTimeUs+100000
 
-	// EnableFPGAWaitMode(1): reg0 bit6, set per exposure (InitCamera never calls WaitMode).
+	// EnableFPGAWaitMode(1): reg0 bit6, set per exposure (camera bringup never sets WaitMode).
 	if err := FPGASetBits(rm, 0x00, 0x40); err != nil {
 		return err
 	}
@@ -510,14 +518,17 @@ func imx174SetExposure(rm Regmap, d time.Duration) error {
 	})
 }
 
-// imx174SetROI: SetStartPos (X aligned to 4, Y to 2) plus Cam_SetResolution (window, VMAX =
+// imx174SetROI: the window start (X aligned to 4, Y to 2) plus the window write (window, VMAX =
 // h·bin+0x26, FPGA HBLK=0, VBLK=0xb, Width, Height, HMAX); the sensor group is under the 0x20c
 // latch.
 //
 // A sensor bin is rejected: this firmware has no pixel-binning step and no bin-gated mode
-// register (Cam_SetResolution only scales the geometry by bin, the SDK's host-bin path), so the
+// register (the window write only scales the geometry by bin, which is the SDK's host-bin path), so the
 // profile lists no HWBins and the Camera always host-bins from the bin-1 window.
 func imx174SetROI(rm Regmap, x, y, w, h, bin int) error {
+	if err := poaUnsupported(rm, "imx174", "SetROI"); err != nil {
+		return err
+	}
 	if bin > 1 {
 		return fmt.Errorf("imx174: sensor bin %d not available (no pixel-binning step; the Camera host-bins)", bin)
 	}
@@ -549,7 +560,7 @@ func imx174SetROI(rm Regmap, x, y, w, h, bin int) error {
 	}); err != nil {
 		return err
 	}
-	// FPGA frame geometry (Cam_SetResolution): HBLK=0, VBLK=0xb, Width, Height.
+	// FPGA frame geometry: HBLK=0, VBLK=0xb, Width, Height.
 	if err := ProgramFrameGeometry(rm, w, h, 0x00, 0x0b); err != nil {
 		return err
 	}

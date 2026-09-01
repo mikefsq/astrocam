@@ -77,6 +77,17 @@ type FrameStream interface {
 	Close() error
 }
 
+// LinkForcer is the optional Transport capability that pins the reported link speed. The
+// negotiated speed is a hardware matter and cannot be changed from the host: this makes the
+// transport REPORT High Speed on a SuperSpeed link, so everything downstream behaves as it would
+// on USB2 — the bandwidth budget and GPIF divider the profile picks, Open's default bandwidth
+// percentage, and the EP0 pacing that only runs on USB2 readouts. The wire stays SuperSpeed, so
+// it exercises the USB2 CONFIGURATION at SuperSpeed throughput, which is what makes it useful for
+// separating a timing-model bug from a link bug.
+type LinkForcer interface {
+	ForceUSB2(on bool)
+}
+
 // StreamStarter opens a resident FrameStream session.
 type StreamStarter interface {
 	StartStream(frameBytes int, total time.Duration) (FrameStream, error)

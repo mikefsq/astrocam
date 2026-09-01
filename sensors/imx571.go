@@ -2,17 +2,16 @@
 // Exmor/STARVIS-2 family as the IMX455, so the profile has the same shape (two exposure modes,
 // FX3 DDR frame markers, windowed FX3 pump with FPGABufReload tail-flush); the registers and
 // constants are the 571's own. Not hardware-validated; it tracks the hardware-verified IMX455
-// profile. SDK op → profile function:
+// profile. Profile entry points:
 //
-//	InitCamera                                imx571InitCommon, imx571InitFPGA
-//	InitSensorMode                            imx571SelectMode + the mode tables at the end
-//	Cam_SetResolution                         imx571SetROI (window, mode 0x1d8, OB crop, geometry)
-//	SetStartPos                               imx571SetROI (ROI start)
-//	SetGain                                   imx571SetGain (imx571SetGainZWO / imx571SetGainPOA)
-//	SetExp                                    imx571SetExposure
-//	SetBrightness                             imx571SetOffset
-//	StartSensorStreaming/StopSensorStreaming  StreamStart/StreamStop, imx571Arm
-//	WorkingFunc                               imx571Worker (arm: imx571Arm)
+//	imx571InitCommon, imx571InitFPGA  sensor and FPGA bringup
+//	imx571SelectMode                  the per-mode tables at the end of this file
+//	imx571SetROI                      window start, window, mode 0x1d8, OB crop, geometry
+//	imx571SetGain                     analog gain (imx571SetGainZWO / imx571SetGainPOA)
+//	imx571SetExposure                 frame length and shutter position
+//	imx571SetOffset                   black level
+//	StreamStart / StreamStop          sensor streaming gate, with imx571Arm
+//	imx571Worker                      the single-shot capture worker (arm: imx571Arm)
 //
 // PlayerOne drives the same die: SetGain/SetOffset/GainCaps/OffsetCaps dispatch on the regmap's
 // VID (ZWO 0x03C3 vs PlayerOne 0xA0A0).
@@ -38,7 +37,7 @@ const (
 	imx571RegConvLow   = 0x2f  // LCG/HCG conversion-gain select (0/1)
 	imx571RegConvHi    = 0x40  // top-band coarse-stage nibble, bits[4:7] (> 460)
 
-	// SetStartPos: X aligned to 16, written nibble-shifted; Y direct.
+	// Window start: X aligned to 16, written nibble-shifted; Y direct.
 	imx571RegApply    = 0x07 // coupled-group apply (written 1 by ROI / res ops)
 	imx571RegStartXEn = 0xa7 // ROI-X enable / mode flag (=1)
 	imx571RegStartXL  = 0xa8 // X start bits [4:12]  (X>>4)
@@ -46,7 +45,7 @@ const (
 	imx571RegStartYL  = 0x08 // (Y start + 0x19/0x1b) low byte
 	imx571RegStartYH  = 0x09 // (Y start + 0x19/0x1b) high byte
 
-	// Cam_SetResolution: output window in output (binned) pixels.
+	// Window setup: output window in output (binned) pixels.
 	imx571RegWinMode = 0x1d8 // window mode: 4 full / 0 binned
 	imx571RegHeightL = 0x0a  // window HEIGHT low  (effHeight, +2 when binned)
 	imx571RegHeightH = 0x0b  // window HEIGHT high
@@ -99,7 +98,7 @@ const (
 	imx571VBlank3 = 24   // 0x18, bin3
 
 	// FPGA optical-black crop: FPGA_SKIP_LINE → SetFPGAVBLK, FPGA_SKIP_CLOUMN → SetFPGAHBLK,
-	// rewritten per mode and applied by SetStartPos.
+	// rewritten per mode and applied with the window start.
 	imx571SkipLine1   = 45 // 0x2d, bin1
 	imx571SkipLine2   = 25 // 0x19, bin2/4
 	imx571SkipLine3   = 23 // 0x17, bin3
@@ -111,10 +110,10 @@ const (
 	imx571FullHeight = 4168 // output rows at full-frame bin 1
 )
 
-// imx571InitCommon is the mode-independent first stage of InitCamera: the 54-entry reglist_init
+// imx571InitCommon is the mode-independent first stage of camera bringup: the 54-entry common
 // table (reg 0xffff = delay of val ms) then the explicit WriteSONYREG tail.
 var imx571InitCommon = []RegVal{
-	// --- reglist_init: reg/val16 pairs ---
+	// --- common init: reg/val16 pairs ---
 	{Reg: 0x01ee, Val: 0x01}, {Reg: 0x0000, Val: 0x04}, {Reg: 0xffff, Val: 0x0a}, // delay 10 ms
 	{Reg: 0x0003, Val: 0x10}, {Reg: 0x0018, Val: 0x01}, {Reg: 0x0027, Val: 0x06}, {Reg: 0x0051, Val: 0x08},
 	{Reg: 0x00d3, Val: 0x08}, {Reg: 0x0133, Val: 0x8c}, {Reg: 0x0324, Val: 0x01}, {Reg: 0x0325, Val: 0x0f},
@@ -139,8 +138,32 @@ var imx571InitCommon = []RegVal{
 }
 
 // imx571Init is the streaming default: the common init followed by the bin-1 16-bit per-mode
-// table (InitCamera then InitSensorMode); the other tables are applied by SetROI per bin.
+// table (common bringup, then the per-mode table); the other tables are applied by SetROI per bin.
 var imx571Init = append(append([]RegVal{}, imx571InitCommon...), imx571ModeFull16...)
+
+// imx571InitPOA is PlayerOne's own init reglist for this die (61 register/value records) rather
+// than a reuse of ZWO's. Against the ZWO table's 60, 47 registers overlap and two values differ
+// (0x0133 0x8c/0x8d, 0x0368 0xe0/0xe1). The vendors agree on Sony's analog tuning; what they
+// disagree on is which registers sit in the table and which move into the init sequence around
+// it.
+var imx571InitPOA = []RegVal{
+	{Reg: 0x01f7, Val: 0x00}, {Reg: 0x0027, Val: 0x06}, {Reg: 0x00d3, Val: 0x08}, {Reg: 0x0400, Val: 0x0e},
+	{Reg: 0x0454, Val: 0x22}, {Reg: 0x0456, Val: 0x22}, {Reg: 0x0559, Val: 0x19}, {Reg: 0x055a, Val: 0x17},
+	{Reg: 0x055c, Val: 0x19}, {Reg: 0x055d, Val: 0x17}, {Reg: 0x055f, Val: 0x20}, {Reg: 0x0560, Val: 0x1e},
+	{Reg: 0x0562, Val: 0x20}, {Reg: 0x0563, Val: 0x1e}, {Reg: 0x056b, Val: 0x27}, {Reg: 0x056c, Val: 0x25},
+	{Reg: 0x056e, Val: 0x20}, {Reg: 0x056f, Val: 0x1e}, {Reg: 0x0573, Val: 0x00}, {Reg: 0x0590, Val: 0x01},
+	{Reg: 0x0596, Val: 0x19}, {Reg: 0x0597, Val: 0x14}, {Reg: 0x0598, Val: 0x20}, {Reg: 0x0599, Val: 0x1b},
+	{Reg: 0x0600, Val: 0x1c}, {Reg: 0x0635, Val: 0x19}, {Reg: 0x0636, Val: 0x15}, {Reg: 0x0637, Val: 0x20},
+	{Reg: 0x0638, Val: 0x15}, {Reg: 0x063a, Val: 0x19}, {Reg: 0x063b, Val: 0x15}, {Reg: 0x063c, Val: 0x20},
+	{Reg: 0x063d, Val: 0x15}, {Reg: 0x063f, Val: 0x19}, {Reg: 0x0640, Val: 0x15}, {Reg: 0x0641, Val: 0x20},
+	{Reg: 0x0642, Val: 0x15}, {Reg: 0x066e, Val: 0x11}, {Reg: 0x0671, Val: 0x11}, {Reg: 0x0674, Val: 0x11},
+	{Reg: 0x0677, Val: 0x11}, {Reg: 0x07cc, Val: 0x0a}, {Reg: 0x0133, Val: 0x8d}, {Reg: 0x0368, Val: 0xe1},
+	{Reg: 0x0051, Val: 0x08}, {Reg: 0x0113, Val: 0x00}, {Reg: 0x0120, Val: 0xbc}, {Reg: 0x0121, Val: 0x01},
+	{Reg: 0x043e, Val: 0x01}, {Reg: 0x0443, Val: 0x01}, {Reg: 0x052e, Val: 0x01}, {Reg: 0x0501, Val: 0x00},
+	{Reg: 0x0506, Val: 0x00}, {Reg: 0x0505, Val: 0x10}, {Reg: 0x0098, Val: 0x05}, {Reg: 0x0528, Val: 0x03},
+	{Reg: 0x052b, Val: 0x03}, {Reg: 0x0522, Val: 0x30}, {Reg: 0x0525, Val: 0x03}, {Reg: 0x045c, Val: 0x03},
+	{Reg: 0x0002, Val: 0x69},
+}
 
 // IMX571 is the Sony IMX571 APS-C profile (ZWO ASI2600 family, PlayerOne Poseidon). Not
 // hardware-validated; it tracks the hardware-verified IMX455 profile.
@@ -161,6 +184,7 @@ var IMX571 = Sensor{
 	OffsetMax:   240,
 	OffsetDef:   1,
 	Init:        imx571Init,
+	InitByVID:   map[uint16][]RegVal{POA.VID: imx571InitPOA},
 	InitFPGA:    imx571InitFPGA,
 	SetGain:     imx571SetGain,
 	GainCaps:    imx571GainCaps,
@@ -169,9 +193,9 @@ var IMX571 = Sensor{
 	GetOffset:   imx571GetOffset,
 	OffsetCaps:  imx571OffsetCaps,
 	SetROI:      imx571SetROI,
-	// Master/stream gate (the IMX455 shape): StopSensorStreaming = 0x1ee←5 + CamSetStandby(1)
+	// Master/stream gate (the IMX455 shape): StopSensorStreaming = 0x1ee←5 + the standby write(1)
 	// (reg0 bit0); StartSensorStreaming = 0x1ee←1 + CamSetWakeup(1) (reg0 bit2) + 10 ms +
-	// CamSetStandby(0). Used by StopExposure and the StartVideo arm; imx571Arm has the same
+	// the standby write(0). Used by StopExposure and the StartVideo arm; imx571Arm has the same
 	// sequence inline.
 	StreamStop: func(rm Regmap) error {
 		if err := rm.WriteReg(imx571RegMaster, 5); err != nil { // 0x1ee = 5 (stop)
@@ -193,11 +217,11 @@ var IMX571 = Sensor{
 	Worker: imx571Worker, // arm + windowed stream read
 
 	FX3DMAMarkers: true, // FX3 bridge framing (0x5A7E/0x3CF0 marker words)
-	// Hardware readout modes: the bin-2 and bin-3 12-bit tables (InitSensorMode); the SDK's
+	// Hardware readout modes: the bin-2 and bin-3 12-bit tables; the SDK's
 	// bin 4 is the bin-2 table over 2w×2h with the host binning 2× more, which the Camera
 	// derives from this list.
 	HWBins: []int{2, 3},
-	// SetStartPos masks: X to 16; Y to 2 at bin 1, 4 at bin 2, 6 at bin 3.
+	// Window-start masks: X to 16; Y to 2 at bin 1, 4 at bin 2, 6 at bin 3.
 	ROIStartAlign: func(bin int) (int, int) {
 		switch bin {
 		case 2:
@@ -211,7 +235,7 @@ var IMX571 = Sensor{
 
 // imx571Worker is the host-timed single-shot capture worker (the IMX455 shape). The sensor gate
 // is the 0x1ee master register via StartSensorStreaming/StopSensorStreaming (which also toggle
-// CamSetWakeup reg0 bit2 / CamSetStandby reg0 bit0). At >= 1 s SetExp arms trigger mode (reg0
+// CamSetWakeup reg0 bit2 / the standby write reg0 bit0). At >= 1 s SetExp arms trigger mode (reg0
 // bit6/bit7); the worker drives the trigger signal (EnableFPGATriggerSignal, FPGA reg 0x0b
 // bit0), whose 1->0 edge releases the frame; the SetExp trigger-mode bits are only safe with
 // this worker. The very-long-band multi-exposure accumulation cycle is not reproduced:
@@ -222,12 +246,12 @@ var IMX571 = Sensor{
 //	expose: >= 1 s only: EnableFPGATriggerSignal(1)·hold the exposure·(0)
 //	read:   continuous windowed pump (ctl.StreamFrame) with a 20 ms FPGABufReload ticker;
 //	        FPGAStop/usleep/FPGAStart on stall
-//	stop:   StopSensorStreaming·SendCMD(0xAA)·ResetEndPoint (WorkingFunc exit)
+//	stop:   StopSensorStreaming·SendCMD(0xAA)·ResetEndPoint (the SDK's exit)
 func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 
 	// Sensor reg-0 read-modify-write (ReadSONYREG 0 -> mask -> WriteSONYREG 0), the bits
-	// CamSetWakeup/CamSetStandby toggle: standby = reg0 bit0, wakeup = reg0 bit2.
+	// CamSetWakeup/the standby write toggle: standby = reg0 bit0, wakeup = reg0 bit2.
 	regRMW := func(set, clr uint16) error {
 		v, err := rm.ReadReg(0)
 		if err != nil {
@@ -242,7 +266,7 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	// this for the integration time.
 	triggerSignal := func(on bool) error { return SetFPGABit(rm, 0x0b, 0x01, on) }
 
-	// StopSensorStreaming: FPGAStop, 0x1ee=5, CamSetStandby(1); the deferred halt uses it.
+	// StopSensorStreaming: FPGAStop, 0x1ee=5, the standby write(1); the deferred halt uses it.
 	stopStreaming := func() error {
 		if err := fpgaStop(); err != nil {
 			return err
@@ -254,8 +278,8 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	}
 
 	// --- arm (imx571Arm) ---
-	// Halt the readout on every return, the arm's own failures included, as WorkingFunc's
-	// exit does (0080_CCameraS2600MC_Pro.o):
+	// Halt the readout on every return, the arm's own failures included, as the SDK does on its
+	// way out:
 	// StopSensorStreaming, SendCMD(0xAA), ResetEndPoint. A sensor left free-running with no
 	// reader backs up the FX3 GPIF. Best-effort: a failed stop must not fail a good frame. Not
 	// hardware-verified.
@@ -340,8 +364,8 @@ func imx571Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 }
 
 // imx571Arm is the stream arm (the imx455Arm shape), shared by the worker and StartVideo:
-// SendCMD(0xAA) · StopSensorStreaming (FPGAStop · 0x1ee=5 · CamSetStandby(1)) · SendCMD(0xA9) ·
-// StartSensorStreaming (FPGAStop · 0x1ee=1 · CamSetWakeup(1) · 10 ms · CamSetStandby(0) ·
+// SendCMD(0xAA) · StopSensorStreaming (FPGAStop · 0x1ee=5 · the standby write(1)) · SendCMD(0xA9) ·
+// StartSensorStreaming (FPGAStop · 0x1ee=1 · CamSetWakeup(1) · 10 ms · the standby write(0) ·
 // FPGAStart). The FPGAStop inside StartSensorStreaming is the second stop after SendCMD(0xA9)
 // the DDR readout requires.
 func imx571Arm(ctl WorkerCtl) error {
@@ -386,7 +410,7 @@ func imx571Arm(ctl WorkerCtl) error {
 	return fpgaStart()
 }
 
-// imx571InitFPGA is the FPGA bringup InitCamera performs after the Sony init tail, using the FX3
+// imx571InitFPGA is the FPGA bringup that follows after the Sony init tail, using the FX3
 // register numbers:
 //
 //	FPGAReset                          reg0 bit0 -> 0
@@ -399,6 +423,9 @@ func imx571Arm(ctl WorkerCtl) error {
 //	SetFPGABinMode(0)                  reg0x27 low 2 bits = 0
 //	SetFPGAGain(0x80,0x80,0x80,0x80)   FPGA 0x0c-0x0f, strobed by reg 1
 func imx571InitFPGA(rm Regmap, subtype int) error {
+	if err := poaUnsupported(rm, "imx571", "FPGA bringup"); err != nil {
+		return err
+	}
 	_ = subtype
 	if err := FPGAClearBits(rm, 0x00, 0x01); err != nil { // FPGAReset: reg0 bit0
 		return err
@@ -414,7 +441,7 @@ func imx571InitFPGA(rm Regmap, subtype int) error {
 		return err
 	}
 	// SetFPGAADCWidthOutputWidth(adc=1, outputWidth): reg0xa bit0 = adc, bit4 = output width.
-	// InitCamera passes outputWidth = 0; bit4 = 1 for RAW16 from the live ReadoutMode (without
+	// Camera bringup passes outputWidth = 0; bit4 = 1 for RAW16 from the live ReadoutMode (without
 	// it the FPGA streams a half-size RAW8 frame).
 	adcOut := uint16(0x01) // bit0 = adc
 	if ModeOf(rm).BytesPerPx >= 2 {
@@ -523,7 +550,7 @@ func imx571SetOffsetZWO(rm Regmap, offset int) error {
 }
 
 // imx571Mode is one readout mode: its sensor register table plus the timing base V (line-time)
-// and vblank that InitSensorMode writes to the timing-base/vblank fields.
+// and vblank that the mode table writes to the timing-base/vblank fields.
 type imx571Mode struct {
 	table     []RegVal
 	v, vblank int
@@ -773,9 +800,12 @@ func imx571SetExposure(rm Regmap, d time.Duration) error {
 	return WriteRegLE(rm, imx571RegApply, []uint16{imx571RegSHS0, imx571RegSHS1}, uint32(shs))
 }
 
-// imx571SetROI: InitSensorMode (per-mode table), SetStartPos, Cam_SetResolution (window + mode
+// imx571SetROI: the per-mode table, the window start, the window write (window + mode
 // 0x1d8), the FPGA OB crop (per-mode skip values), the FPGA frame geometry and SetFPGABinDataLen.
 func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
+	if err := poaUnsupported(rm, "imx571", "SetROI"); err != nil {
+		return err
+	}
 	if bin < 1 {
 		bin = 1
 	}
@@ -788,7 +818,7 @@ func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if y < 0 {
 		y = 0
 	}
-	// (x,y,w,h) are binned output pixels. Apply this bin's readout-mode table (InitSensorMode),
+	// (x,y,w,h) are binned output pixels. Apply this bin's readout-mode table,
 	// then the ROI. The start is sensor pixels (binned·bin); window mode 0x1d8 = 4 full / 0
 	// binned; HEIGHT(0x0a) takes the output height +2 when binned, WIDTH(0x1dd) the ×4-aligned
 	// width +0x18.
@@ -850,7 +880,7 @@ func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
 	}); err != nil {
 		return err
 	}
-	// SetOutput16Bits / InitSensorMode: FPGA reg 0xa bit0 (ADC_BIT) follows the table, 1 for the
+	// Output width and mode: FPGA reg 0xa bit0 (ADC_BIT) follows the table, 1 for the
 	// 16-bit readout and 0 for the 12-bit bin tables; bit4 is the output width (1 = RAW16). The
 	// 455 rule (ADC_BIT left at 1 on a 12-bit table delivers unreadable frames), applied here by
 	// inference: not verified on an ASI2600.
@@ -885,12 +915,12 @@ func imx571SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if err := SetFPGABinDataLen(rm, uint32((w*h*bpp+3)/4)); err != nil {
 		return err
 	}
-	// DDR-branch HMAX (SetFPSPerc): the per-mode V written to 0x13/0x14, not the bandwidth-
+	// DDR-branch HMAX (the SDK's bandwidth formula): the per-mode V written to 0x13/0x14, not the bandwidth-
 	// throttle formula; SetExposure derives the line time from the same V.
 	return FPGAWrite16(rm, 0x13, 0x14, uint16(mode.v))
 }
 
-// IMX571 per-mode register tables (InitSensorMode), 53 entries each:
+// IMX571 per-mode register tables, 53 entries each:
 //
 //	bin 1, 16-bit : reg_full_16bit   the streaming default (imx571Init)
 //	bin 2         : reg_bin2w_12bit

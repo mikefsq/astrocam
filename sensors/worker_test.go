@@ -19,16 +19,21 @@ type fakeCtl struct {
 
 func (f *fakeCtl) Rm() Regmap            { return f.rm }
 func (f *fakeCtl) VendorCmd(FX3Op) error { return nil }
-func (f *fakeCtl) ResetEndpoint() error  { return nil }
-func (f *fakeCtl) ResetDevice() error    { return nil }
-func (f *fakeCtl) NoteStall()            {}
+
+// FPGARun reproduces ZWO's encoding on the fake's regmap — bit 4 of FPGA register 0 set to halt —
+// so a worker's run control still shows up on the scripted wire exactly as it did when profiles
+// open-coded it.
+func (f *fakeCtl) FPGARun(start bool) error { return SetFPGABit(f.rm, 0x00, 0x10, !start) }
+func (f *fakeCtl) ResetEndpoint() error     { return nil }
+func (f *fakeCtl) ResetDevice() error       { return nil }
+func (f *fakeCtl) NoteStall()               {}
 func (f *fakeCtl) DrainPipe(time.Duration) int {
 	f.drained++
 	return 0
 }
-func (f *fakeCtl) ReapplyOffset() error  { return nil }
-func (f *fakeCtl) Aborted() bool         { return false }
-func (f *fakeCtl) FrameBytes() int       { return f.fb }
+func (f *fakeCtl) ReapplyOffset() error { return nil }
+func (f *fakeCtl) Aborted() bool        { return false }
+func (f *fakeCtl) FrameBytes() int      { return f.fb }
 func (f *fakeCtl) BulkRead(buf []byte, to time.Duration) (int, error) {
 	f.lastTO = to
 	return len(buf), nil
@@ -99,13 +104,16 @@ func (s *scriptCtl) Rm() Regmap {
 	return s.rm
 }
 func (s *scriptCtl) VendorCmd(FX3Op) error { return nil }
-func (s *scriptCtl) ResetEndpoint() error  { s.resetEP++; return nil }
-func (s *scriptCtl) ResetDevice() error    { s.resetDev++; return nil }
+
+// FPGARun reproduces ZWO's encoding, as fakeCtl does.
+func (s *scriptCtl) FPGARun(start bool) error    { return SetFPGABit(s.Rm(), 0x00, 0x10, !start) }
+func (s *scriptCtl) ResetEndpoint() error        { s.resetEP++; return nil }
+func (s *scriptCtl) ResetDevice() error          { s.resetDev++; return nil }
+func (s *scriptCtl) NoteStall()                  { s.stalls++ }
 func (s *scriptCtl) DrainPipe(time.Duration) int { return 0 }
-func (s *scriptCtl) NoteStall()            { s.stalls++ }
-func (s *scriptCtl) ReapplyOffset() error  { s.reapplied++; return nil }
-func (s *scriptCtl) Aborted() bool         { return s.abortAfter > 0 && s.idx >= s.abortAfter }
-func (s *scriptCtl) FrameBytes() int       { return s.fb }
+func (s *scriptCtl) ReapplyOffset() error        { s.reapplied++; return nil }
+func (s *scriptCtl) Aborted() bool               { return s.abortAfter > 0 && s.idx >= s.abortAfter }
+func (s *scriptCtl) FrameBytes() int             { return s.fb }
 func (s *scriptCtl) read(buf []byte) (int, error) {
 	s.lastReadLen = len(buf)
 	if s.idx >= len(s.reads) {
@@ -165,7 +173,7 @@ func TestIMX462WorkerZerosResetDevice(t *testing.T) {
 	}
 }
 
-// TestIMX462WorkerShortBy512Tolerated: the SDK startAsyncXfer treats a frame short by
+// TestIMX462WorkerShortBy512Tolerated: the SDK the SDK treats a frame short by
 // exactly 512 bytes as complete; the worker zero-fills the missing tail.
 func TestIMX462WorkerShortBy512Tolerated(t *testing.T) {
 	const fb = 8192
@@ -395,7 +403,7 @@ func TestIMX290WorkerTriggerReload(t *testing.T) {
 }
 
 // TestWorkerReadClamp: a caller buffer larger than the frame does not widen the wire read; the
-// WorkingFuncs read only the frame byte count, and an oversized read runs into the next free-run
+// The SDK's capture loops read only the frame byte count, and an oversized read runs into the next free-run
 // frame or times out short.
 func TestWorkerReadClamp(t *testing.T) {
 	workers := []struct {

@@ -6,16 +6,15 @@
 // (single-shot and 1 s trigger band); bin 2 at both depths is host-binned like the SDK's
 // (SoftBinRAW8) and matches its level and rate. The FX3 brackets each frame with the
 // 0x5A7E/0x3CF0 marker words (FX3DMAMarkers); the SDK's frames carry real pixels there.
-// SDK op → profile function:
+// Profile entry points:
 //
-//	InitCamera         imx290Init, imx290InitFPGA
-//	SetCMOSClk         imx290WriteClockSel
-//	Cam_SetResolution  imx290SetROI (mode 0x3006, window, SetOutput16Bits, FPGA geometry, HMAX)
-//	SetStartPos        imx290SetROI (ROI start)
-//	SetGain            imx290SetGain
-//	SetExp             imx290SetExposure
-//	SetBrightness      imx290SetOffset
-//	WorkingFunc        imx290Worker
+//	imx290Init, imx290InitFPGA  sensor and FPGA bringup
+//	imx290WriteClockSel         pixel-clock select
+//	imx290SetROI                window start, mode 0x3006, window, output width, geometry, HMAX
+//	imx290SetGain               analog gain
+//	imx290SetExposure           frame length and shutter position
+//	imx290SetOffset             black level
+//	imx290Worker                the single-shot capture worker
 
 package sensors
 
@@ -32,13 +31,13 @@ const (
 	imx290RegGainMode = 0x3009 // bit 0x10 = high conversion gain; low bits = FRSEL clock select
 	imx290RegGainCode = 0x3014 // analog gain code (single byte)
 
-	// SetStartPos: X aligned to 4, Y to 2 before the write (WINPH/WINPV).
+	// Window start: X aligned to 4, Y to 2 before the write (WINPH/WINPV).
 	imx290RegStartXL = 0x3040
 	imx290RegStartXH = 0x3041
 	imx290RegStartYL = 0x303c
 	imx290RegStartYH = 0x303d
 
-	// Cam_SetResolution: output window size × binning (WINWH/WINWV).
+	// Window setup: output window size × binning (WINWH/WINWV).
 	imx290RegWidthL  = 0x3042
 	imx290RegWidthH  = 0x3043
 	imx290RegHeightL = 0x303e
@@ -71,12 +70,12 @@ const (
 	// SHSOffset the STARVIS VMAX/SHS math, HBLK/VBLK the FPGA frame geometry.
 	imx290FullWidth  = 1936
 	imx290FullHeight = 1096
-	// Pixel clock by mode (SetCMOSClk switch): normal RAW16 18562, 10-bit high-speed 37124,
+	// Pixel clock by mode (the clock select switch): normal RAW16 18562, 10-bit high-speed 37124,
 	// hardware bin 2 9281 (not modelled; RAW16 bin runs the normal clock). At 0.2 s full-frame
 	// USB2 the normal clock gives HMAX 0x0662.
 	imx290ClkKHz = 18562
-	// HMAX floor = REG_FRAME_LENGTH_PKG_MIN, written per clock by SetCMOSClk
-	// (0003_CCameraS290MM_Mini.o): 18562→203, 37124→196, 9281→145. HMAX = max(bandwidth
+	// HMAX floor = REG_FRAME_LENGTH_PKG_MIN, written per clock by the clock select
+	// (measured): 18562→203, 37124→196, 9281→145. HMAX = max(bandwidth
 	// candidate, floor)·100/FPSPercent: on USB2 the candidate dominates, on USB3 and small ROIs
 	// the floor pins HMAX. Floor-dominated readout is not hardware-verified.
 	imx290HMAXFloor   = 203
@@ -88,7 +87,7 @@ const (
 	imx290VBLK        = 9  // SetFPGAVBLK(9), sensor-specific blanking
 )
 
-// imx290Init is InitCamera's sensor-write sequence: the 47-entry reglist (reg 0xffff =
+// imx290Init is the sensor-write half of camera bringup: the 47-entry reglist (reg 0xffff =
 // InitDelayReg, delay = val ms) then the explicit WriteSONYREG tail. FPGA bringup is in
 // imx290InitFPGA; the SDK's SendCMD(0xAF/0xAE) are not replayed (Camera.Init sends 0xAF once).
 var imx290Init = []RegVal{
@@ -127,7 +126,7 @@ var IMX290 = Sensor{
 	ExpMinUs: imx290ExpMinUs,
 	ExpMaxUs: imx290ExpMaxUs,
 	// ASI Brightness / black level: range 0..240 from ASIGetControlCaps, and the default the
-	// SDK's InitCamera programs rather than the 1 its caps declare — the same poison-and-read
+	// SDK's bringup programs rather than the 1 its caps declare — the same poison-and-read
 	// check on regs 0x300a/0x300b gives 75. With it our default frames and the SDK's agree to
 	// 0.02 % (mean 1321.9 against 1321.6 at 4 ms, gain 0).
 	OffsetMax: 240, OffsetDef: 75,
@@ -153,10 +152,10 @@ var IMX290 = Sensor{
 	// on an ASI290MM Mini).
 	FX3DMAMarkers: true,
 	// No HWBins: the die's 2× readout (mode 0x3006=0x22, which SetROI still programs for a
-	// sensor bin 2) is one the SDK never selects (no ASI_HARDWARE_BIN control; Cam_SetResolution
+	// sensor bin 2) is one the SDK never selects (no ASI_HARDWARE_BIN control, and the window write
 	// programs it only under the hard-bin flag), and its frames differ from the SDK's host bin,
 	// so SetHardwareBin(true) host-bins here too, as the SDK does.
-	ROIStartAlign: func(int) (int, int) { return 4, 2 }, // SetStartPos masks
+	ROIStartAlign: func(int) (int, int) { return 4, 2 }, // window-start masks
 }
 
 // imx290Worker is the host-timed single-shot capture worker. The sensor gate is the 0x3000
@@ -168,7 +167,7 @@ var IMX290 = Sensor{
 //	expose: EnableFPGATriggerSignal(1)·host-time (< 1 s: exposure-200 ms, then re-arm;
 //	        >= 1 s: 100 ms poll for the full exposure)
 //	fire:   EnableFPGATriggerSignal(0)·BulkRead with the retry ladder
-//	stop:   FPGAStop·0x3000=1·SendCMD(0xAA)·ResetEndPoint (WorkingFunc exit)
+//	stop:   FPGAStop·0x3000=1·SendCMD(0xAA)·ResetEndPoint (the SDK's exit)
 func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error) {
 	rm := ctl.Rm()
 	arm := func(full bool) error {
@@ -199,7 +198,7 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := arm(true); err != nil {
 		return 0, err
 	}
-	// Halt the readout on every return, as WorkingFunc's exit does (0006_CCameraS290MC.o):
+	// Halt the readout on every return, as the SDK does on its way out:
 	// StopSensorStreaming (FPGAStop + standby 0x3000=1), SendCMD(0xAA), ResetEndPoint. A sensor
 	// left free-running with no reader backs up the FX3 GPIF until the firmware crashes.
 	// Best-effort: a failed stop must not fail a good frame. This exit sequence is not
@@ -246,7 +245,7 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	if err := integrate(); err != nil {
 		return 0, err
 	}
-	// Read with the retry ladder of WorkingFunc (0003_CCameraS290MM_Mini.o .text+0xf80), which
+	// Read with the SDK's own retry ladder, which
 	// covers the tiny-ROI intermittent short read:
 	//
 	//   trigger-mode short   -> checked first: if FPGA reg 0x23 bit2 says the triggered frame is
@@ -330,7 +329,7 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 	}
 }
 
-// imx290InitFPGA is the FPGA bringup InitCamera performs after the Sony init writes, using the
+// imx290InitFPGA is the FPGA bringup that follows after the Sony init writes, using the
 // FX3 register numbers:
 //
 //	FPGAReset                          reg0 bit0 -> 0
@@ -342,7 +341,7 @@ func imx290Worker(ctl WorkerCtl, buf []byte, exposure time.Duration) (int, error
 //	SetFPGAGain(0x80,0x80,0x80,0x80)   FPGA 0x0c-0x0f, strobed by reg 1
 //	WriteFPGAREG(0x1a, 0x04)           direct FPGA register write
 //
-// InitCamera passes outputWidth = 0 (8-bit) and the SDK raises reg0xa bit4 later for RAW16;
+// Camera bringup passes outputWidth = 0 (8-bit) and the SDK raises reg0xa bit4 later for RAW16;
 // here bit4 comes from the live ReadoutMode. With bit4 = 0 the ASI290 streams a half-size RAW8
 // frame (1936×1096×1 = 2121856 B) and the RAW16 read reports a short frame.
 func imx290InitFPGA(rm Regmap, subtype int) error {
@@ -381,7 +380,7 @@ func imx290InitFPGA(rm Regmap, subtype int) error {
 	if err := rm.WriteFPGAReg(0x01, 0); err != nil {
 		return err
 	}
-	return rm.WriteFPGAReg(0x1a, 0x04) // InitCamera
+	return rm.WriteFPGAReg(0x1a, 0x04) // as camera bringup does
 }
 
 // imx290SetGain (SetGain) clamps to [0, 600], converts to the Sony analog-gain code (gain/3
@@ -448,7 +447,7 @@ func imx290ClockFloor(rm Regmap) (clock, floor int) {
 	return imx290ClkKHz, imx290HMAXFloor
 }
 
-// imx290SetOutputFormat is SetOutput16Bits: the sensor output bit format for the live mode.
+// imx290SetOutputFormat is the 16-bit output select: the sensor output bit format for the live mode.
 // Normal or RAW16 uses the 12-bit ADBIT block (0x3005=1, OUTFMT 0x3046=0xf1, 0x3129=0,
 // 0x317c=0, 0x31ec=0x0e) with FPGA ADC_BIT (reg 0x0a bit0) = 1. High-speed RAW8 uses the 10-bit
 // reformat (0x3046=0xf0, 0x3005=0, 0x3129=0x1d, 0x317c=0x12, ADC_BIT=0): a shorter ADC ramp
@@ -493,12 +492,12 @@ func imx290SetExposure(rm Regmap, d time.Duration) error {
 	if err := ApplyExposure(rm, imx290Shutter, imx290RegLatch, d); err != nil {
 		return err
 	}
-	// SetCMOSClk at the tail, as SetExp does: the sensor clock select must track the live mode
+	// the clock select at the tail, as SetExp does: the sensor clock select must track the live mode
 	// or the HMAX/SHS math above runs at the wrong physical rate.
 	return imx290WriteClockSel(rm)
 }
 
-// imx290WriteClockSel is SetCMOSClk (0003_CCameraS290MM_Mini.o .text+0x1af0): program the
+// imx290WriteClockSel programs the sensor clock: program the
 // 0x3009 clock/FRSEL select for the live readout mode, preserving the conversion-gain bit that
 // SetGain maintains:
 //
@@ -508,7 +507,7 @@ func imx290SetExposure(rm Regmap, d time.Duration) error {
 //	                                 control sets on this die; bin 2 is host-binned)
 //	other                         -> FRSEL 0x02   (unused)
 //
-// The SDK calls it from SetExp, SetResolution, InitCamera and SetHighSpeedMode; the driver
+// The SDK calls it whenever the exposure, the window or the speed mode changes. The driver
 // mirrors the first two (the init reglist leaves 0x3009 alone; a HighSpeed toggle takes effect
 // at the next SetExposure/SetROI). Without this write the host math would switch clocks
 // (imx290ClockFloor) while the sensor stayed on its init clock.
@@ -524,8 +523,8 @@ func imx290WriteClockSel(rm Regmap) error {
 	return rm.WriteReg(imx290RegGainMode, v)
 }
 
-// imx290SetOffset (SetBrightness) writes the offset 16-bit little-endian to 0x300a/0x300b, no
-// scaling; imx290GetOffset reads it back.
+// imx290GetOffset reads the offset back from 0x300a/0x300b, the pair imx290SetOffset writes
+// 16-bit little-endian with no scaling.
 func imx290GetOffset(rm Regmap) (int, error) {
 	v, err := ReadRegLE(rm, []uint16{0x300a, 0x300b})
 	return int(v), err
@@ -539,8 +538,8 @@ func imx290SetOffset(rm Regmap, offset int) error {
 	return rm.WriteReg(0x300a, v&0xff)
 }
 
-// imx290SetROI programs the readout window: SetStartPos (X aligned to 4, Y to 2) plus
-// Cam_SetResolution (mode byte 0x3006, window, FPGA frame geometry). Both sensor groups are
+// imx290SetROI programs the readout window: the window start (X aligned to 4, Y to 2) plus
+// the window write (mode byte 0x3006, window, FPGA frame geometry). Both sensor groups are
 // under the 0x3001 latch. FPGA geometry via the FX3 setters:
 //
 //	SetFPGAHBLK(0)   -> 0x02/0x03 (strobed)   horizontal blanking = 0
@@ -563,7 +562,7 @@ func imx290SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if y < 0 {
 		y = 0
 	}
-	// (x,y,w,h) are binned output pixels. STARVIS binning (Cam_SetResolution): the sensor window
+	// (x,y,w,h) are binned output pixels. STARVIS binning: the sensor window
 	// regs take the physical region (output·bin), the mode byte 0x3006 selects the 2× readout
 	// (0x22, else 0x00); the FPGA frame geometry + HMAX take the output dims. Start is sensor
 	// pixels = output·bin. SetExp is unchanged: VMAX uses the full sensor height (invariant under
@@ -579,7 +578,7 @@ func imx290SetROI(rm Regmap, x, y, w, h, bin int) error {
 		mode = 0x22
 	}
 
-	// SetStartPos: ROI offset (latched group).
+	// Window start: ROI offset (latched group).
 	if err := WithLatch(rm, imx290RegLatch, func() error {
 		for _, rv := range []RegVal{
 			{Reg: imx290RegStartXL, Val: ux & 0xff}, {Reg: imx290RegStartXH, Val: (ux >> 8) & 0xff},
@@ -594,7 +593,7 @@ func imx290SetROI(rm Regmap, x, y, w, h, bin int) error {
 		return err
 	}
 
-	// Cam_SetResolution: mode byte + sensor window (physical region = output·bin → 0x3042/3,
+	// Window setup: mode byte + sensor window (physical region = output·bin → 0x3042/3,
 	// 0x303e/f).
 	if err := rm.WriteReg(imx290RegMode, mode); err != nil {
 		return err
@@ -608,7 +607,7 @@ func imx290SetROI(rm Regmap, x, y, w, h, bin int) error {
 		}
 	}
 
-	// SetOutput16Bits: the output bit format for the live mode (12-bit, or 10-bit high-speed).
+	// the 16-bit output select: the output bit format for the live mode (12-bit, or 10-bit high-speed).
 	if err := imx290SetOutputFormat(rm); err != nil {
 		return err
 	}
@@ -622,6 +621,6 @@ func imx290SetROI(rm Regmap, x, y, w, h, bin int) error {
 	if err := ProgramHMAX(rm, w, h, clk, floor, imx290VBlankAdd); err != nil {
 		return err
 	}
-	// SetCMOSClk at the tail, as SetResolution does.
+	// the clock select at the tail, as SetResolution does.
 	return imx290WriteClockSel(rm)
 }

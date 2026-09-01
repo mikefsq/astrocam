@@ -2,6 +2,7 @@ package astrocam
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -80,23 +81,28 @@ var ZWO = &Vendor{
 	VID:  0x03C3,
 	Name: "ZWO",
 	Cmds: FX3Cmds{
-		StreamStop:      cmdStreamStop,
-		StreamStart:     cmdStreamStart,
-		Flush:           cmdFlush,
+		StreamStop:      FX3Cmd{Req: cmdStreamStop},
+		StreamStart:     FX3Cmd{Req: cmdStreamStart},
+		Flush:           FX3Cmd{Req: cmdFlush},
 		EnableGPIF32DQ:  cmdEnableGPIF32DQ,
 		ReadSPIFlash:    reqReadSPIFlash,
 		FirmwareVersion: reqFirmwareVer,
 		SerialNumber:    reqSerialNumber,
-		ST4On:           cmdST4N,
-		ST4Off:          cmdST4F,
+		ST4:             FX3ST4{On: cmdST4N, Off: cmdST4F},
 		ReadTemp:        reqReadTemp,
+		TempC:           zwoTempC,
 		ReadHumidity:    reqReadHumidity,
 
 		ReadHumidityWValue: humidityWValue,
 	},
+	// ZWO's map is hardware-characterised: in a 20 s dark on a 6200MM, 95.6% of the frame's hot
+	// pixels are in it, and its own pixels sit a median 2166 ADU above the pedestal.
+	defectMapTrusted: true,
 	newRegmap: func(t Transport, bus RegBus, mode ReadoutMode) Regmap {
 		return &zwoRegmap{t: t, bus: bus, mode: mode}
 	},
+	fpgaRun:    zwoFPGARun,
+	newThermal: zwoThermal,
 }
 
 func init() { RegisterVendor(ZWO) }
@@ -187,13 +193,15 @@ func SetVMAX(rm Regmap, vmax uint32) (err error) {
 	return nil
 }
 
-// vendorCmd issues a SendCMD-style FX3 vendor command through the vendor's command table.
+// vendorCmd issues a SendCMD-style FX3 vendor command through the vendor's command table. The
+// wValue comes from the table too, since PlayerOne selects stream start from stop with it rather
+// than with a second request code.
 func (c *Camera) vendorCmd(op FX3Op) error {
-	code := c.vend.Cmds.cmd(op)
-	if code == 0 {
+	cmd := c.vend.Cmds.cmd(op)
+	if !cmd.decoded() {
 		return fmt.Errorf("astrocam: FX3 %s not decoded for vendor %s", op, c.vend.Name)
 	}
-	return c.t.ControlOut(code, 0, 0, nil)
+	return c.t.ControlOut(cmd.Req, cmd.WValue, 0, nil)
 }
 
 // vendorIn issues a vendor IN request from the command table (code 0 = not decoded).
@@ -214,19 +222,24 @@ const FlashHPCMapAddr = 0x40000
 // pins, so the read is bracketed by EnableGPIF32DQ(false)/(true); the camera must be Init'd first.
 func (c *Camera) ReadSPIFlash(addr uint32, n int) (out []byte, err error) {
 	gpif, flash := c.vend.Cmds.EnableGPIF32DQ, c.vend.Cmds.ReadSPIFlash
-	if gpif == 0 || flash == 0 {
+	if flash == 0 {
 		return nil, fmt.Errorf("astrocam: SPI flash read not decoded for vendor %s", c.vend.Name)
 	}
-	if err := c.t.ControlOut(gpif, 0, 0, nil); err != nil {
-		return nil, err
-	}
-	defer func() {
-		// A data bus left disabled leaves the next readout dead, so a failed re-enable is
-		// surfaced (a read error from the body wins if both fail).
-		if rerr := c.t.ControlOut(gpif, 1, 0, nil); err == nil && rerr != nil {
-			err = fmt.Errorf("astrocam: re-enable GPIF32DQ after flash read: %w", rerr)
+	// The GPIF toggle is ZWO's: its flash shares the FX3 pins with the data bus, so the bus has
+	// to be dropped for the read and put back afterwards. PlayerOne's does not, and a vendor that
+	// declares no toggle simply reads.
+	if gpif != 0 {
+		if err := c.t.ControlOut(gpif, 0, 0, nil); err != nil {
+			return nil, err
 		}
-	}()
+		defer func() {
+			// A data bus left disabled leaves the next readout dead, so a failed re-enable is
+			// surfaced (a read error from the body wins if both fail).
+			if rerr := c.t.ControlOut(gpif, 1, 0, nil); err == nil && rerr != nil {
+				err = fmt.Errorf("astrocam: re-enable GPIF32DQ after flash read: %w", rerr)
+			}
+		}()
+	}
 	const block = 2048
 	out = make([]byte, 0, n)
 	for len(out) < n {
@@ -248,35 +261,48 @@ func (c *Camera) ReadSPIFlash(addr uint32, n int) (out []byte, err error) {
 	return out, nil
 }
 
-// FirmwareVersion reads the camera firmware version.
+// FirmwareVersion reads the camera firmware version, little-endian over the vendor's reply
+// length (2 bytes on ZWO, 1 on PlayerOne).
 func (c *Camera) FirmwareVersion() (uint16, error) {
-	buf := make([]byte, 2)
+	buf := make([]byte, c.vend.Cmds.firmwareBytes())
 	if _, err := c.vendorIn(c.vend.Cmds.FirmwareVersion, "FirmwareVersion", 0, 0, buf); err != nil {
 		return 0, err
 	}
-	return uint16(buf[0]) | uint16(buf[1])<<8, nil
+	var v uint16
+	for i := len(buf) - 1; i >= 0; i-- {
+		v = v<<8 | uint16(buf[i])
+	}
+	return v, nil
 }
 
-// Serial is the ZWO factory device ID (ASI_ID): 8 raw bytes burned at manufacture. The camera
-// exposes no USB serial-number descriptor, so this is the only stable per-unit identifier.
-type Serial [8]byte
+// Serial is a camera's factory serial, rendered the way its vendor writes it. ZWO burns 8 raw
+// bytes (the ASI_ID) that its SDK shows as hex; PlayerOne burns 20 printable ASCII characters
+// (e.g. "CAMGF252416072209000"). Neither camera exposes a USB serial-number descriptor, so this
+// is the only stable per-unit identifier.
+type Serial string
 
-// String renders the serial as 8 bytes of lowercase hex.
-func (s Serial) String() string {
+func (s Serial) String() string { return string(s) }
+
+// decodeSerial renders raw serial bytes per the vendor's convention: printable text as itself
+// (trailing NULs and padding trimmed), raw bytes as lowercase hex.
+func decodeSerial(raw []byte, ascii bool) Serial {
+	if ascii {
+		return Serial(strings.TrimRight(string(raw), "\x00 "))
+	}
 	const hex = "0123456789abcdef"
-	var b [16]byte
-	for i, c := range s {
-		b[i*2], b[i*2+1] = hex[c>>4], hex[c&0xf]
+	b := make([]byte, 0, len(raw)*2)
+	for _, c := range raw {
+		b = append(b, hex[c>>4], hex[c&0xf])
 	}
-	return string(b[:])
+	return Serial(b)
 }
 
-// SerialNumber reads the factory serial: a single vendor control-IN transfer (bRequest
-// 0xC8, wValue 0, wIndex 0) returning the 8 raw ASI_ID bytes.
+// SerialNumber reads the factory serial: a single vendor control-IN transfer (bRequest 0xC8 on
+// ZWO, 0xA3 on PlayerOne; wValue 0, wIndex 0) of the vendor's reply length.
 func (c *Camera) SerialNumber() (Serial, error) {
-	var s Serial
-	if _, err := c.vendorIn(c.vend.Cmds.SerialNumber, "SerialNumber", 0, 0, s[:]); err != nil {
-		return Serial{}, err
+	raw := make([]byte, c.vend.Cmds.serialBytes())
+	if _, err := c.vendorIn(c.vend.Cmds.SerialNumber, "SerialNumber", 0, 0, raw); err != nil {
+		return "", err
 	}
-	return s, nil
+	return decodeSerial(raw, c.vend.Cmds.SerialASCII), nil
 }

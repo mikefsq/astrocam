@@ -4,6 +4,7 @@ package astrocam
 // drives (cooling.go), for FPGA-cooled models (ASI2600 / ASI6200):
 //
 //	ReadTemp     GetSensorTemp    : SendCMD 0xB3 IN 2B; signed 12-bit (hi<<4 | lo>>4) × 1/16 °C
+//	                                (zwoTempC; PlayerOne packs the same reading differently)
 //	ReadHumidity GetHumidity      : SendCMD(0x85, wValue 0xF5) IN 2B; Sensirion RH
 //	SetTECPower  SetFPGACoolPower : WriteFPGAREG reg 0x26
 //	SetFan       EnableCfan       : RMW FPGA reg 0x19 bit7 (0x80)
@@ -106,26 +107,39 @@ type camThermal struct {
 }
 
 // HardwareThermal returns the control-transfer Thermal backend for this (FPGA-cooled) camera:
-// cam.EnableCooling(cam.HardwareThermal(), …).
-func (c *Camera) HardwareThermal() Thermal {
+// cam.EnableCooling(cam.HardwareThermal(), …). The backend comes from the vendor, because the
+// cooling registers are not shared (see Vendor.newThermal).
+func (c *Camera) HardwareThermal() Thermal { return c.vend.newThermal(c) }
+
+// zwoThermal builds ZWO's cooling backend.
+func zwoThermal(c *Camera) Thermal {
 	return &camThermal{t: c.t, rm: c.rm, cmds: c.vend.Cmds, vend: c.vend.Name, writes: &c.coolW}
 }
 
 // ReadTemp reads the sensor temperature in °C (GetSensorTemp): a 2-byte IN packed as a signed
 // 12-bit fixed-point value (hi << 4) | (lo >> 4), temp = signed12 × 1/16.
 func (h *camThermal) ReadTemp() (float64, error) {
-	if h.cmds.ReadTemp == 0 {
+	if h.cmds.ReadTemp == 0 || h.cmds.TempC == nil {
 		return 0, fmt.Errorf("astrocam: FX3 ReadTemp not decoded for vendor %s", h.vend)
 	}
-	var b [2]byte
-	if _, err := h.t.ControlIn(h.cmds.ReadTemp, 0, 0, b[:]); err != nil {
+	b := make([]byte, h.cmds.readTempBytes())
+	if _, err := h.t.ControlIn(h.cmds.ReadTemp, 0, 0, b); err != nil {
 		return 0, err
+	}
+	return h.cmds.TempC(b), nil
+}
+
+// zwoTempC decodes ZWO's GetSensorTemp reply: a signed 12-bit value packed as (hi<<4 | lo>>4),
+// in sixteenths of a degree.
+func zwoTempC(b []byte) float64 {
+	if len(b) < 2 {
+		return 0
 	}
 	raw := int(b[1])<<4 | int(b[0])>>4
 	if raw >= 0x800 { // sign-extend
 		raw -= 0x1000
 	}
-	return float64(raw) * 0.0625, nil
+	return float64(raw) * 0.0625
 }
 
 // ReadHumidity reads relative humidity % (GetHumidity): a 2-byte LE IN run through the

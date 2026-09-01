@@ -35,20 +35,30 @@ func (d GuideDir) String() string {
 
 // st4Out issues one ST4 pulse command (the vendor's ST4On/ST4Off request, 0xB0/0xB1 on ZWO)
 // through UngatedControlSender when the transport offers it, else the gated ControlOut. The
-// SDK's shape is CCameraBase::pulseGuide: SendCMD(0xB0) → usleep(ms) → SendCMD(0xB1). A vendor
+// SDK's shape is assert → sleep for the pulse width → release. A vendor
 // with the request not decoded errors instead of sending another vendor's opcode.
 func (c *Camera) st4Out(on bool, dir GuideDir) error {
-	code, what := c.vend.Cmds.ST4Off, "ST4Off"
+	st := c.vend.Cmds.ST4
+	code, what := st.Off, "ST4Off"
 	if on {
-		code, what = c.vend.Cmds.ST4On, "ST4On"
+		code, what = st.On, "ST4On"
 	}
 	if code == 0 {
 		return fmt.Errorf("astrocam: FX3 %s not decoded for vendor %s", what, c.vend.Name)
 	}
-	if u, ok := c.t.(UngatedControlSender); ok {
-		return u.ControlOutUngated(code, uint16(dir), 0)
+	// ZWO carries the direction in wValue and picks the line state with the request code.
+	// PlayerOne has one code (0xA6) and carries the state in wValue, the direction in wIndex.
+	wValue, wIndex := uint16(dir), uint16(0)
+	if st.DirInWIndex {
+		wValue, wIndex = 0, uint16(dir)
+		if on {
+			wValue = 1
+		}
 	}
-	return c.t.ControlOut(code, uint16(dir), 0, nil)
+	if u, ok := c.t.(UngatedControlSender); ok {
+		return u.ControlOutUngated(code, wValue, wIndex)
+	}
+	return c.t.ControlOut(code, wValue, wIndex, nil)
 }
 
 // PulseGuideOn asserts the ST4 line for dir (ZWO SendCMD 0xB0, wValue=dir). dir>3 is a no-op.

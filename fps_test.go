@@ -26,22 +26,27 @@ func TestHMAX462USB2WireConfirmed(t *testing.T) {
 
 // TestHMAX462USB3FloorDominates: on USB3 the bandwidth candidate (~196) is below the sensor's
 // per-clock floor, so HMAX pins to REG_FRAME_LENGTH_PKG_MIN, 261 for the 462's 18562 clock (the
-// value its SetCMOSClk installs; the .data 1100 initializer is dead after init).
+// value its the clock select installs; the .data 1100 initializer is dead after init).
 func TestHMAX462USB3FloorDominates(t *testing.T) {
 	m := ReadoutMode{USB3: true, BytesPerPx: 2, FPSPercent: 100}
 	if got := HMAX(1936, 1096, 18562, 261, 18, m); got != 261 {
-		t.Fatalf("HMAX = %d, want 261 (the SetCMOSClk floor)", got)
+		t.Fatalf("HMAX = %d, want 261 (the clock-select floor)", got)
 	}
 }
 
-// TestHMAXFPSPercentClamps: FPSPercent normalizes into [40, 100], so an out-of-range request
-// cannot divide by 0 or produce a runaway line time.
+// TestHMAXFPSPercentClamps: the readout mode's own normalisation is a sanity clamp only — it
+// bounds the percentage away from zero and above 100 so the line time cannot run away or divide
+// by zero. The vendor's real floor (ZWO 40, PlayerOne 35) is applied by Camera.SetFPSPercent,
+// which knows the vendor; normalising to 40 here would raise a percentage PlayerOne accepts.
 func TestHMAXFPSPercentClamps(t *testing.T) {
 	at := func(pct int) uint16 {
 		return HMAX(1936, 1096, 18562, 1100, 18, ReadoutMode{BytesPerPx: 2, FPSPercent: pct})
 	}
-	if at(10) != at(40) {
-		t.Errorf("pct 10 -> %d, want the pct-40 clamp value %d", at(10), at(40))
+	if at(10) == at(40) {
+		t.Errorf("pct 10 was normalised up to 40; the floor is the vendor's to apply, not norm()'s")
+	}
+	if at(1) == 0 {
+		t.Error("pct 1 produced a zero line time")
 	}
 	if at(500) != at(100) {
 		t.Errorf("pct 500 -> %d, want the pct-100 clamp value %d", at(500), at(100))
