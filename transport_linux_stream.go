@@ -42,7 +42,7 @@ type streamSlot struct {
 
 // StartStream implements StreamStarter: it primes the window and returns the session. total is
 // unused on usbfs (URBs carry no timeout; Next's idle bounds a stall and Close discards).
-func (d *usbfsDevice) StartStream(frameBytes int, total time.Duration) (FrameStream, error) {
+func (d *usbfsDevice) StartStream(frameBytes, trailer int, total time.Duration) (FrameStream, error) {
 	release, err := d.enter()
 	if err != nil {
 		return nil, err

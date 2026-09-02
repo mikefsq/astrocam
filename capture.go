@@ -371,6 +371,9 @@ func (c *Camera) StartExposure(light bool) error {
 	gen := c.expGen
 	c.expAborted = false
 	c.mu.Unlock()
+	// A single shot owns the bulk pipe outright, so a free-run session left from an earlier
+	// StartVideo has to go: the worker's own windowed read cannot share the byte stream with it.
+	c.closeVideoStream()
 	// Clear a prior StopExposure's read-abort latch (ReadAborter).
 	if ra, ok := c.t.(ReadAborter); ok {
 		ra.ArmRead()
@@ -479,6 +482,15 @@ func (c *Camera) StartVideo(light bool) error {
 			ra.AbortRead()
 		}
 	}
+	// A re-arm restarts the byte stream, so a session from the previous free-run is stale: its
+	// segment offset points into a frame that no longer exists. Drop it before the arm writes,
+	// while its pump still holds the bulk pipe, and let the next ReadFrame open a fresh one.
+	c.closeVideoStream()
+	// Open the session inside the arm, in the gap between the FX3 stream start and the FPGA
+	// start: the pipe is quiet there, so the first byte the session reads is the first byte of
+	// the first frame. Joining an already-running stream instead leaves the session at whatever
+	// byte the pipe happened to hold, and nothing later can recover the boundary — the FX3
+	// commits its DMA by size, so a frame boundary need not show up in the stream at all.
 	if err := c.arm(); err != nil {
 		return err
 	}
@@ -497,6 +509,74 @@ func (c *Camera) StartVideo(light bool) error {
 	return nil
 }
 
+// videoStream returns the resident session ReadFrame reads through, opening it on first use.
+//
+// It is opened lazily rather than in StartVideo because a device has ONE session: a caller that
+// drives the free-run itself (Camera.StartStream, as the burst path does) must be able to take it.
+// Claiming it at arm time would hand that caller errStreamBusy and drop it onto a slower path.
+//
+// nil is not an error. A backend with no session, or one whose session another caller already
+// holds, leaves ReadFrame on the whole-frame BulkRead, which is correct for any frame that is a
+// whole number of the FX3's 1024-byte commit units.
+func (c *Camera) videoStream() FrameStream {
+	c.mu.Lock()
+	st := c.vidStream
+	c.mu.Unlock()
+	if st != nil {
+		return st
+	}
+	ss, ok := c.t.(StreamStarter)
+	if !ok {
+		return nil
+	}
+	total := 2*c.expDuration() + 3*time.Second
+	if total < 2*time.Second {
+		total = 2 * time.Second
+	}
+	// Opened outside mu: StartStream submits transfers, and mu is never held across USB I/O.
+	raw, err := ss.StartStream(c.FrameBytes(), c.vend.frameTrailer, total)
+	if err != nil {
+		return nil
+	}
+	ns := raw
+	c.mu.Lock()
+	if c.vidStream == nil {
+		c.vidStream = ns
+		ns = nil // adopted
+	}
+	st = c.vidStream
+	c.mu.Unlock()
+	if ns != nil {
+		_ = ns.Close() // another caller won the race; one session per device
+	}
+	return st
+}
+
+// FrameStartOffset reports where the frame inside buf actually begins, as a byte offset: 0 when
+// the buffer starts on a frame, a positive offset when it starts that many bytes into the previous
+// one, and -1 when this vendor has no marker to tell by or none was found.
+//
+// It exists so a caller can CHECK alignment rather than infer it. A rotated frame has the right
+// byte count and no error — it only looks wrong — so a test that counts bytes passes on frames
+// that are torn.
+func (c *Camera) FrameStartOffset(buf []byte) int {
+	if c.vend.frameStart == nil {
+		return -1
+	}
+	return c.vend.frameStart(buf)
+}
+
+// closeVideoStream ends the free-run session, if one is open. Idempotent.
+func (c *Camera) closeVideoStream() {
+	c.mu.Lock()
+	st := c.vidStream
+	c.vidStream = nil
+	c.mu.Unlock()
+	if st != nil {
+		_ = st.Close()
+	}
+}
+
 // StartStream opens a resident windowed-stream session (FrameStream) sized to the current frame
 // when the backend supports it; errors otherwise so the caller can fall back to per-frame reads.
 func (c *Camera) StartStream(total time.Duration) (FrameStream, error) {
@@ -504,7 +584,11 @@ func (c *Camera) StartStream(total time.Duration) (FrameStream, error) {
 	if !ok {
 		return nil, fmt.Errorf("astrocam: backend has no resident stream session")
 	}
-	return ss.StartStream(c.FrameBytes(), total)
+	st, err := ss.StartStream(c.FrameBytes(), c.vend.frameTrailer, total)
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
 }
 
 // nowFunc is the clock the host-timed status poll uses; overridable in tests.
@@ -779,7 +863,10 @@ func (c *Camera) recoverAndRearm(attempt int, gen uint64) error {
 // returns the bytes read. reset clears the bulk pipe first (a fresh frame boundary); pass false
 // for back-to-back continuous reads. A complete frame gets the FX3 marker repair (RepairFrame).
 func (c *Camera) ReadFrame(buf []byte, reset bool) (int, error) {
-	if reset {
+	st := c.videoStream()
+	if reset && st == nil {
+		// A session tracks the frame boundary itself, and clearing the pipe under it discards
+		// bytes it has already counted, which desyncs every frame after.
 		if r, ok := c.t.(EndpointResetter); ok {
 			_ = r.ResetEndpoint(bulkEndpoint)
 		}
@@ -788,7 +875,13 @@ func (c *Camera) ReadFrame(buf []byte, reset bool) (int, error) {
 	if to < 2*time.Second {
 		to = 2 * time.Second
 	}
-	n, err := c.t.BulkRead(buf, to)
+	var n int
+	var err error
+	if st != nil {
+		n, err = st.Next(buf, to)
+	} else {
+		n, err = c.t.BulkRead(buf, to)
+	}
 	if err == nil && n > 0 && n == c.FrameBytes() {
 		if !c.RepairFrame(buf[:n]) {
 			// A desynced free-run frame is reported, not returned as good: the caller retries
@@ -824,6 +917,7 @@ func (c *Camera) StopExposure() error {
 	c.expAborted = true // the abort signal the in-flight worker polls
 	c.status = ExpIdle
 	c.mu.Unlock()
+	c.closeVideoStream() // before the stop writes: the session's pump holds the bulk pipe
 	if ra, ok := c.t.(ReadAborter); ok {
 		ra.AbortRead()
 	}

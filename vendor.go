@@ -46,12 +46,32 @@ type Vendor struct {
 	// out on USB3; PlayerOne accepts 35 and defaults to 90 on both, which poasnap -caps reports
 	// as USBBandWidthLimit min=35 max=100 def=90. Zero values fall back to ZWO's.
 	fpsMin, fpsDefUSB2, fpsDefUSB3 int
+	// frameTrailer is how many bytes this vendor's FX3 firmware sends after a frame's pixels, in
+	// free-run. A reader that counts only the pixels leaves them in the pipe and every later frame
+	// starts that far in, which reads as a torn image and never as an error.
+	//
+	// It belongs to the vendor because the two decoded ones disagree, and measurement is the only
+	// way to know: an ASI6200MC sends exactly width×height×bpp and nothing else, across three
+	// window sizes, while a PlayerOne body appends sixteen bytes to every frame. It cannot be
+	// inferred from the stream — a short USB transfer marks a DMA commit as well as a frame end,
+	// so "whatever follows the pixels" is sometimes the next frame's pixels.
+	frameTrailer int
 	// frameMarker repairs the fixed header this vendor's firmware writes over the first pixels of
 	// every frame. It belongs to the vendor rather than the die: the marker is the FX3/FPGA
 	// firmware's, and the same sensor under the other vendor carries a different one, or none.
 	// nil = this vendor's frames start with pixel data. width is in output pixels and rows is how
 	// far down to reach for replacements.
 	frameMarker func(buf []byte, bpp, width, rows int)
+	// frameStart locates a frame boundary inside a buffer taken from the free-run byte stream and
+	// returns its byte offset, or -1 when the buffer already begins on one (or the vendor has no
+	// marker to find it by).
+	//
+	// A resident stream session hands out frameBytes at a time from a continuous stream, and
+	// nothing makes the first of those bytes the first byte of a frame. Every frame then comes out
+	// rotated by the same offset, which reads as a vertical seam rather than as an error: the byte
+	// count is right and only the content is wrong. Locating the boundary once, right after the
+	// session opens, lets the reader swallow the offset so every later frame lands square.
+	frameStart func(buf []byte) int
 	// loadDefectMap reads this vendor's factory hot-pixel map from flash. The two layouts share
 	// nothing: ZWO stores a sparse-RLE bitmap behind an "ASID" header, PlayerOne a per-row run
 	// list behind an "HPC:" one. nil = not decoded for this vendor.

@@ -403,8 +403,27 @@ func doSoak(tg target, o captureOpts, frames int, video bool) error {
 	}
 	defer cam.StopExposure()
 	defer installInterrupt(cam, nil)()
-	info := cam.Info()
-	if err := cam.SetROI(0, 0, info.MaxWidth, info.MaxHeight); err != nil {
+	// The geometry follows -bin and -roi, as -capture does: a soak that could only ever run the
+	// full frame cannot isolate a fault that depends on the frame size.
+	if o.hwbin {
+		if err := cam.SetHardwareBin(true); err != nil {
+			return err
+		}
+	}
+	if o.bin > 1 {
+		if err := cam.SetBinning(o.bin); err != nil {
+			return err
+		}
+	}
+	x, y, w, h := 0, 0, 0, 0
+	if o.roi != "" {
+		if _, e := fmt.Sscanf(o.roi, "%d,%d,%d,%d", &x, &y, &w, &h); e != nil {
+			return fmt.Errorf("bad -roi %q (want x,y,w,h): %v", o.roi, e)
+		}
+	} else {
+		_, _, w, h = cam.ROI() // the whole frame at this binning, as the driver sizes it
+	}
+	if err := cam.SetROI(x, y, w, h); err != nil {
 		return err
 	}
 	_ = cam.SetGain(o.gain)
@@ -413,6 +432,26 @@ func doSoak(tg target, o captureOpts, frames int, video bool) error {
 	}
 	fb := cam.FrameBytes()
 	buf := make([]byte, fb)
+	// An Alpaca client polls properties while frames stream, and each poll is an EP0 control
+	// transfer landing mid-readout — the same traffic the USB2 pacing exists to throttle. The
+	// antagonist reproduces it so a soak can tell a quiet bus from a realistic one.
+	if o.antagonist {
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			var b [8]byte
+			tk := time.NewTicker(5 * time.Millisecond)
+			defer tk.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-tk.C:
+					_, _ = raw.ControlIn(0xB3, 0, 0, b[:]) // sensor temperature, as a client polls it
+				}
+			}
+		}()
+	}
 	t0 := time.Now()
 	el := func() string { return fmt.Sprintf("[%6.1fs]", time.Since(t0).Seconds()) }
 	// Single-shot arms every frame; free-run arms once and reads back-to-back.
@@ -431,6 +470,11 @@ func doSoak(tg target, o captureOpts, frames int, video bool) error {
 		o.exposure, fb, frames, o.usb2, o.fpsPerc, mode)
 
 	fails := 0
+	// Frame-boundary bookkeeping. One distinct offset means the stream started mid-frame and
+	// stayed there, which a one-time realign fixes; several means the boundary is moving, which
+	// it cannot.
+	aligned, misaligned, noMarker := 0, 0, 0
+	offsets := map[int]int{}
 	var prevStalls int64
 	for i := 0; i < frames; i++ {
 		if err := arm(); err != nil {
@@ -440,6 +484,23 @@ func doSoak(tg target, o captureOpts, frames int, video bool) error {
 		}
 		n, err := read()
 		st := cam.StallCount()
+		// A frame can arrive complete and still be WRONG: a free-run read that does not begin on
+		// a frame boundary returns the right byte count with every row shifted, which shows as a
+		// vertical seam and as nothing at all to a test that counts bytes. Track where each frame
+		// actually starts.
+		if err == nil && n == fb {
+			switch off := cam.FrameStartOffset(buf[:n]); {
+			case off < 0:
+				noMarker++
+			case off == 0:
+				aligned++
+			default:
+				misaligned++
+				if offsets[off]++; len(offsets) <= 8 && offsets[off] == 1 {
+					fmt.Printf("%s frame %d MISALIGNED: frame starts %d bytes in\n", el(), i, off)
+				}
+			}
+		}
 		switch {
 		case err != nil || n < fb:
 			fails++
@@ -454,6 +515,18 @@ func doSoak(tg target, o captureOpts, frames int, video bool) error {
 	dt := time.Since(t0).Seconds()
 	fmt.Printf("\n*** SOAK *** %d frames, %d failed, %d stalls, %.1f fps (%.0fs)\n",
 		frames, fails, cam.StallCount(), float64(frames)/dt, dt)
+	fmt.Printf("  alignment: %d aligned, %d misaligned, %d without a marker", aligned, misaligned, noMarker)
+	if len(offsets) > 0 {
+		fmt.Printf(" — %d distinct offset(s)", len(offsets))
+		if len(offsets) == 1 {
+			for off := range offsets {
+				fmt.Printf(", constant at %d bytes (a one-time realign would fix it)", off)
+			}
+		} else {
+			fmt.Printf(", DRIFTING (a one-time realign cannot fix it)")
+		}
+	}
+	fmt.Println()
 	if cam.StallCount() == 0 && fails == 0 {
 		fmt.Println("  clean: no stalls, no failures — soft stalls did not recur single-threaded.")
 	}

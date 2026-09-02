@@ -95,6 +95,11 @@ var ZWO = &Vendor{
 
 		ReadHumidityWValue: humidityWValue,
 	},
+	frameStart: zwoFrameStart,
+	// Nothing follows a ZWO frame. Traced on an ASI6200MC free-running 2328x2280, 2344x1500 and
+	// 1840x1146: every frame is exactly width×height×bpp, ending on a short transfer with no bytes
+	// beyond the pixels.
+	frameTrailer: 0,
 	// ZWO's map is hardware-characterised: in a 20 s dark on a 6200MM, 95.6% of the frame's hot
 	// pixels are in it, and its own pixels sit a median 2166 ADU above the pedestal.
 	defectMapTrusted: true,
@@ -103,6 +108,20 @@ var ZWO = &Vendor{
 	},
 	fpgaRun:    zwoFPGARun,
 	newThermal: zwoThermal,
+}
+
+// zwoFrameStart locates a frame boundary inside a buffer taken from the free-run byte stream, as
+// a byte offset, or -1 when there is none to find. 0 means the buffer already begins on a frame.
+//
+// A DDR frame opens with the FX3 header word 0x00005A7E, so a buffer that starts on one shows it
+// at offset 0. Anywhere else, a boundary is the previous frame's footer immediately followed by
+// the next frame's header (fx3MarkerOffset), which needs both words and so cannot be tripped by a
+// lone 0x7E 0x5A pair in sensor noise.
+func zwoFrameStart(buf []byte) int {
+	if len(buf) >= 2 && buf[0] == 0x7E && buf[1] == 0x5A {
+		return 0
+	}
+	return fx3MarkerOffset(buf)
 }
 
 func init() { RegisterVendor(ZWO) }

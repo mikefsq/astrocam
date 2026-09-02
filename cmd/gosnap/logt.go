@@ -114,12 +114,12 @@ func (l *logT) ArmRead() {
 
 // StartStream forwards StreamStarter; only the session's open and close are logged, not its
 // per-frame reads.
-func (l *logT) StartStream(frameBytes int, total time.Duration) (astrocam.FrameStream, error) {
+func (l *logT) StartStream(frameBytes, trailer int, total time.Duration) (astrocam.FrameStream, error) {
 	ss, ok := l.t.(astrocam.StreamStarter)
 	if !ok {
 		return nil, fmt.Errorf("transport has no resident stream session")
 	}
-	sess, err := ss.StartStream(frameBytes, total)
+	sess, err := ss.StartStream(frameBytes, trailer, total)
 	fmt.Fprintf(l.w, "%s STREAM-SESSION open frame=%d total=%s%s\n", l.ts(), frameBytes, total, res(err))
 	if err != nil {
 		return nil, err

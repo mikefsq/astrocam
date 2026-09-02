@@ -60,7 +60,16 @@ type Camera struct {
 	// StartExposure clears it). It is distinct from status: a status poll deriving Success must
 	// not read as an abort to the worker still integrating.
 	expAborted bool
-	subtype    int // firmware subtype byte (GetFirmwareVer); gates init branches
+	// vidStream is the resident stream session a free-run capture reads through (StartVideo then
+	// ReadFrame). It exists because a free-run frame cannot be read with one exact-size transfer:
+	// the FX3 commits its DMA in whole 1024-byte units, so a frame whose length is not a multiple
+	// of 1024 ends mid-unit, and the device fills the rest of that unit from the NEXT frame. A
+	// transfer sized to the frame overruns by the difference (kIOReturnOverrun on macOS), and the
+	// bytes past the end are real data that the following frame needs. A session reads fixed
+	// segments and carries the remainder, so the boundary stays where it belongs. nil when the
+	// backend has no session, which leaves ReadFrame on the whole-frame BulkRead.
+	vidStream FrameStream
+	subtype   int // firmware subtype byte (GetFirmwareVer); gates init branches
 
 	// ST4 pulse state (guide.go), under mu: st4Lines is the bitmask of asserted guide lines
 	// (bit = GuideDir), st4Pulses counts host-timed PulseGuide calls in flight. Together they
@@ -254,6 +263,7 @@ func (c *Camera) Close() error {
 	if busy {
 		_ = c.StopExposure() // best-effort; the transport is about to go away regardless
 	}
+	c.closeVideoStream() // its pump thread references the interface the transport is about to release
 	c.DisableCooling()
 	// Zero the drive whatever the caller did before this. Regulation may have been stopped
 	// earlier, a loop may have retired with its own fail-safe write failing, or the TEC may have
@@ -886,6 +896,100 @@ func (c *Camera) SetROI(x, y, w, h int) error {
 	// scales it, so the black level is rewritten in the new mode's terms. Left alone it keeps the
 	// previous mode's encoding and means a different offset than the one that was set.
 	return c.ReapplyOffset()
+}
+
+// ClampROI returns the largest window at or below the requested one that SetROI accepts at the
+// current binning and hardware-bin split, with the start already aligned to the profile's grid.
+// It never grows a window past what was asked for, and never returns one the frame cannot hold.
+//
+// A caller cannot compute this itself. The granularity is vendor policy — ZWO wants the width a
+// multiple of 8, PlayerOne a multiple of 4 — and whether the rule counts output or sensor pixels
+// depends on where the binning happens, which is a property of the camera rather than the
+// request. Dividing the sensor extent by the bin factor lands wherever the arithmetic falls: on a
+// 3856x2180 IMX585 that is an odd 1285 columns at bin 3 and an odd 545 rows at bin 4, both of
+// which SetROI refuses.
+//
+// SetROI still refuses a misaligned window rather than quietly capturing a different one, so a
+// caller that means to be exact keeps that guarantee. This is the seam for a front end whose
+// protocol expects the driver to adapt instead: clamp, program, then report what was programmed.
+func (c *Camera) ClampROI(x, y, w, h int) (int, int, int, int) {
+	c.mu.Lock()
+	bin, hwBin := c.bin, c.hwBin
+	c.mu.Unlock()
+	if bin < 1 {
+		bin = 1
+	}
+	info := c.Info()
+	maxW, maxH := info.MaxWidth/bin, info.MaxHeight/bin
+	stepW, stepH := c.roiStep(bin, hwBin)
+	// The origin comes first, since it decides how much room is left for the window. Aligning it
+	// only ever moves it down, so it cannot push the far edge past the frame.
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+	if c.sensor.ROIStartAlign != nil {
+		hw, _ := c.binSplit(bin, hwBin)
+		ax, ay := c.sensor.ROIStartAlign(hw)
+		x, y = alignStart(x, bin, ax), alignStart(y, bin, ay)
+	}
+	if x >= maxW {
+		x = 0
+	}
+	if y >= maxH {
+		y = 0
+	}
+	// Fit the size inside the frame, then floor it to the granularity.
+	if w > maxW-x {
+		w = maxW - x
+	}
+	if h > maxH-y {
+		h = maxH - y
+	}
+	w, h = w-w%stepW, h-h%stepH
+	// A request below one step still gets one step, where the frame has room: a zero-sized window
+	// is not a readout the camera can perform.
+	if w < stepW && stepW <= maxW-x {
+		w = stepW
+	}
+	if h < stepH && stepH <= maxH-y {
+		h = stepH
+	}
+	return x, y, w, h
+}
+
+// roiStep is the window granularity SetROI enforces, expressed in the OUTPUT pixels a caller
+// passes. The vendor's own rule counts SENSOR pixels, so it divides through by the bin factor
+// wherever the host or the FPGA does the reduction and the sensor still reads the full region;
+// where the sensor itself bins, the rule already counts output pixels and carries over as it is.
+// A colour body that host-bins by an odd factor needs an even extent on top of that, or the
+// same-colour block the bin averages straddles the Bayer phase.
+func (c *Camera) roiStep(bin int, hwBin bool) (w, h int) {
+	w, h = c.vend.roiStep()
+	hw, soft := c.binSplit(bin, hwBin)
+	if hw <= 1 {
+		w, h = w/gcd(w, bin), h/gcd(h, bin)
+	}
+	if soft > 1 && c.Color() && soft%2 != 0 {
+		w, h = evenMultiple(w), evenMultiple(h)
+	}
+	if w < 1 {
+		w = 1
+	}
+	if h < 1 {
+		h = 1
+	}
+	return w, h
+}
+
+// evenMultiple is the smallest multiple of v that is itself even.
+func evenMultiple(v int) int {
+	if v%2 == 0 {
+		return v
+	}
+	return v * 2
 }
 
 // alignStart aligns a binned start coordinate so that its sensor-pixel position (v·bin) is a

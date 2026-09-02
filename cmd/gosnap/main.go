@@ -88,6 +88,7 @@ func main() {
 	soak := flag.Bool("soak", false, "single-threaded continuous capture of -soakframes frames, reporting the stall count")
 	soakFrames := flag.Int("soakframes", 5000, "with -soak: number of frames")
 	soakVideo := flag.Bool("soakvideo", false, "with -soak: use the free-run path (arm once) instead of arm-per-frame")
+	soakPoll := flag.Bool("soakpoll", false, "with -soak: poll EP0 (temperature) at 200/s during the run, as an Alpaca client does")
 	flag.Parse()
 	// The driver corrects every frame from the factory map by default, as the vendor SDKs do;
 	// this flag turns that off rather than turning a separate pass on.
@@ -103,6 +104,7 @@ func main() {
 		binsum:     *binsum, frameLimit: *frameLimit,
 		raw8: *raw8 || *highspeed, out: *out, timeout: *timeout, nframes: *nframes, usb2: *usb2,
 		discard: *discard, highspeed: *highspeed, fpsPerc: *fpsPerc, fixDefects: *fixDefects,
+		antagonist: *soakPoll,
 	}
 
 	// One mode per run, first match wins; every mode selects the camera through tg.
@@ -254,6 +256,7 @@ type captureOpts struct {
 	highspeed  bool // 10-bit high-speed readout (implies raw8)
 	fpsPerc    int  // FPS / bandwidth percent; 0 = the vendor's per-link default
 	fixDefects bool // apply the factory defect map to the frame
+	antagonist bool // poll EP0 during the soak, as an Alpaca client's property reads do
 }
 
 func (o captureOpts) binOr1() int {

@@ -41,7 +41,7 @@ type winStreamSlot struct {
 
 // StartStream implements StreamStarter: it primes the window and returns the session. total is
 // applied as the driver-side per-transfer timeout (plus a margin); Next's idle bounds a stall.
-func (d *winusbDevice) StartStream(frameBytes int, total time.Duration) (FrameStream, error) {
+func (d *winusbDevice) StartStream(frameBytes, trailer int, total time.Duration) (FrameStream, error) {
 	release, err := d.enter()
 	if err != nil {
 		return nil, err

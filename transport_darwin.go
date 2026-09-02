@@ -805,6 +805,7 @@ typedef struct {
     asi_sd   sd;
     pthread_t th;
     uint32_t chunk;
+    uint32_t trailer;    // bytes the device sends after each frame (Vendor.frameTrailer)
     uint32_t totalMs;
     uint32_t xferMs;     // driver-side per-transfer timeout (totalMs + margin)
     uint64_t next_seq;   // segment to consume next (in-order watermark)
@@ -858,7 +859,7 @@ static void asi_stream_free(asicam_stream* s) {
     free(s);
 }
 
-static asicam_stream* asi_stream_start(asicam_dev* d, uint32_t chunk, uint32_t totalMs) {
+static asicam_stream* asi_stream_start(asicam_dev* d, uint32_t chunk, uint32_t trailer, uint32_t totalMs) {
     if (!d->inPipe) return NULL;
     if (chunk == 0) chunk = 1 << 20;
     asicam_stream* s = (asicam_stream*)calloc(1, sizeof(asicam_stream));
@@ -873,7 +874,7 @@ static asicam_stream* asi_stream_start(asicam_dev* d, uint32_t chunk, uint32_t t
         sd->slots[i].scratch = (char*)malloc(chunk);
         if (!sd->slots[i].scratch) { asi_stream_free(s); return NULL; }
     }
-    s->chunk = chunk; s->totalMs = totalMs;
+    s->chunk = chunk; s->trailer = trailer; s->totalMs = totalMs;
     // The driver bounds each transfer's own wait for data from when that transfer reaches the
     // head of the pipe, not from when it was queued: on an ASI6200MC with 8 slots armed and a
     // 101 ms frame period, transfers survived a 160 ms timeout and failed at 150 ms. One frame
@@ -977,9 +978,9 @@ static int asi_stream_next_zc(asicam_stream* s, char** outBuf, uint32_t idleMs, 
 // desynced.
 //
 // A short return means the idle window elapsed part way through a frame. Nothing can realign the
-// segment watermark afterwards: the FX3 emits ZLPs at inter-buffer boundaries as well as frame
-// boundaries, and the session aligns in the first place only by starting just after the sensor
-// arms. The session latches `desynced`, and the caller must close it and start a new one.
+// segment watermark afterwards: a short transfer marks a DMA commit as readily as a frame end, so
+// there is no boundary in the stream to resynchronise against. The session latches `desynced`, and
+// the caller must close it and start a new one.
 //
 // Only ASI_HARD_KR ends the session. A driver per-transfer timeout or our own abort carries real
 // pixel data, since the rest of that frame has already landed in the following slot, so its slot
@@ -991,9 +992,10 @@ static int asi_stream_next(asicam_stream* s, void* buf, uint32_t bufSize, uint32
     if (s->desynced) return -2; // a previous call ended mid-frame; Close and StartStream to realign
     asi_stream_release(s); // a slot still held from a next_zc (see asi_stream_release)
     uint32_t copied = 0;
+    uint32_t tail = 0; // trailer bytes dropped from the terminating transfer
     int64_t lastReal = asi_now_ms();
     const int64_t sliceNs = 50 * 1000000LL; // idle re-check cadence
-    while (copied < bufSize) {
+    for (;;) {
         int progressed = 0;
         for (;;) {
             pthread_mutex_lock(&sd->qlk);
@@ -1004,30 +1006,51 @@ static int asi_stream_next(asicam_stream* s, void* buf, uint32_t bufSize, uint32
             if (!cur) break;
             if (ASI_HARD_KR(cur->kr)) { *outKr = cur->kr; return -1; }
             uint32_t avail = cur->len - s->seg_off;
-            uint32_t take = avail; if (take > bufSize - copied) take = bufSize - copied;
+            uint32_t want = bufSize - copied; // 0 once the frame is full: the rest is trailer
+            uint32_t take = avail < want ? avail : want;
             if (take) {
                 memcpy((char*)buf + copied, cur->scratch + s->seg_off, take);
                 copied += take; s->seg_off += take; progressed = 1; lastReal = asi_now_ms();
+            }
+            if (copied >= bufSize && tail < s->trailer && s->seg_off < cur->len) {
+                // The frame is full: the next `trailer` bytes are what this vendor's firmware
+                // appends, and they are consumed and dropped so the following frame starts where
+                // the camera starts it. Exactly that many, wherever they fall — the trailer can
+                // straddle two transfers.
+                //
+                // A COUNT, not "whatever follows the pixels". A short transfer marks a DMA commit
+                // as well as a frame end, so discarding to the next short transfer can throw away
+                // the next frame's pixels. The count comes from the vendor, which is where the
+                // difference lives: ZWO appends nothing, PlayerOne sixteen bytes.
+                uint32_t drop = s->trailer - tail;
+                uint32_t left = cur->len - s->seg_off;
+                if (drop > left) drop = left;
+                s->seg_off += drop;
+                tail += drop;
+                progressed = 1; lastReal = asi_now_ms();
             }
             if (s->seg_off >= cur->len) { // segment fully consumed: recycle the slot
                 s->seg_off = 0; s->next_seq++;
                 asi_stream_claim(s);
                 asi_stream_rearm(s, cur);
             }
-            if (copied >= bufSize) break;
+            if (copied >= bufSize && tail >= s->trailer) break;
         }
-        if (copied >= bufSize) break;
+        if (copied >= bufSize && tail >= s->trailer) break;
         if (!asi_stream_live(s)) return -1; // window died: no completion can ever arrive
-        // Need more bytes: wait for one completion, then re-scan at once (no drain, so a
-        // completion landing between the scan and the wait is never discarded).
+        // Need more bytes, or the trailer that follows them: wait for one completion, then re-scan
+        // at once (no drain, so a completion landing between the scan and the wait is never
+        // discarded).
         if (dispatch_semaphore_wait(sd->comp, dispatch_time(DISPATCH_TIME_NOW, sliceNs)) == 0) {
             s->unclaimed++;
         } else if (!progressed && asi_now_ms() - lastReal > (int64_t)idleMs) {
-            break; // stall
+            break; // stall (a whole frame already in hand is delivered; less is a short read)
         }
     }
-    // Short and off a frame boundary: the watermark has passed bytes the caller never got a whole
-    // frame from, so latch rather than hand back offset frames.
+    // Short of a whole frame: the idle window elapsed part way through one, and the watermark has
+    // passed bytes the caller never got a frame from. Nothing in the stream can realign it — a
+    // short transfer marks a DMA commit as well as a frame end, so there is no boundary to trust —
+    // so latch, and let the caller close the session and open one that starts aligned.
     if (copied < bufSize && (copied > 0 || s->seg_off > 0)) s->desynced = 1;
     return (int)copied;
 }
@@ -1601,13 +1624,17 @@ func (t *darwinDevice) ReadFrameStreamPrequeued(buf []byte, idle, total time.Dur
 type darwinStream struct {
 	t *darwinDevice
 	s *C.asicam_stream
+	// frameBytes is the pixel count one Next delivers, without the vendor trailer the session
+	// also consumes. NextZC hands back the scratch directly, so it needs to know where the frame
+	// ends: the transfer behind it is frame + trailer long.
+	frameBytes int
 }
 
 // StartStream opens a persistent windowed stream and primes it. total sets the driver-side
 // per-transfer timeout and so has to cover one frame period, not the whole burst. The session is
 // registered on the device, so a transport Close stops it before releasing the interface its pump
 // thread references. Gates: closeMu shared.
-func (t *darwinDevice) StartStream(frameBytes int, total time.Duration) (FrameStream, error) {
+func (t *darwinDevice) StartStream(frameBytes, trailer int, total time.Duration) (FrameStream, error) {
 	t.closeMu.RLock()
 	defer t.closeMu.RUnlock()
 	if t.closed {
@@ -1620,11 +1647,16 @@ func (t *darwinDevice) StartStream(frameBytes int, total time.Duration) (FrameSt
 	if totalMs <= 0 {
 		totalMs = defaultTotalBound.Milliseconds()
 	}
-	// Chunk = one frame for sub-MiB frames (each transfer lands a whole frame, no cross-chunk
-	// straddle, lowest latency); 1 MiB for large frames the window pipelines.
+	// Chunk = one frame PLUS its trailer for sub-MiB frames (each transfer lands a whole frame,
+	// no cross-chunk straddle, lowest latency); 1 MiB for large frames the window pipelines.
+	//
+	// The trailer has to be in the chunk. A transfer sized to the pixels alone cannot hold what
+	// the device sends after them, and the kernel fails the whole transfer with kIOReturnOverrun:
+	// on a Xena 585M every sub-MiB ROI returned "0 of 599136 bytes" and fell back to the
+	// single-shot worker, which ran the same window at 10.8 fps instead of the stream's rate.
 	chunk := 1 << 20
-	if frameBytes > 0 && frameBytes < chunk {
-		chunk = frameBytes
+	if frameBytes > 0 && frameBytes+trailer < chunk {
+		chunk = frameBytes + trailer
 	}
 	// One session per device. Two windows on the same bulk pipe compete for one byte stream:
 	// each session's transfers take whatever segments arrive next, so both read torn frames and
@@ -1638,11 +1670,11 @@ func (t *darwinDevice) StartStream(frameBytes int, total time.Duration) (FrameSt
 	if t.streams == nil {
 		t.streams = map[*darwinStream]struct{}{}
 	}
-	st := &darwinStream{t: t}
+	st := &darwinStream{t: t, frameBytes: frameBytes}
 	t.streams[st] = struct{}{}
 	t.streamMu.Unlock()
 
-	s := C.asi_stream_start(t.d, C.uint32_t(chunk), C.uint32_t(totalMs))
+	s := C.asi_stream_start(t.d, C.uint32_t(chunk), C.uint32_t(trailer), C.uint32_t(totalMs))
 	if s == nil {
 		t.streamMu.Lock()
 		delete(t.streams, st)
@@ -1720,6 +1752,12 @@ func (st *darwinStream) NextZC(idle time.Duration) ([]byte, error) {
 	}
 	if n == 0 || p == nil {
 		return nil, nil // idle stall
+	}
+	// The transfer holds the frame and the vendor trailer; the caller gets the frame. Trimming
+	// here rather than at the caller keeps the trailer a property of the transport, which is the
+	// only layer that knows the transfer was sized to hold it.
+	if st.frameBytes > 0 && int(n) > st.frameBytes {
+		n = C.int(st.frameBytes)
 	}
 	return unsafe.Slice((*byte)(unsafe.Pointer(p)), int(n)), nil
 }

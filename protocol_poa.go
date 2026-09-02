@@ -196,7 +196,12 @@ var POA = &Vendor{
 	// register and the GPIF bandwidth are both computed from, so a driver running at 100 where
 	// the vendor runs at 90 disagrees with it on every frame's timing.
 	fpsMin: 35, fpsDefUSB2: 90, fpsDefUSB3: 90,
-	frameMarker:   repairPOAFrameMarker,
+	frameMarker: repairPOAFrameMarker,
+	frameStart:  poaFrameStart,
+	// PlayerOne's FX3 sends sixteen bytes after each frame. Found by content on a Xena 585M: a
+	// reader that consumed them BEFORE the frame rotated every frame left by sixteen bytes, which
+	// places them after the pixels and not before. Unverified on other PlayerOne bodies.
+	frameTrailer:  16,
 	loadDefectMap: loadDefectMapPOA,
 	// NOT trusted, deliberately. The "HPC:" blob parses perfectly — the declared count matches the
 	// entries exactly, the sentinels number height+1, the row indices run 0..2179 complete and
@@ -257,6 +262,22 @@ func poaMarkerAt(buf []byte, i int) bool {
 		}
 	}
 	return true
+}
+
+// poaFrameStart locates the first frame marker in buf and returns its byte offset, or -1 when
+// there is none. 0 means the buffer already begins on a frame.
+//
+// It is only sound for a frame carrying ONE marker, which is every frame the sensor or the FPGA
+// has not binned. A die-binned frame carries a second marker partway in (the readout makes two
+// passes over the window), and a buffer that starts mid-frame would find that one first and align
+// to the middle of a frame rather than its start. The caller therefore aligns at bin 1 only.
+func poaFrameStart(buf []byte) int {
+	for i := 0; i+poaFrameMarkerLen <= len(buf); i++ {
+		if poaMarkerAt(buf, i) {
+			return i
+		}
+	}
+	return -1
 }
 
 // repairPOAFrameMarker overwrites every marker with pixels from the same columns one step down,

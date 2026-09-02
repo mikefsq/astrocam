@@ -90,7 +90,10 @@ type LinkForcer interface {
 
 // StreamStarter opens a resident FrameStream session.
 type StreamStarter interface {
-	StartStream(frameBytes int, total time.Duration) (FrameStream, error)
+	// StartStream opens the session. trailer is how many bytes the device sends after each
+	// frame's pixels (Vendor.frameTrailer), which the session consumes and discards so the next
+	// frame starts where the camera starts it.
+	StartStream(frameBytes, trailer int, total time.Duration) (FrameStream, error)
 }
 
 // FrameStreamZC is a zero-copy extension a FrameStream may implement, for frames small enough to

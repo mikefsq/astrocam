@@ -316,3 +316,40 @@ func TestPOAFrameMarkerRepair(t *testing.T) {
 		t.Error("repair reached past the end of a short frame")
 	}
 }
+
+// TestPOAFrameStart covers the boundary finder a fresh stream session aligns by. A session hands
+// out frameBytes at a time from a continuous stream, so without this every frame comes back
+// rotated by a fixed offset — right byte count, wrong content, no error.
+func TestPOAFrameStart(t *testing.T) {
+	marker := func(seq byte) []byte {
+		return []byte{0x77, 0xee, seq, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0}
+	}
+	fill := func(n int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte(i%251 + 1) // never zero: no accidental 8-zero run
+		}
+		return b
+	}
+
+	aligned := fill(4096)
+	copy(aligned, marker(0))
+	if got := poaFrameStart(aligned); got != 0 {
+		t.Errorf("a buffer that starts on a frame = %d, want 0", got)
+	}
+
+	for _, off := range []int{4, 1024, 2048, 4084} {
+		b := fill(8192)
+		copy(b[off:], marker(3))
+		if got := poaFrameStart(b); got != off {
+			t.Errorf("marker at %d: poaFrameStart = %d, want %d", off, got, off)
+		}
+	}
+
+	if got := poaFrameStart(fill(4096)); got != -1 {
+		t.Errorf("a buffer with no marker = %d, want -1", got)
+	}
+	if got := poaFrameStart([]byte{0x77, 0xee, 0x00}); got != -1 {
+		t.Errorf("a buffer shorter than one marker = %d, want -1", got)
+	}
+}
