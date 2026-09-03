@@ -3,6 +3,7 @@ package astrocam
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // DeviceInfo describes one attached camera discovered on the USB bus without opening it. The
@@ -90,7 +91,11 @@ func OpenSerial(serial string) (Transport, DeviceInfo, error) {
 		if err != nil {
 			continue // busy or vanished: try the next candidate
 		}
-		if sn, err := readSerial(t, d.VID); err == nil && sn.String() == serial {
+		// EqualFold: PlayerOne burns the serial as uppercase ASCII while ZWO
+		// renders raw bytes as lowercase hex, so an exact compare made a
+		// PlayerOne camera unmatchable from a config value in any other case
+		// (measured: CAMGF... bound, camgf... did not).
+		if sn, err := readSerial(t, d.VID); err == nil && strings.EqualFold(sn.String(), serial) {
 			return t, d, nil
 		}
 		t.Close()
