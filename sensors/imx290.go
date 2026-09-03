@@ -121,10 +121,11 @@ var imx290Init = []RegVal{
 
 // IMX290 is the Sony IMX290 STARVIS profile (ZWO ASI290 family).
 var IMX290 = Sensor{
-	Name:     "IMX290", // mono die; MC adds a CFA
-	GainMax:  imx290GainMax,
-	ExpMinUs: imx290ExpMinUs,
-	ExpMaxUs: imx290ExpMaxUs,
+	Name:          "IMX290", // mono die; MC adds a CFA
+	TriggerBandUs: imx290LongExpUs,
+	GainMax:       imx290GainMax,
+	ExpMinUs:      imx290ExpMinUs,
+	ExpMaxUs:      imx290ExpMaxUs,
 	// ASI Brightness / black level: range 0..240 from ASIGetControlCaps, and the default the
 	// SDK's bringup programs rather than the 1 its caps declare — the same poison-and-read
 	// check on regs 0x300a/0x300b gives 75. With it our default frames and the SDK's agree to

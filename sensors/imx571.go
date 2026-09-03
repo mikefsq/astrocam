@@ -168,10 +168,11 @@ var imx571InitPOA = []RegVal{
 // IMX571 is the Sony IMX571 APS-C profile (ZWO ASI2600 family, PlayerOne Poseidon). Not
 // hardware-validated; it tracks the hardware-verified IMX455 profile.
 var IMX571 = Sensor{
-	Name:     "IMX571", // Sony IMX571 APS-C BSI
-	GainMax:  imx571GainMax,
-	ExpMinUs: imx571ExpMinUs,
-	ExpMaxUs: imx571ExpMaxUs,
+	Name:          "IMX571", // Sony IMX571 APS-C BSI
+	TriggerBandUs: imx571LongExpUs,
+	GainMax:       imx571GainMax,
+	ExpMinUs:      imx571ExpMinUs,
+	ExpMaxUs:      imx571ExpMaxUs,
 	Info: CameraInfo{
 		MaxWidth:  imx571FullWidth,
 		MaxHeight: imx571FullHeight,

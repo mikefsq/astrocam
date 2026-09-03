@@ -44,6 +44,17 @@ type Sensor struct {
 	// fields above; a max of 0 means undeclared.
 	ExpCaps func(vid uint16) (minUs, maxUs int64)
 
+	// TriggerBandUs is the exposure at or above which this die stops holding its own shutter and
+	// the FPGA times the integration instead, parking the sensor for the duration. Free-run arms
+	// once and expects the sensor to keep producing frames, so it yields NOTHING in that band —
+	// a continuous capture has to loop single shots there instead. Surfaced by
+	// Camera.TriggerBand.
+	//
+	// Per die, not per vendor, and the values genuinely differ: 1 s on the IMX178/290/455/462/
+	// 571/585, but 4 s on the IMX174. 0 means the die free-runs at any exposure this profile
+	// declares.
+	TriggerBandUs int64
+
 	// Bus selects which vendor request WriteReg/ReadReg use. Zero value is BusSony (WriteSONYREG
 	// 0xB6 / ReadSONYREG 0xB7); non-Sony dies (Aptina/ON, Panasonic, SmartSens) use the generic
 	// camera-register bus (BusCamera, 0xA6). FPGA timing always goes through WriteFPGAReg.

@@ -25,9 +25,15 @@ type usbfsStream struct {
 	next   uint64 // segment to consume next
 	submit uint64 // segment number for the next submission
 	segOff int    // bytes already consumed from the current `next` segment
-	desync bool   // a Next ended mid-frame: the segment stream no longer aligns
-	closed bool
-	mu     sync.Mutex // Next vs Close from different goroutines
+	// trailer is the byte count this vendor's firmware appends after each frame's pixels, which
+	// Next consumes and discards so the following frame starts where the camera starts it. ZWO
+	// appends nothing; PlayerOne appends sixteen (Vendor.frameTrailer). A reader that counts only
+	// the pixels leaves them in the pipe and every later frame starts that far in, which reads as
+	// a torn image and never as an error.
+	trailer int
+	desync  bool // a Next ended mid-frame: the segment stream no longer aligns
+	closed  bool
+	mu      sync.Mutex // Next vs Close from different goroutines
 }
 
 type streamSlot struct {
@@ -52,7 +58,7 @@ func (d *usbfsDevice) StartStream(frameBytes, trailer int, total time.Duration) 
 	if frameBytes > 0 && frameBytes < chunk {
 		chunk = frameBytes // one transfer per frame for sub-MiB frames
 	}
-	st := &usbfsStream{d: d, chunk: chunk, slots: make([]streamSlot, urbWindow)}
+	st := &usbfsStream{d: d, chunk: chunk, trailer: trailer, slots: make([]streamSlot, urbWindow)}
 	for i := range st.slots {
 		st.slots[i].buf = make([]byte, chunk)
 	}
@@ -116,6 +122,19 @@ func (st *usbfsStream) reapOne() (bool, error) {
 	return true, nil // not ours (another reader's URB): ignore
 }
 
+// live reports whether the session can still produce anything: a slot still owned by the kernel,
+// or one already completed and not yet consumed. Mirrors asi_stream_live. An empty window can
+// never deliver a completion, so without this a dead window waits out the caller's entire idle
+// bound and returns a silent short read instead of an error.
+func (st *usbfsStream) live() bool {
+	for i := range st.slots {
+		if st.slots[i].armed || st.slots[i].done {
+			return true
+		}
+	}
+	return false
+}
+
 // Next pulls one frame (len(buf) bytes) from the session, in segment order; a chunk may straddle
 // frame boundaries (segOff carries the remainder to the next call). Returns a short count with a
 // nil error on an idle stall (no completion for idle), an error on a hard URB status or a closed
@@ -153,7 +172,8 @@ func (st *usbfsStream) Next(buf []byte, idle time.Duration) (int, error) {
 	}
 	copied := 0
 	lastReal := time.Now()
-	for copied < len(buf) {
+	tail := 0 // trailer bytes dropped after this frame's pixels
+	for copied < len(buf) || tail < st.trailer {
 		progressed := false
 		for {
 			cur := -1
@@ -184,17 +204,39 @@ func (st *usbfsStream) Next(buf []byte, idle time.Duration) (int, error) {
 				progressed = true
 				lastReal = time.Now()
 			}
+			if copied >= len(buf) && tail < st.trailer && st.segOff < s.n {
+				// The frame is full: the next `trailer` bytes are what this vendor's firmware
+				// appends, consumed and dropped so the following frame starts where the camera
+				// starts it. Exactly that many, wherever they fall — the trailer can straddle
+				// two transfers.
+				//
+				// A COUNT, not "whatever follows the pixels": a short transfer marks a DMA commit
+				// as readily as a frame end, so discarding to the next short transfer can throw
+				// away the next frame's pixels.
+				drop := st.trailer - tail
+				if left := s.n - st.segOff; drop > left {
+					drop = left
+				}
+				st.segOff += drop
+				tail += drop
+				progressed = true
+				lastReal = time.Now()
+			}
 			if st.segOff >= s.n { // segment fully consumed (a ZLP consumes at once): recycle
 				st.segOff = 0
 				st.next++
 				_ = st.rearm(cur) // a failed resubmit leaves a dead slot; the window shrinks
 			}
-			if copied >= len(buf) {
+			if copied >= len(buf) && tail >= st.trailer {
 				break
 			}
 		}
-		if copied >= len(buf) {
+		if copied >= len(buf) && tail >= st.trailer {
 			break
+		}
+		if !st.live() {
+			st.markDesync(copied, len(buf))
+			return copied, fmt.Errorf("astrocam: stream window died with no armed transfer")
 		}
 		if st.d.readAborted.Load() {
 			st.markDesync(copied, len(buf))

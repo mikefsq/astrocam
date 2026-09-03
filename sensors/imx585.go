@@ -249,11 +249,12 @@ var imx585InitPOA = []RegVal{
 // IMX585 is the Sony IMX585 STARVIS 2 profile, shared by ZWO's ASI585 and PlayerOne's
 // Uranus/Xena bodies.
 var IMX585 = Sensor{
-	Name:      "IMX585", // mono die; MC adds a CFA
-	GainMax:   imx585GainMax,
-	ExpMinUs:  imx585ExpMinUs,
-	ExpMaxUs:  imx585ExpMaxUs,
-	OffsetMax: 240, OffsetDef: 16, // ASI Brightness range (family default)
+	Name:          "IMX585", // mono die; MC adds a CFA
+	TriggerBandUs: imx585LongExpUs,
+	GainMax:       imx585GainMax,
+	ExpMinUs:      imx585ExpMinUs,
+	ExpMaxUs:      imx585ExpMaxUs,
+	OffsetMax:     240, OffsetDef: 16, // ASI Brightness range (family default)
 	Info: CameraInfo{
 		MaxWidth:  imx585FullWidth,
 		MaxHeight: imx585FullHeight,

@@ -104,11 +104,12 @@ var imx178Init = []RegVal{
 
 // IMX178 is the Sony IMX178 profile (ZWO ASI178, PlayerOne Sedna). Not hardware-validated.
 var IMX178 = Sensor{
-	Name:      "IMX178", // mono die; MC adds a CFA
-	GainMax:   imx178GainMax,
-	ExpMinUs:  imx178ExpMinUs,
-	ExpMaxUs:  imx178ExpMaxUs,
-	OffsetMax: 240, OffsetDef: 1, // ASI Brightness range (family default)
+	Name:          "IMX178", // mono die; MC adds a CFA
+	TriggerBandUs: imx178LongExpUs,
+	GainMax:       imx178GainMax,
+	ExpMinUs:      imx178ExpMinUs,
+	ExpMaxUs:      imx178ExpMaxUs,
+	OffsetMax:     240, OffsetDef: 1, // ASI Brightness range (family default)
 	Info: CameraInfo{
 		MaxWidth:  imx178FullWidth,
 		MaxHeight: imx178FullHeight,

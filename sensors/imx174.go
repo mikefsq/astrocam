@@ -98,10 +98,11 @@ var imx174Init = []RegVal{
 
 // IMX174 is the Sony IMX174 global-shutter profile (ZWO ASI174 family, PlayerOne Apollo).
 var IMX174 = Sensor{
-	Name:     "IMX174", // mono die; MC adds a CFA
-	GainMax:  imx174GainMax,
-	ExpMinUs: imx174ExpMinUs,
-	ExpMaxUs: imx174ExpMaxUs,
+	Name:          "IMX174", // mono die; MC adds a CFA
+	TriggerBandUs: imx174TriggerUs,
+	GainMax:       imx174GainMax,
+	ExpMinUs:      imx174ExpMinUs,
+	ExpMaxUs:      imx174ExpMaxUs,
 	// ASI Brightness / black level: 0..240, default 1.
 	OffsetMax: 240, OffsetDef: 1,
 	Info: CameraInfo{

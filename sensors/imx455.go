@@ -198,10 +198,11 @@ var imx455InitPOA = []RegVal{
 
 // IMX455 is the Sony IMX455 full-frame profile (ZWO ASI6200 MM/MC Pro, PlayerOne Zeus 455).
 var IMX455 = Sensor{
-	Name:     "IMX455", // Sony IMX455 full-frame 62MP
-	GainMax:  imx455GainMax,
-	ExpMinUs: imx455ExpMinUs,
-	ExpMaxUs: imx455ExpMaxUs,
+	Name:          "IMX455", // Sony IMX455 full-frame 62MP
+	TriggerBandUs: imx455ExpTrigUs,
+	GainMax:       imx455GainMax,
+	ExpMinUs:      imx455ExpMinUs,
+	ExpMaxUs:      imx455ExpMaxUs,
 	// ASI Brightness / black level: 0..200, default 50 (SDK init applies ~502 DN, offset 50;
 	// offset→DN is ≈10·offset+2).
 	OffsetMax: 200, OffsetDef: 50,

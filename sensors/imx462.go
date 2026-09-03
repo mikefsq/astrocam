@@ -112,10 +112,11 @@ var imx462Init = []RegVal{
 
 // IMX462 is the Sony IMX462 STARVIS profile (ZWO ASI462, PlayerOne Mars/Ceres 462).
 var IMX462 = Sensor{
-	Name:     "IMX462", // mono die; MC adds a CFA
-	GainMax:  imx462GainMax,
-	ExpMinUs: imx462ExpMinUs,
-	ExpMaxUs: imx462ExpMaxUs,
+	Name:          "IMX462", // mono die; MC adds a CFA
+	TriggerBandUs: imx462LongExpUs,
+	GainMax:       imx462GainMax,
+	ExpMinUs:      imx462ExpMinUs,
+	ExpMaxUs:      imx462ExpMaxUs,
 	// ASI Brightness / black level: range from ASIGetControlCaps (SDK 1.41: min 0, max 500), and
 	// the default the SDK's bringup programs rather than the 1 its caps declare — poisoning
 	// regs 0x300a/0x300b with 200, running the SDK at its own default and reading them back gives

@@ -229,6 +229,20 @@ func (c *Camera) Name() string { return c.model.Name }
 // Sensor returns the sensor profile.
 func (c *Camera) Sensor() *Sensor { return c.sensor }
 
+// TriggerBand is the exposure at or above which this camera's die stops holding its own shutter
+// and the FPGA times the integration, parking the sensor for the duration. Free-run produces
+// nothing in that band, so a caller wanting a continuous capture must loop single shots at or
+// above it. Zero means the die free-runs at any exposure it accepts.
+//
+// It is a property of the die, not the vendor, and the bands differ: 1 s on most, 4 s on the
+// IMX174. A caller that hard-codes one number gets the other camera wrong.
+func (c *Camera) TriggerBand() time.Duration {
+	if c.sensor == nil || c.sensor.TriggerBandUs <= 0 {
+		return 0
+	}
+	return time.Duration(c.sensor.TriggerBandUs) * time.Microsecond
+}
+
 // Cooled reports whether the model has a TEC cooler.
 func (c *Camera) Cooled() bool { return c.model.Cooled }
 
