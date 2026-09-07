@@ -112,7 +112,7 @@ type Camera struct {
 	// coolFault is the error the regulation goroutine gave up with (Run's consecutive-failure
 	// exit); set when the loop retires itself, cleared by EnableCooling.
 	coolFault error
-	// coolW is the hardware Thermal's write cache (thermal_hw.go), invalidated by Init and a
+	// coolW is the hardware Thermal's write cache (thermal.go), invalidated by Init and a
 	// device reset; it has its own lock.
 	coolW coolWrites
 }

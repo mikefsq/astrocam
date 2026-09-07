@@ -180,3 +180,63 @@ func ApplyExposure(rm Regmap, m ShutterModel, latchReg uint16, d time.Duration) 
 	}
 	return WriteRegLE(rm, latchReg, []uint16{m.SHS0, m.SHS1, m.SHS2}, shs)
 }
+
+// --- Line-time engine: the SDK's bandwidth/FPS-percent formula. Only STARVIS profiles use
+// it (imx174 directly, imx178/imx290/imx462 through ShutterModel.lineTimeNs); the dies that
+// bake or table their own line period never call it. ---
+
+// USB-bandwidth budgets the FPS-percent throttle uses. bwUSB2 is identical across every camera;
+// bwUSB3 varies per camera (290 0x4dac0098, 455 0x4db9f76c, 174 0x4db79512), so when it matters
+// pass the sensor's own via HMAXBW.
+const (
+	bwUSB2 = 43272000.0  // float32(0x4c2511d0); ~43 MB/s (USB2 HighSpeed); universal
+	bwUSB3 = 360715008.0 // float32(0x4dac0098); ~360 MB/s (USB3); IMX290's, per-camera
+)
+
+// HMAX computes the per-line readout period, which is also the line-time numerator (lineTime =
+// HMAX*1000/clock), so throttling the readout to the USB bus also sets the exposure time scale.
+// Per-sensor inputs: pixel clock, HMAX floor (REG_FRAME_LENGTH_PKG_MIN), VMAX vblank add.
+// Geometry and mode are runtime. This is the SDK's own formula: the bandwidth is a
+// link-switched constant (USB3→360715, USB2→43272; ×10×100 = bwUSB3/bwUSB2).
+//
+//	cand = 1e6 / (bw / (bytesPerPx*H*W)) / (H+vblankAdd) * clock / 1000   (truncated)
+//	HMAX = clamp( max(cand, floor) * 100/fpsPercent , .. , 0xffff )
+//
+// FPSPercent is the ASI bandwidth-overload (40..100): lower = more USB throttle = larger HMAX.
+// On USB3 the floor usually dominates (462 full-frame candidate ≈196 < its 261 floor); on USB2
+// the candidate dominates (462 full-frame 1634 → HMAX 4085 at pct=40, wire-confirmed) and pins
+// the sensor line rate to the link budget so the FX3 GPIF never outruns the pipe.
+func HMAX(w, h, clock, floor, vblankAdd int, m ReadoutMode) uint16 {
+	return HMAXBW(w, h, clock, floor, vblankAdd, bwUSB2, bwUSB3, m)
+}
+
+// HMAXBW is HMAX with the sensor's own USB-bandwidth constants. Use it when the camera's bwUSB3
+// differs from the package default; bw2 is universal.
+func HMAXBW(w, h, clock, floor, vblankAdd int, bw2, bw3 float64, m ReadoutMode) uint16 {
+	m = m.norm()
+	bw := bw3
+	if !m.USB3 {
+		bw = bw2
+	}
+	x := 1e6 / (bw / (float64(m.BytesPerPx) * float64(h) * float64(w)))
+	x = x / float64(h+vblankAdd)
+	x = x * float64(clock)
+	x = x / 1000.0
+	cand := int(x) // truncate
+	if cand < floor {
+		cand = floor
+	}
+	hm := cand * 100 / m.FPSPercent
+	if hm > 0xffff {
+		hm = 0xffff
+	}
+	return uint16(hm)
+}
+
+// LineTimeNs is the readout line time in ns: HMAX*1e6/clock.
+func LineTimeNs(w, h, clock, floor, vblankAdd int, m ReadoutMode) uint64 {
+	if clock == 0 {
+		return 0
+	}
+	return uint64(HMAX(w, h, clock, floor, vblankAdd, m)) * 1_000_000 / uint64(clock)
+}

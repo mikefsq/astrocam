@@ -35,25 +35,9 @@ var ErrCaptureBusy = errors.New("astrocam: capture already in progress")
 // is the only reliable detector; without it the frame is saved and stacked as if it were good.
 var ErrFrameDesynced = errors.New("astrocam: frame desynced (FX3 DDR markers not at the frame boundaries)")
 
-// ZWO's FX3 streaming vendor commands (SendCMD); they seed ZWO.Cmds.
-const (
-	cmdStreamStop  = 0xAA // stop/prepare before (re)arming
-	cmdStreamStart = 0xA9 // begin streaming
-	cmdFlush       = 0xAF // pipeline flush / drop recovery
-	bulkEndpoint   = 0x81 // bulk-IN endpoint
-)
-
-// FPGA mode register 0: bit4 stops the readout pipeline (FPGAStop sets it, FPGAStart clears it).
-const (
-	fpgaModeReg0 = 0x00
-	fpgaStopBit  = 0x10
-)
-
-// zwoFPGARun is ZWO's readout run control: bit 4 of FPGA register 0 is the STOP flag, set to
-// halt and cleared to run, read-modify-written so the rest of the mode byte survives.
-func zwoFPGARun(rm Regmap, start bool) error {
-	return SetFPGABit(rm, fpgaModeReg0, fpgaStopBit, !start)
-}
+// bulkEndpoint is the FX3 bridge's bulk-IN endpoint. Both vendors ship the same bridge, so the
+// transports address it directly rather than through the vendor descriptor.
+const bulkEndpoint = 0x81
 
 // FPGARun implements WorkerCtl: the readout run control, in the vendor's encoding.
 func (c *Camera) FPGARun(start bool) error { return c.vend.fpgaRun(c.rm, start) }

@@ -56,7 +56,7 @@ const (
 
 	imx178LongExpUs = 1_000_000 // >= 1 s enters FPGA trigger mode (inclusive bound)
 
-	// Readout constants for the shared engine (fps.go / shutter.go). Geometry is image
+	// Readout constants for the shared engine (shutter.go). Geometry is image
 	// orientation: 3072 wide × 2048 tall; the height drives VMAX/SHS.
 	imx178FullWidth  = 3072
 	imx178FullHeight = 2048

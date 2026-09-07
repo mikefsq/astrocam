@@ -73,7 +73,7 @@ const (
 	imx585MinExpLinesPOA = 2
 	imx585LongExpUs      = 1_000_000 // >= 1 s enters FPGA trigger mode (inclusive bound)
 
-	// Readout constants for the shared engine (fps.go / shutter.go). Geometry is image
+	// Readout constants for the shared engine (shutter.go). Geometry is image
 	// orientation, effective 4K. HMAX is baked: the SDK sets clock 20000 with no static HMAX
 	// floor, and its FPS% default of 80 is not applied.
 	imx585FullWidth  = 3840  // horizontal (lit16 0x3440)

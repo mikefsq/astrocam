@@ -53,13 +53,13 @@ const (
 	imx462ExpMaxUs  = 2_000_000_000 // 2000 s ceiling
 	imx462LongExpUs = 1_000_000     // >= 1 s enters FPGA trigger mode (reg0 bit7)
 
-	// Readout constants for the shared engine (fps.go / shutter.go).
+	// Readout constants for the shared engine (shutter.go).
 	imx462FullWidth  = 1936 // ASI462MC reports 1936×1096, the same array as the 290
 	imx462FullHeight = 1096
 	imx462ClkKHz     = 18562 // 12-bit normal pixel clock (INCK/2)
 	// HMAX floor = REG_FRAME_LENGTH_PKG_MIN, written per clock by the clock select
 	// (measured): 18562→261, 37124→245, 9281→145. HMAX = max(bandwidth candidate,
-	// floor)·100/FPSPercent (the SDK's bandwidth formula; HMAX/HMAXBW in fps.go, bwUSB2/bwUSB3 = MAX_DATASIZE·
+	// floor)·100/FPSPercent (the SDK's bandwidth formula; HMAX/HMAXBW in shutter.go, bwUSB2/bwUSB3 = MAX_DATASIZE·
 	// 10·100 with MAX_DATASIZE from the 16-bit output select: USB3 360715, USB2 43272). On USB2 the
 	// candidate dominates (1634 full-frame; HMAX 4085 at pct 40, wire-confirmed); on USB3 the
 	// floor pins HMAX (261 ≈ 64 fps full-frame RAW16, measured 63.4 fps on USB3).

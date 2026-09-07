@@ -4,13 +4,23 @@
 // Layering:
 //
 //	Transport     the USB physical layer
-//	protocol.go   ZWO's control-transfer register dialect (zwoRegmap) over a Transport
-//	protocol_poa  PlayerOne's dialect (poaRegmap): different opcodes, same Regmap
-//	Vendor        VID -> { Name, newRegmap } (vendor.go); each die maps to one Vendor
+//	Vendor        VID -> { Name, newRegmap, … } (vendor.go); each die maps to one Vendor
 //	Regmap        the sensor-register interface the profiles write to (incl. VID())
 //	Sensor        a per-chip profile: init table + gain/exposure/ROI ops (vendor-dispatched)
 //	Models        (VID,PID) -> { sensor, mono|color, cooled, usb3 }
 //	Camera        binds a Transport + Model + Sensor into the control flow
+//
+// A file name says which vendor its contents belong to. An unsuffixed file is the
+// vendor-neutral engine and must reach hardware through the Vendor descriptor; _zwo and _poa
+// files hold the one vendor's opcodes, registers and blob layouts, and pair up:
+//
+//	protocol_zwo  / protocol_poa   the control-transfer register dialect and vendor descriptor
+//	fpga_zwo      / fpga_poa       camera-FPGA registers (vendor firmware, nothing carries over)
+//	thermal_zwo   / thermal_poa    the cooling backend behind the Thermal seam
+//	defectmap_zwo / defectmap_poa  the factory hot-pixel blob layout ("ASID" vs "HPC:")
+//
+// A new vendor is a new set of _<vendor> files plus a Vendor descriptor; anything it forces
+// into an unsuffixed file is a seam the engine is still missing.
 package astrocam
 
 import (

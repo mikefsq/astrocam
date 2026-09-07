@@ -2,7 +2,7 @@ package astrocam
 
 import "testing"
 
-// These tests pin the HMAX/line-time formula (fps.go) to wire-confirmed SDK values and its
+// These tests pin the HMAX/line-time formula (shutter.go) to wire-confirmed SDK values and its
 // clamping edges.
 
 // plainRegmap is a no-op Regmap without modeReader, so ModeOf returns normalized defaults.

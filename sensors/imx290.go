@@ -65,7 +65,7 @@ const (
 
 	imx290ReadAttempts = 12
 
-	// Readout constants for the shared engine (fps.go / shutter.go); runtime state (USB speed,
+	// Readout constants for the shared engine (shutter.go); runtime state (USB speed,
 	// FPS, output depth) lives in ReadoutMode. Clock + floor feed the HMAX formula, VBlankAdd +
 	// SHSOffset the STARVIS VMAX/SHS math, HBLK/VBLK the FPGA frame geometry.
 	imx290FullWidth  = 1936

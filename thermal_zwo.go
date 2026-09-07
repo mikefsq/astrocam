@@ -1,7 +1,7 @@
 package astrocam
 
-// Hardware Thermal backend: the control-transfer implementation of the Thermal seam the Cooler
-// drives (cooling.go), for FPGA-cooled models (ASI2600 / ASI6200):
+// ZWO cooling: the control-transfer Thermal backend the Cooler loop drives (cooling.go), for
+// FPGA-cooled models (ASI2600 / ASI6200):
 //
 //	ReadTemp     GetSensorTemp    : SendCMD 0xB3 IN 2B; signed 12-bit (hi<<4 | lo>>4) × 1/16 °C
 //	                                (zwoTempC; PlayerOne packs the same reading differently)
@@ -11,15 +11,14 @@ package astrocam
 //	SetHeater    SetLensHeat      : WriteFPGAREG reg 0x2a = 8-bit PWM duty (0..255), + EnableWarm
 //	             EnableWarm       : RMW FPGA reg 0x19 bit6 (0x40)
 //
+// The registers are ZWO's alone: PlayerOne puts a different actuator behind 0x26 and 0x2a, so
+// its backend is a separate type (thermal_poa.go) rather than a parameterisation of this one.
+//
 // Non-FPGA cameras (ASI071/1600 class) drive the TEC through a calibrated DAC (SetDA cubic →
 // SendCMD 0xB2) and read temperature via I2C ADC chips; that path is not implemented and would
 // need its own Thermal.
 
-import (
-	"fmt"
-	"sync"
-	"time"
-)
+import "fmt"
 
 // FPGA register numbers for the cooling block (wValue to WriteFPGAREG 0xBD).
 const (
@@ -34,67 +33,6 @@ const (
 	humidityWValue  = 0xF5
 )
 
-// coolRefresh bounds how long an unchanged TEC level or fan state goes without being rewritten:
-// the write cache below skips a value the FPGA already holds, and this periodic rewrite covers
-// a register the firmware reset behind the driver's back (a device reset the cache did not see,
-// a second Thermal instance driving the same registers).
-const coolRefresh = 5 * time.Second
-
-// coolWrites is the write cache the hardware Thermal keeps on the Camera (shared by every
-// HardwareThermal instance): the last TEC level and fan state put on the wire, so the 5 Hz
-// regulation loop issues the reg-0x26 write and the reg-0x19 fan RMW only when a value changes
-// or coolRefresh has passed. Init and a device reset invalidate it.
-type coolWrites struct {
-	mu       sync.Mutex
-	level    uint16 // last TEC level written to fpgaCoolPower
-	levelOK  bool   // level is known to be on the wire
-	levelAt  time.Time
-	fan      bool
-	fanOK    bool
-	fanAt    time.Time
-	nowStamp func() time.Time // test hook; nil = time.Now
-}
-
-func (w *coolWrites) now() time.Time {
-	if w.nowStamp != nil {
-		return w.nowStamp()
-	}
-	return time.Now()
-}
-
-// invalidate forgets the cached values, so the next SetTECPower/SetFan writes unconditionally.
-func (w *coolWrites) invalidate() {
-	w.mu.Lock()
-	w.levelOK, w.fanOK = false, false
-	w.mu.Unlock()
-}
-
-// levelDue reports whether level must be written: unknown, changed, or last written more than
-// coolRefresh ago.
-func (w *coolWrites) levelDue(level uint16) bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return !w.levelOK || w.level != level || w.now().Sub(w.levelAt) >= coolRefresh
-}
-
-func (w *coolWrites) levelWritten(level uint16) {
-	w.mu.Lock()
-	w.level, w.levelOK, w.levelAt = level, true, w.now()
-	w.mu.Unlock()
-}
-
-func (w *coolWrites) fanDue(on bool) bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return !w.fanOK || w.fan != on || w.now().Sub(w.fanAt) >= coolRefresh
-}
-
-func (w *coolWrites) fanWritten(on bool) {
-	w.mu.Lock()
-	w.fan, w.fanOK, w.fanAt = on, true, w.now()
-	w.mu.Unlock()
-}
-
 // camThermal maps the Thermal interface to control transfers for one camera: the Transport, the
 // Regmap (FPGA register RMW) and the vendor's FX3 request codes for the temperature/humidity
 // reads. writes is the Camera's shared write cache (nil = write every call).
@@ -105,11 +43,6 @@ type camThermal struct {
 	vend   string
 	writes *coolWrites
 }
-
-// HardwareThermal returns the control-transfer Thermal backend for this (FPGA-cooled) camera:
-// cam.EnableCooling(cam.HardwareThermal(), …). The backend comes from the vendor, because the
-// cooling registers are not shared (see Vendor.newThermal).
-func (c *Camera) HardwareThermal() Thermal { return c.vend.newThermal(c) }
 
 // zwoThermal builds ZWO's cooling backend.
 func zwoThermal(c *Camera) Thermal {
