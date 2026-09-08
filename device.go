@@ -47,6 +47,45 @@ func Enumerate() ([]DeviceInfo, error) {
 	return filterCameras(raw), nil
 }
 
+// FoundCamera is one attached camera plus the identity that survives a replug.
+type FoundCamera struct {
+	DeviceInfo
+	// Serial is the factory serial, or "" when it could not be read — the camera is open in
+	// another process, or the vendor's serial request is not decoded. Absent rather than fatal:
+	// a camera that cannot be identified is still attached, and a caller listing hardware needs
+	// to show it.
+	Serial string
+}
+
+// EnumerateWithSerials lists attached cameras and reads each one's factory serial, opening every
+// camera briefly and closing it again.
+//
+// It exists because Enumerate alone cannot identify a camera across replugs: it reports VID, PID
+// and Location, and Location is the physical PORT, so moving a camera to another socket changes
+// it. The serial is the only stable identity, and reading it costs a transport open — which is
+// why this is a separate call rather than something Enumerate does for everyone.
+//
+// A camera that is already open elsewhere is REPORTED WITHOUT ITS SERIAL, not skipped: the whole
+// point of a listing is to show what is attached, and "in use" is not "absent".
+func EnumerateWithSerials() ([]FoundCamera, error) {
+	devs, err := Enumerate()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]FoundCamera, 0, len(devs))
+	for _, d := range devs {
+		f := FoundCamera{DeviceInfo: d}
+		if t, err := OpenLocation(d.VID, d.Location); err == nil {
+			if sn, err := readSerial(t, d.VID); err == nil {
+				f.Serial = sn.String()
+			}
+			t.Close()
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
 // filterCameras keeps only the raw USB devices whose PID resolves to a registered camera Model
 // and fills a missing Name from the registry.
 func filterCameras(raw []DeviceInfo) []DeviceInfo {
